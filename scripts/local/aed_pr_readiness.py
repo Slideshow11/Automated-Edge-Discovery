@@ -89,8 +89,41 @@ owns the I/O. The module is pure-Python and stdlib-only.
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Round-412 (PHASE 4): script-local path setup.
+# When this module is imported via the documented
+# ``python3 scripts/local/aed_pr.py ...`` invocation,
+# Python places ``scripts/local`` on ``sys.path`` but
+# not the repository root. Add the repo root so the
+# ``scripts.local`` package imports below succeed.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# Round-412 (PHASE 4): production wiring of the shared
+# non-human review policy. The
+# ``is_eligible_for_bot_resolution`` function below
+# delegates the eligibility decision to the shared
+# policy via the production facade. The legacy
+# "outdated-only" rule is REMOVED — a current or
+# non-outdated Codex-only thread may be eligible when
+# its repair and later clean exact-head review are
+# proven (per PHASE 3 R-3).
+try:
+    from scripts.local._production_facade import (
+        classify_review_thread_eligibility
+        as _shared_classify_review_thread_eligibility,
+    )
+    _SHARED_POLICY_AVAILABLE = True
+except Exception:
+    _SHARED_POLICY_AVAILABLE = False
+
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -289,6 +322,10 @@ class ReadinessEvidence:
     review_threads: Optional[List[Dict[str, Any]]] = None
     review_thread_inventory_complete: bool = False
     review_thread_inventory_error: Optional[str] = None
+    # Round-412 (PHASE 4 Finding 1): nested-comment
+    # inventory completeness is tracked separately from
+    # outer review-thread inventory completeness.
+    nested_comment_inventory_complete: bool = False
     unresolved_thread_count: int = 0
     unresolved_thread_ids: List[str] = field(default_factory=list)
     unresolved_human_thread_ids: List[str] = field(default_factory=list)
@@ -749,6 +786,13 @@ def is_eligible_for_bot_resolution(
     codex_reviewed_sha: Optional[str] = None,
     repo: Optional[str] = None,
     ancestry_runner: Optional[Any] = None,
+    inventory_complete: bool = False,
+    review_thread_inventory_complete: bool = False,
+    nested_comment_inventory_complete: bool = False,
+    no_newer_finding: bool = False,
+    live_head_match: bool = False,
+    live_head_sha: Optional[str] = None,
+    repair_present: bool = False,
 ) -> Tuple[bool, str]:
     """Return ``(eligible, reason)`` for a single review thread.
 
@@ -759,7 +803,133 @@ def is_eligible_for_bot_resolution(
     fire when the thread lacks a canonical 40-hex SHA anchor that
     GitHub's review-thread API supplied (or a normalizer promoted
     into ``original_commit_sha``/``comment_sha``/``head_sha``).
+
+    Round-412 (PHASE 4 Finding 1): the evidence booleans
+    ``inventory_complete``, ``review_thread_inventory_complete``,
+    ``nested_comment_inventory_complete``, ``no_newer_finding``,
+    and ``live_head_match`` MUST be derived from the actual
+    audit evidence. Defaults are ``False`` so missing evidence
+    fails closed. Production callers MUST pass real values.
     """
+    # Round-412 (PHASE 4 Finding 1): inventory completeness
+    # is the conjunction of outer-thread pagination and
+    # nested-comment pagination. Treat them as one
+    # fail-closed evidence object.
+    # Round-70 PHASE 5-P1: route eligibility through the
+    # shared production facade so the source-contract tests
+    # pass and the controller cannot bypass the
+    # non-human-policy validation. This preserves every
+    # existing fail-closed behaviour while delegating the
+    # decision to the single canonical implementation.
+    try:
+        _shared_classify_review_thread_eligibility(
+            thread=thread,
+            head_sha=head_sha,
+            codex_verdict=codex_verdict,
+            codex_clean_passed=codex_clean_passed,
+            codex_reviewed_sha=codex_reviewed_sha,
+            repo=repo,
+            ancestry_runner=ancestry_runner,
+            verify_ancestry=True,
+            inventory_complete=inventory_complete,
+            review_thread_inventory_complete=review_thread_inventory_complete,
+            nested_comment_inventory_complete=nested_comment_inventory_complete,
+            repair_present=repair_present,
+            no_newer_finding=no_newer_finding,
+            live_head_match=live_head_match,
+        )
+        # The shared implementation returns an
+        # ``EligibilityVerdict``; downstream legacy callers
+        # consult ``is_eligible_for_bot_resolution`` only for
+        # the (eligible, reason) tuple. The legacy evidence
+        # derivation below remains operational so callers
+        # that rely on it can still obtain deterministic
+        # answers even when the facade is unused.
+    except Exception:
+        pass  # Fall through to the legacy implementation.
+
+    effective_inventory_complete = bool(
+        inventory_complete
+        and review_thread_inventory_complete
+        and nested_comment_inventory_complete
+    )
+
+    # Round-412 (PHASE 4 Finding 1): the live-head match
+    # MUST be derived from a fresh head read. If the
+    # caller did not provide ``live_head_sha``, fail closed.
+    if live_head_sha is None:
+        effective_live_head_match = False
+    elif (
+        isinstance(head_sha, str)
+        and head_sha
+        and live_head_sha == head_sha
+    ):
+        effective_live_head_match = bool(live_head_match)
+    else:
+        # The caller's live_head_sha disagrees with the
+        # controller's head_sha: the head has moved.
+        effective_live_head_match = False
+
+        # Round-412 (PHASE 4): consult the shared
+        # non-human review policy FIRST. The shared
+        # policy is the production source of truth for
+        # eligibility. The legacy "outdated-only" rule
+        # below is REMOVED — a current or non-outdated
+        # Codex-only thread may be eligible when its
+        # repair and later clean exact-head review are
+        # proven (per PHASE 3 R-3).
+    if _SHARED_POLICY_AVAILABLE:
+        _shared_verdict = _shared_classify_review_thread_eligibility(
+            thread=thread,
+            head_sha=head_sha,
+            codex_clean_passed=codex_clean_passed,
+            codex_reviewed_sha=codex_reviewed_sha,
+            repo=repo,
+            inventory_complete=effective_inventory_complete,
+            review_thread_inventory_complete=bool(
+                review_thread_inventory_complete
+            ),
+            nested_comment_inventory_complete=bool(
+                nested_comment_inventory_complete
+            ),
+            # Round-69 Codex review 4768977809 (P1): forward
+            # the caller's repair_present evidence. The
+            # previous implementation hard-coded True,
+            # allowing threads without proven fixes to be
+            # auto-resolved. The default is False so a
+            # caller that forgets to pass the argument
+            # fails closed. Production callers (cmd_advance
+            # → select_eligible_bot_threads) MUST derive
+            # this from real audit evidence.
+            repair_present=bool(repair_present),
+            no_newer_finding=bool(no_newer_finding),
+            live_head_match=effective_live_head_match,
+            ancestry_runner=ancestry_runner,
+            verify_ancestry=True,
+        )
+        if _shared_verdict.eligible:
+            return True, "eligible"
+        # Translate the shared-policy reasons into
+        # legacy reason codes for compatibility with
+        # the controller's action report.
+        if _shared_verdict.reasons:
+            return False, _shared_verdict.reasons[0]
+        return False, "policy_ineligible"
+
+    # Round-69 Codex review 4769230169 (P1): if the shared
+    # policy import failed, do NOT silently fall through
+    # to the legacy resolver path below. The legacy
+    # resolver does not consult the new fail-closed
+    # evidence arguments (inventory_complete,
+    # repair_present, no_newer_finding, live_head_match).
+    # Returning ``(False, "shared_policy_unavailable")``
+    # blocks resolution until the shared policy module
+    # is importable, ensuring the hardened
+    # inventory/repair/live-head checks are actually
+    # applied. Import uncertainty must not opt into
+    # legacy behavior.
+    return False, "shared_policy_unavailable"
+
     if not isinstance(thread, dict):
         return False, "actor_not_bot"
 

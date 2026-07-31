@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Needles and blocking words
@@ -101,6 +101,16 @@ _COORDINATION_PATTERNS = (
     # so a Codex finding that incidentally contains the phrase
     # in the middle of its body is unaffected.
     "codex automated review request",
+    # Round-81 P1 follow-up: malformed Codex-review request
+    # comments that lack the canonical ``@codex review``
+    # trigger but begin with the PR author's ``Codex: please
+    # re-review`` coordination phrase. These name a specific
+    # head SHA, summarize the prior-round repairs, and are NOT
+    # findings. Without this entry, the gate treats them as
+    # current-head blockers because the body mentions the
+    # ``P1`` / ``P2`` severity tokens when describing what the
+    # prior-round commits repaired. The match is exact-prefix.
+    "codex: please re-review",
 )
 
 
@@ -582,9 +592,43 @@ def gh_graphql_review_threads(
         f'repository(owner:"{owner}", name:"{name}") {{',
         f"pullRequest(number:{pr_number}) {{",
         "reviewThreads(first:100) {",
+        # Round-69 Codex review 4768917422 (P1): include
+        # pageInfo so the first-page helper can detect
+        # incomplete outer pagination. When
+        # hasNextPage=true the helper returns ok=False
+        # so the wrapper invokes the cursor walker.
+        "pageInfo { hasNextPage }",
         "nodes {",
         "id isResolved isOutdated",
-        "comments(first:50) { nodes { databaseId url author { login } } }",
+        # Round-69 Codex review 4769344844 (P2): add
+        # whitespace between ``isOutdated`` and
+        # ``comments`` so the rendered query is
+        # ``... isOutdated comments(first:50) ...``
+        # instead of ``... isOutdatedcomments(first:50) ...``
+        # (a single nonexistent field that causes GitHub
+        # to return a GraphQL error).
+        " ",  # explicit whitespace separator
+        # Round-69 Codex review 4769230169 (P2): include
+        # the nested comments pageInfo so the first-page
+        # helper can detect incomplete nested comment
+        # pagination. When any thread's
+        # ``comments.pageInfo.hasNextPage=true`` the
+        # helper returns ok=False so the wrapper invokes
+        # the cursor walker (or the audit's visible-blocker
+        # logic catches the current-finding).
+        "comments(first:50) {"
+        "pageInfo { hasNextPage }"
+        # Round-81 follow-up: also fetch the
+        # parent ``pullRequestReview`` so per-review-comment
+        # findings can be linked to threads in the same
+        # review via the review_id index. Without this,
+        # a review-summary finding whose URL is the
+        # review URL (not a thread discussion URL) cannot
+        # inherit the resolution state of any thread in
+        # that review and would falsely remain as a
+        # stale-blocker after every thread in the review
+        # is resolved.
+        "nodes { databaseId url author { login } pullRequestReview { databaseId } } }",
         "}",  # close nodes
         "}",  # close reviewThreads
         "}",  # close pullRequest
@@ -609,37 +653,479 @@ def gh_graphql_review_threads(
         errors = data.get("errors")
         if errors:
             return False, [], f"GraphQL errors: {errors}"
-        nodes = (
+        review_threads_container = (
             data.get("data", {})
             .get("repository", {})
             .get("pullRequest", {})
             .get("reviewThreads", {})
-            .get("nodes", [])
         )
-        # Flatten: keep thread metadata + each comment's databaseId/url/author.
-        threads: list[dict[str, Any]] = []
+        # Round-69 Codex review 4768917422 (P1): detect
+        # incomplete outer pagination. When
+        # hasNextPage=true the inventory is incomplete;
+        # return ok=False so the wrapper invokes the
+        # cursor walker. Test mocks that return
+        # ``(True, [], "")`` directly via
+        # ``mock.patch.object`` short-circuit this check
+        # because the test never reaches this code path.
+        page_info = review_threads_container.get("pageInfo") or {}
+        if isinstance(page_info, dict) and page_info.get("hasNextPage"):
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true; "
+                "pagination required"
+            )
+        nodes = review_threads_container.get("nodes", [])
+        # Round-69 Codex review 4769230169 (P2): detect
+        # incomplete nested comment pagination. When any
+        # thread's ``comments.pageInfo.hasNextPage=true`` the
+        # nested inventory is incomplete. Return ok=False
+        # so the wrapper invokes the cursor walker (which
+        # walks nested comments via the
+        # ``_walk_pagination_cursors`` helper).
+        for _node in nodes:
+            if not isinstance(_node, dict):
+                continue
+            _comments = _node.get("comments") or {}
+            if not isinstance(_comments, dict):
+                continue
+            _nested_pi = _comments.get("pageInfo") or {}
+            if (
+                isinstance(_nested_pi, dict)
+                and _nested_pi.get("hasNextPage")
+            ):
+                return False, [], (
+                    "reviewThreads.comments.pageInfo.hasNextPage=true; "
+                    "nested pagination required"
+                )
+    except (json.JSONDecodeError, OSError) as exc:
+        return False, [], f"gh graphql decode failed: {exc}"
+
+    # Flatten: keep thread metadata + each comment's databaseId/url/author.
+    # Round-81 follow-up: also carry the parent
+    # ``pull_request_review_id`` so per-review-comment findings
+    # whose URL is the review-summary URL can be linked to
+    # threads in the same review via the review_id index.
+    threads: list[dict[str, Any]] = []
+    for node in nodes:
+        thread_id = node.get("id", "")
+        is_resolved = node.get("isResolved", False)
+        is_outdated = node.get("isOutdated", False)
+        for comment in (node.get("comments", {}) or {}).get("nodes", []):
+            author_login = (
+                (comment.get("author") or {}).get("login", "")
+                if comment.get("author") else ""
+            )
+            # Round-81 follow-up: thread -> review linkage.
+            # Pulled from the inline comment's
+            # ``pullRequestReview.databaseId`` so per-review-
+            # comment findings can map back to threads in
+            # the same review via the review_id index.
+            pr_review = comment.get("pullRequestReview") or {}
+            review_id = (
+                pr_review.get("databaseId")
+                if isinstance(pr_review, dict) else None
+            )
+            threads.append({
+                "thread_id": thread_id,
+                "is_resolved": is_resolved,
+                "is_outdated": is_outdated,
+                "database_id": comment.get("databaseId"),
+                "url": comment.get("url") or "",
+                "author_login": author_login,
+                "review_id": review_id,
+            })
+    return True, threads, ""
+
+
+def _walk_thread_comments(
+    *, owner: str, name: str, pr_number: int,
+    thread_id: str, timeout: int,
+    page_size: int = 50, safety_cap: int = 200,
+) -> tuple[bool, list[dict[str, Any]], str]:
+    """Round-90 follow-up: walk the nested ``comments(first:N)``
+    cursor for one review thread so that threads with more than
+    N initial comments produce a complete comment inventory.
+
+    Returns ``(ok, comments, error_msg)``.
+
+    The outer walker (``_walk_pagination_cursors``) used to
+    return ``nested_comments_not_paginated: thread=<id>``
+    whenever a thread's ``comments.pageInfo.hasNextPage=true``
+    because it had no logic to follow the nested cursor. That
+    failure mode meant the production review-comment gate
+    remained fail-closed indefinitely for any PR with a
+    long-running review thread. This helper performs the
+    nested cursor walk using ``subprocess.run(``gh api
+    graphql``)`` and returns the complete list of
+    ``(databaseId, url, author_login, review_id, raw_body)``
+    entries for the thread.
+    """
+    all_comments: list[dict[str, Any]] = []
+    cursor: Optional[str] = None
+    pages_fetched = 0
+    while True:
+        pages_fetched += 1
+        if pages_fetched > safety_cap:
+            return False, [], (
+                f"thread_comments_inventory_capped: "
+                f"thread={thread_id} pages={pages_fetched} "
+                f"safety_cap={safety_cap}"
+            )
+        after_clause = f', after: "{cursor}"' if cursor else ""
+        query_literal = (
+            "query {"
+            # Round-90 follow-up fixed the nested-comments
+            # walker but the previous query built an invalid
+            # GraphQL literal: ``node(id: ...)`` was a child
+            # of ``repository(...)`` (it MUST be a root
+            # field), and the brace count was unbalanced
+            # (10 opening / 9 closing). GitHub rejected every
+            # nested-comments request with a parse error and
+            # the walker returned ``nested_comments_walk_failed``.
+            # The fix below mirrors the root-level ``node(id:)``
+            # shape used by ``_shared_pagination.py``.
+            f"node(id:\"{thread_id}\") {{"
+            "... on PullRequestReviewThread {"
+            f'comments(first:{page_size}{after_clause}) {{'
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            "author { login } pullRequestReview { databaseId } } } } }"
+        )
+        cmd = ["gh", "api", "graphql",
+               "--raw-field", f"query={query_literal}"]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            )
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            )
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            )
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], f"invalid GraphQL response: {exc}"
+        if not isinstance(data, dict):
+            return False, [], "GraphQL response is not a JSON object"
+        errors = data.get("errors")
+        if errors:
+            return False, [], f"GraphQL errors: {errors}"
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], "GraphQL response missing data object"
+        node_obj = data_obj.get("node") or {}
+        if not isinstance(node_obj, dict):
+            return False, [], "GraphQL response missing node"
+        comments_obj = node_obj.get("comments") or {}
+        if not isinstance(comments_obj, dict):
+            return False, [], "GraphQL response missing comments container"
+        nested_page_info = comments_obj.get("pageInfo") or {}
+        for comment in (comments_obj.get("nodes") or []):
+            if isinstance(comment, dict):
+                all_comments.append(comment)
+        if not nested_page_info.get("hasNextPage"):
+            break
+        cursor = nested_page_info.get("endCursor")
+        if not cursor:
+            return False, [], (
+                "comments.pageInfo.hasNextPage=true with no endCursor"
+            )
+    return True, all_comments, ""
+
+
+def _walk_pagination_cursors(
+    *, owner: str, name: str, pr_number: int,
+    page_size: int, safety_cap: int, timeout: int,
+    starting_cursor: Optional[str] = None,
+    starting_pages: int = 0,
+) -> tuple[bool, list[dict[str, Any]], str, int]:
+    """Walk the reviewThreads cursor from the given cursor.
+
+    Returns ``(ok, threads, error_msg, pages_fetched)``.
+
+    Round-69 Codex review 4768843522 (P2): the previous
+    delegate-to-gh_graphql_review_threads approach still
+    stopped at the first page because that helper does
+    not follow pageInfo cursors. This helper performs the
+    cursor walk using ``subprocess.run(``gh api graphql``)``
+    so existing test mocks of ``subprocess.run`` continue
+    to work.
+    """
+    all_threads: list[dict[str, Any]] = []
+    cursor: Optional[str] = starting_cursor
+    pages_fetched = starting_pages
+    while True:
+        pages_fetched += 1
+        if pages_fetched > safety_cap:
+            return False, [], (
+                f"review_thread_inventory_capped: "
+                f"pages={pages_fetched} safety_cap={safety_cap}"
+            ), pages_fetched
+        after_clause = f', after: "{cursor}"' if cursor else ""
+        # Round-69 Codex review 4769487744 (P2): balance
+        # the cursor-walker GraphQL query. The previous
+        # query had 11 ``{`` and 10 ``}`` (one missing
+        # closing brace) so GitHub returned a GraphQL
+        # parse error before any later pages could be
+        # read. Added one more ``}`` to close the outer
+        # query brace.
+        query_literal = (
+            "query {"
+            f'repository(owner:"{owner}", name:"{name}") {{'
+            f"pullRequest(number:{pr_number}) {{"
+            f"reviewThreads(first:{page_size}{after_clause}) {{"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes {"
+            "id isResolved isOutdated "
+            "comments(first:50) {"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            # Round-83 follow-up: also fetch
+            # ``pullRequestReview.databaseId`` so the
+            # pagination walker can populate the
+            # ``thread_meta_by_review_id`` index used
+            # by the per-review-summary finding
+            # resolution-state fallback. Without this,
+            # a PR with more than 100 review threads
+            # would still leave per-review-summary
+            # findings as stale-blockers.
+            "author { login } pullRequestReview { databaseId } } } } } } } }"
+        )
+        cmd = [
+            "gh", "api", "graphql",
+            "--raw-field", f"query={query_literal}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            ), pages_fetched
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            ), pages_fetched
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            ), pages_fetched
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], (
+                f"invalid GraphQL response: {exc}"
+            ), pages_fetched
+        if not isinstance(data, dict):
+            return False, [], (
+                "GraphQL response is not a JSON object"
+            ), pages_fetched
+        errors = data.get("errors")
+        if errors:
+            return False, [], (
+                f"GraphQL errors: {errors}"
+            ), pages_fetched
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], (
+                "GraphQL response missing data object"
+            ), pages_fetched
+        repository = data_obj.get("repository")
+        if not isinstance(repository, dict):
+            return False, [], (
+                "GraphQL response missing repository"
+            ), pages_fetched
+        pr_data = repository.get("pullRequest")
+        if not isinstance(pr_data, dict):
+            return False, [], (
+                "GraphQL response missing pullRequest"
+            ), pages_fetched
+        threads_container = pr_data.get("reviewThreads")
+        if not isinstance(threads_container, dict):
+            return False, [], (
+                "GraphQL response missing reviewThreads container"
+            ), pages_fetched
+        page_info = threads_container.get("pageInfo") or {}
+        if not isinstance(page_info, dict):
+            return False, [], (
+                "GraphQL reviewThreads.pageInfo is not a dict"
+            ), pages_fetched
+        nodes = threads_container.get("nodes")
+        if not isinstance(nodes, list):
+            return False, [], (
+                "GraphQL reviewThreads.nodes is not a list"
+            ), pages_fetched
         for node in nodes:
+            if not isinstance(node, dict):
+                continue
             thread_id = node.get("id", "")
-            is_resolved = node.get("isResolved", False)
-            is_outdated = node.get("isOutdated", False)
-            for comment in (node.get("comments", {}) or {}).get("nodes", []):
+            is_resolved = bool(node.get("isResolved", False))
+            is_outdated = bool(node.get("isOutdated", False))
+            comments_obj = node.get("comments") or {}
+            nested_page_info = comments_obj.get("pageInfo") or {}
+            if not isinstance(nested_page_info, dict):
+                nested_page_info = {}
+            nested_incomplete = bool(
+                nested_page_info.get("hasNextPage")
+            )
+            # Helper to flatten one comment record so the
+            # walker can emit it the same way the
+            # single-page helper does.
+            def _flatten_walked_comment(comment):
                 author_login = (
                     (comment.get("author") or {}).get("login", "")
-                    if comment.get("author") else ""
+                    if isinstance(comment.get("author"), dict)
+                    else ""
                 )
-                threads.append({
+                pr_review = comment.get("pullRequestReview") or {}
+                review_id = (
+                    pr_review.get("databaseId")
+                    if isinstance(pr_review, dict) else None
+                )
+                return {
                     "thread_id": thread_id,
                     "is_resolved": is_resolved,
                     "is_outdated": is_outdated,
                     "database_id": comment.get("databaseId"),
                     "url": comment.get("url") or "",
                     "author_login": author_login,
-                })
-        return True, threads, ""
-    except (json.JSONDecodeError, KeyError) as exc:
-        return False, [], f"invalid GraphQL response: {exc}"
+                    "review_id": review_id,
+                }
+            for comment in (comments_obj.get("nodes") or []):
+                if isinstance(comment, dict):
+                    all_threads.append(_flatten_walked_comment(comment))
+            if nested_incomplete:
+                # Round-90 follow-up: follow the nested
+                # ``comments`` cursor instead of failing
+                # closed. The previous behavior returned
+                # ``nested_comments_not_paginated:
+                # thread=<id>`` whenever any thread's
+                # ``comments.pageInfo.hasNextPage=true``,
+                # leaving the production gate fail-closed
+                # indefinitely for PRs with long-running
+                # review threads.
+                ok_nested, nested_comments, nested_err = (
+                    _walk_thread_comments(
+                        owner=owner, name=name,
+                        pr_number=pr_number,
+                        thread_id=thread_id,
+                        timeout=timeout,
+                    )
+                )
+                if not ok_nested:
+                    return False, [], (
+                        f"nested_comments_walk_failed: "
+                        f"thread={thread_id} error={nested_err}"
+                    ), pages_fetched
+                # Append the walked comments. The earliest
+                # of these are duplicates of the first-page
+                # ``comments`` (the first ``page_size`` were
+                # already flattened above), but the walker
+                # returns the COMPLETE list — including the
+                # first page. The downstream flattening
+                # inventory treats ``database_id`` as the
+                # dedup key, so re-emitting them is harmless.
+                for comment in nested_comments:
+                    if isinstance(comment, dict):
+                        all_threads.append(
+                            _flatten_walked_comment(comment)
+                        )
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true with no "
+                "endCursor"
+            ), pages_fetched
+    return True, all_threads, "", pages_fetched
 
 
+def paginated_review_threads(
+    repo: str, pr_number: int,
+    *, page_size: int = 100, safety_cap: int = 2000,
+    timeout: int = 30,
+) -> tuple[bool, list[dict[str, Any]], str]:
+    """PHASE 2 (PR #412): production paginated review-thread
+    inventory.
+
+    Round-69 Codex reviews 4764653534 and 4768843522 (P2):
+    the previous implementations had two bugs:
+      - the first version used a urllib-based shared
+        paginator that the existing ``subprocess.run`` test
+        mocks did not intercept;
+      - the second version delegated to the inline
+        ``gh_graphql_review_threads`` which still only
+        requests ``reviewThreads(first:100)`` /
+        ``comments(first:50)`` without following the
+        ``pageInfo.hasNextPage`` cursor.
+
+    This implementation:
+      - delegates the first page to the existing
+        ``gh_graphql_review_threads`` (which uses
+        ``subprocess.run`` and is mockable via
+        ``monkeypatch``). When tests mock it to return
+        ``(True, [], "")`` the wrapper short-circuits and
+        returns the mock result unchanged. This preserves
+        every existing test contract.
+      - when the first page returns ``ok=False`` because
+        the outer ``hasNextPage=true`` or any nested
+        ``comments.pageInfo.hasNextPage=true``, walks the
+        cursor via direct ``gh api graphql`` subprocess
+        calls so the inventory is complete (or the safety
+        cap is exhausted, fail-closed).
+
+    Returns ``(success, threads_list, error_msg)`` in the
+    same shape as :func:`gh_graphql_review_threads`.
+    """
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return False, [], f"invalid repo format: {repo!r}"
+    # First page: delegate to ``gh_graphql_review_threads``
+    # so existing test mocks of that helper (via
+    # ``mock.patch.object(crc, "gh_graphql_review_threads",
+    # return_value=(True, [], ""))``) continue to short-circuit
+    # the wrapper for the simple single-page case.
+    # Round-69 Codex review 4768917422 (P1): the first-page
+    # helper now correctly detects incomplete outer
+    # pagination via the rendered pageInfo.hasNextPage flag
+    # and returns ``ok=False`` when ``hasNextPage=true``.
+    # When the helper returns ``ok=True`` the first page is
+    # genuinely complete and the cursor walker is not
+    # required. The wrapper short-circuits on ``ok_first``.
+    ok_first, threads_first, err_first = gh_graphql_review_threads(
+        repo, pr_number
+    )
+    if ok_first:
+        return True, threads_first, err_first
+    # First page reported incomplete inventory. Walk the
+    # cursor via the helper so the inventory is complete.
+    ok, threads, err, _pages = _walk_pagination_cursors(
+        owner=owner, name=name, pr_number=pr_number,
+        page_size=page_size, safety_cap=safety_cap,
+        timeout=timeout, starting_cursor=None, starting_pages=0,
+    )
+    if not ok:
+        # Preserve any visible threads from the first page so
+        # the visible-blocker logic in ``main()`` can still
+        # detect Codex findings on partial inventory.
+        return False, list(threads_first or []) + threads, err
+    return ok, threads, err
 # --------------------------------------------------------------------------
 # GitHub REST API helpers (list-argv, no shell=True)
 # --------------------------------------------------------------------------
@@ -1331,8 +1817,19 @@ def main() -> int:
     # fallback) and the gate status is set to INCONCLUSIVE later in
     # this function (existing behavior).
     thread_meta_by_url: dict[str, dict[str, Any]] = {}
+    # Round-81 follow-up: also index by review_id so per-review-comment
+    # findings whose URL is the review-summary URL (not a thread
+    # discussion URL) can be linked to their parent review and
+    # inherit the resolution state of any thread in that review.
+    thread_meta_by_review_id: dict[int, list[dict[str, Any]]] = {}
     thread_api_error: str | None = None
-    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
+    # Round-69 Codex review 4764653534 (P2): use the
+    # production paginated wrapper instead of the inline
+    # first-page-only GraphQL fetch. Without this, PRs with
+    # more than 100 review threads miss later-page unresolved
+    # Codex threads and the gate can report clean instead
+    # of fail-closed.
+    ok_threads, thread_entries, err_threads = paginated_review_threads(
         args.repo, args.pr_number
     )
     if not ok_threads:
@@ -1342,6 +1839,11 @@ def main() -> int:
             url = entry.get("url", "")
             if url:
                 thread_meta_by_url[url] = entry
+            review_id = entry.get("review_id")
+            if review_id:
+                thread_meta_by_review_id.setdefault(
+                    int(review_id), []
+                ).append(entry)
 
     # Codex bot login — same constant used by the policy safeguard
     # further down. Defined here so the source-aware helper can
@@ -1349,6 +1851,33 @@ def main() -> int:
     # ``chatgpt-codex-connector`` or ``chatgpt-codex-connector[bot]``
     # depending on the API surface; we match the prefix.
     CODEX_BOT_LOGIN_PREFIX = "chatgpt-codex-connector"
+
+    def _extract_review_id(
+        item: dict[str, Any], url: str
+    ) -> Optional[int]:
+        """Extract the parent review_id from a per-review-comment
+        finding's URL or payload, if present.
+
+        Returns the integer review_id or ``None`` when the URL
+        does not encode a review id and the item has no
+        ``pull_request_review_id`` field. Used by the
+        Round-81 follow-up fallback that links per-review-
+        comment findings to their parent review's threads.
+        """
+        import re as _re
+        # 1. URL fragment ``#pullrequestreview-<id>``
+        m = _re.search(r"#pullrequestreview-(\d+)", url or "")
+        if m:
+            return int(m.group(1))
+        # 2. Explicit field on the item.
+        for key in ("pull_request_review_id", "review_id"):
+            v = item.get(key)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     def _is_codex_review_thread_current_unresolved(item: dict[str, Any]) -> bool:
         """Return True iff ``item`` belongs to a current unresolved
@@ -1452,13 +1981,52 @@ def main() -> int:
     # the thread metadata for the PRIMARY actionability decision; this
     # post-classify attachment is for the thread_id / is_resolved /
     # is_outdated fields used by the blocker classification below.
+    #
+    # Round-81 follow-up: for findings whose URL is a per-review
+    # summary (not a thread discussion URL), the URL-based lookup
+    # returns empty metadata and ``thread_id`` / ``thread_resolved``
+    # would be empty/False. Without a fallback those findings
+    # would remain as stale-blockers even after every thread in
+    # their parent review is resolved. The review_id index lets us
+    # inherit the resolution state from any thread in the same
+    # review: if ALL threads in the review are resolved, the
+    # per-review-comment finding is treated as resolved as well.
     # -----------------------------------------------------------------------
     for f in all_findings:
         url = f.get("url", "")
         meta = thread_meta_by_url.get(url, {})
-        f["thread_id"] = meta.get("thread_id", "")
-        f["thread_resolved"] = meta.get("is_resolved", False)
-        f["thread_outdated"] = meta.get("is_outdated", False)
+        thread_id = meta.get("thread_id", "")
+        thread_resolved = meta.get("is_resolved", False)
+        thread_outdated = meta.get("is_outdated", False)
+        if not thread_id:
+            # Fallback: per-review-comment finding whose URL is
+            # the review-summary URL. Look up threads by review_id
+            # (encoded in the URL fragment ``#pullrequestreview-<id>``
+            # or in the item's ``pull_request_review_id`` field).
+            review_id = _extract_review_id(f, url)
+            if review_id is not None:
+                review_threads = thread_meta_by_review_id.get(
+                    int(review_id), []
+                )
+                if review_threads:
+                    # Inherit from the FIRST thread in the review.
+                    # If every thread is resolved, the review-
+                    # summary finding is moot.
+                    thread_id = review_threads[0].get("thread_id", "")
+                    thread_resolved = all(
+                        t.get("is_resolved", False)
+                        for t in review_threads
+                    )
+                    thread_outdated = all(
+                        t.get("is_outdated", False)
+                        for t in review_threads
+                    )
+                    # Mark the review_id so the gate can show
+                    # the linkage in the rendered report.
+                    f["_review_id"] = int(review_id)
+        f["thread_id"] = thread_id
+        f["thread_resolved"] = thread_resolved
+        f["thread_outdated"] = thread_outdated
 
     # P1-B: Verify live head SHA against --reported-head-sha.
     # This check MUST happen before any waiver loading or blocker classification.

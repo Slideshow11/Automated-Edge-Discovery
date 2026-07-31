@@ -175,6 +175,23 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "ancestry_runner": lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
         ),
+        # Round-412 (PHASE 4 Finding 1): evidence flags
+        # required by the new shared policy contract.
+        # Defaults to "all satisfied" so the legacy F4
+        # tests keep their intent of testing the
+        # anchor / actor / codex-shape decisions.
+        "inventory_complete": True,
+        "review_thread_inventory_complete": True,
+        "nested_comment_inventory_complete": True,
+        "no_newer_finding": True,
+        "live_head_match": True,
+        "live_head_sha": head,
+        # Round-69 follow-up: repair_present must be
+        # True so the legacy F4 tests can isolate the
+        # anchor / actor / codex-shape decisions
+        # without every test constructing an extra
+        # evidence flag.
+        "repair_present": True,
     }
     base.update(overrides)
     return base
@@ -507,9 +524,16 @@ class TestRound5FollowUpAncestryVerifier:
         assert reason == "ancestry_unavailable"
 
     def test_verified_ancestry_cannot_override_failed_safety(self):
-        """Even with verified ancestry, an outdated-required or
-        actor-required failure still blocks the thread."""
-        # ``is_outdated=False`` -> reason "not_outdated".
+        """Even with verified ancestry, a non-Codex actor or
+        missing anchor still blocks the thread.
+
+        PHASE 3 R-3 (PR #412): ``is_outdated=False`` is no
+        longer a blocker on its own. The new policy rejects
+        only when a HARD SAFETY condition fails. The
+        legacy ``not_outdated`` reason is removed.
+        """
+        # ``is_outdated=False`` with all other evidence
+        # proven -> ELIGIBLE (no ``not_outdated`` rejection).
         thread = _bot_thread(anchor=OTHER_HEAD, is_outdated=False)
         ancestry_runner = lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
@@ -518,8 +542,22 @@ class TestRound5FollowUpAncestryVerifier:
             thread,
             **_eligibility_kwargs(ancestry_runner=ancestry_runner),
         )
+        assert ok is True
+        assert reason == "eligible"
+
+        # Non-Codex top-level actor -> ``actor_not_codex``
+        # despite verified ancestry and ``is_outdated=False``.
+        thread = _bot_thread(
+            anchor=OTHER_HEAD,
+            is_outdated=False,
+            author="dependabot[bot]",
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
         assert ok is False
-        assert reason == "not_outdated"
+        assert reason == "actor_not_codex"
 
 
 # ---------------------------------------------------------------------------
@@ -2595,6 +2633,22 @@ class TestRound8CodexOnlyAutoResolution:
             "ancestry_runner": lambda *a, **kw: mock.Mock(
                 returncode=0, stdout="ahead", stderr=""
             ),
+            # Round-412 (PHASE 4 Finding 1): new evidence
+            # flags default to satisfied so existing F4
+            # tests keep their intent of testing the
+            # anchor / actor / codex-shape decisions.
+            "inventory_complete": True,
+            "review_thread_inventory_complete": True,
+            "nested_comment_inventory_complete": True,
+            "no_newer_finding": True,
+            "live_head_match": True,
+            "live_head_sha": DEFAULT_HEAD,
+            # Round-69 follow-up: repair_present default
+            # to True so legacy F4 tests can isolate the
+            # anchor / actor / codex-shape decisions
+            # without every test constructing an extra
+            # evidence flag.
+            "repair_present": True,
         }
         base.update(overrides)
         return base
@@ -2741,6 +2795,19 @@ class TestRound8CodexOnlyAutoResolution:
             ancestry_runner=lambda *a, **kw: mock.Mock(
                 returncode=0, stdout="ahead", stderr=""
             ),
+            # Round-412 (PHASE 4 Finding 1): explicit
+            # evidence flags so the legacy F4 test keeps
+            # its intent of partitioning by thread shape.
+            inventory_complete=True,
+            review_thread_inventory_complete=True,
+            nested_comment_inventory_complete=True,
+            no_newer_finding=True,
+            live_head_match=True,
+            live_head_sha=DEFAULT_HEAD,
+            # Round-69 follow-up: explicit repair_present
+            # so the legacy F4 test keeps its intent of
+            # partitioning by thread shape.
+            repair_present=True,
         )
         eligible_ids = [t["thread_id"] for t in result["eligible"]]
         assert eligible_ids == ["T-CODEX-A"]
@@ -4948,6 +5015,38 @@ class TestRound14RequireNonemptyThreadParticipants:
         base.update(kwargs)
         return base
 
+    def _eligibility_kwargs(self, head_sha="d" * 40, **overrides):
+        """Return kwargs for ``is_eligible_for_bot_resolution``
+        that satisfy the new shared-policy evidence flags.
+
+        Round-412 (PHASE 4 Finding 1): every eligibility
+        call MUST supply the audit evidence flags. Tests
+        in this class that test non-inventory-shape decisions
+        (e.g. ``human_reply``, ``actor_not_codex``,
+        ``nonempty complete Codex-only``) need the new
+        flags passed to reach the actor/anchor checks.
+
+        Round-69 follow-up: ``repair_present`` must be
+        True so these tests can isolate the actor /
+        anchor decisions without every test constructing
+        an extra evidence flag.
+        """
+        base = {
+            "head_sha": head_sha,
+            "codex_verdict": "clean",
+            "codex_clean_passed": True,
+            "codex_reviewed_sha": head_sha,
+            "inventory_complete": True,
+            "review_thread_inventory_complete": True,
+            "nested_comment_inventory_complete": True,
+            "no_newer_finding": True,
+            "live_head_match": True,
+            "live_head_sha": head_sha,
+            "repair_present": True,
+        }
+        base.update(overrides)
+        return base
+
     def test_missing_comments_and_comment_list_blocks(self):
         from scripts.local import aed_pr_readiness as R
         thread = self._thread()
@@ -5039,9 +5138,7 @@ class TestRound14RequireNonemptyThreadParticipants:
                        {"author": "human-user"}],
         )
         eligible, reason = R.is_eligible_for_bot_resolution(
-            thread, head_sha="d" * 40,
-            codex_verdict="clean",
-            codex_clean_passed=True,
+            thread, **self._eligibility_kwargs(),
         )
         assert eligible is False
         assert reason == "human_reply"
@@ -5074,11 +5171,10 @@ class TestRound14RequireNonemptyThreadParticipants:
             comments=[{"author": "chatgpt-codex-connector[bot]"}],
         )
         eligible, reason = R.is_eligible_for_bot_resolution(
-            thread, head_sha="a" * 40,
-            codex_verdict="clean",
-            codex_clean_passed=True,
-            repo="owner/repo",
-            codex_reviewed_sha="a" * 40,
+            thread, **self._eligibility_kwargs(
+                head_sha="a" * 40,
+                repo="owner/repo",
+            ),
         )
         # Either eligible=True (when ancestry matches) or
         # the test still proves the comments check passes

@@ -51,7 +51,6 @@ import argparse
 import json
 import re
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,6 +109,39 @@ from typing import Any, Dict, List, Optional, Tuple
 # the repo root) and any future nested-layout refactor.
 import os as _os
 import sys as _sys
+
+# Round-412: delegate to the shared Codex classifier.
+try:
+    from scripts.local._shared_codex_classifier import (
+        CODEX_CLEAN_PASS_PHRASES,
+        CODEX_CLEAN_PASS_EXTRA_FRAGMENTS,
+        CODEX_REVIEW_SUMMARY_PREFIX,
+        CODEX_FINDING_BADGE_PREFIX,
+        is_codex_clean_pass_comment as _shared_is_clean,
+        is_codex_finding_body as _shared_is_finding,
+        is_codex_review_summary as _shared_is_summary,
+        extract_review_commit_oid as _shared_extract_oid,
+        body_has_finding_badge as _shared_body_has_finding,
+        # Round-412 (MINIMAX P2 Finding 1): route
+        # ``has_active_blocker`` through the canonical
+        # case-insensitive ``is_codex_login`` predicate
+        # so a Codex-authored active thread whose
+        # author field is not lowercased is still
+        # recognized as a current-head finding. The
+        # previous code used a case-sensitive ``in``
+        # check against ``CODEX_BOT_LOGINS`` (the
+        # audit's local frozenset), which silently
+        # missed uppercase/mixed-case Codex logins.
+        is_codex_login as _shared_is_codex_login,
+    )
+except ImportError:
+    _shared_is_clean = None
+    _shared_is_finding = None
+    _shared_is_summary = None
+    _shared_extract_oid = None
+    _shared_body_has_finding = None
+    _shared_is_codex_login = None
+
 _SCRIPT_DIR_HERE = _os.path.dirname(_os.path.abspath(__file__))
 # Walk up to find the parent of the ``scripts/`` directory.
 # The repo root sits one level above ``scripts/`` in the
@@ -184,6 +216,42 @@ CODEX_BOT_LOGINS = frozenset({
     "chatgpt-codex-connector[bot]",
 })
 
+# Precomputed normalized (lowercase) fallback login set. Used by
+# ``_local_codex_login_fallback`` when the canonical shared
+# ``is_codex_login`` predicate is unavailable. Precomputed once
+# at module load so the generator inside ``has_active_blocker``
+# does not rebuild the set for every thread.
+_LOCAL_CODEX_LOGINS_LOWER: frozenset = frozenset(
+    a.lower() for a in CODEX_BOT_LOGINS
+)
+
+
+def _local_codex_login_fallback(login: Any) -> bool:
+    """Local fallback Codex-login predicate.
+
+    Round-412 (FINAL direct-CLI micro-repair): the canonical
+    ``is_codex_login`` predicate from ``_shared_codex_classifier``
+    requires a non-empty string and normalizes with ``.lower()``.
+    The previous fallback in ``has_active_blocker`` was
+    ``(t.get("author", "") or "").lower() in {a.lower() for a in CODEX_BOT_LOGINS}``
+    which raises ``AttributeError`` when ``author`` is a truthy
+    non-string (e.g., an integer from a malformed GraphQL
+    response). This fallback matches the canonical predicate's
+    type-safety and case-insensitive identity semantics: it
+    returns False for any non-string value (None, int, list,
+    dict, empty string) and otherwise compares
+    ``login.lower()`` against the precomputed normalized
+    ``_LOCAL_CODEX_LOGINS_LOWER`` set. Never raises.
+
+    The canonical predicate is still preferred when available
+    (single source of truth); this fallback is only used when
+    the shared classifier import fails.
+    """
+    if not isinstance(login, str) or not login:
+        return False
+    return login.lower() in _LOCAL_CODEX_LOGINS_LOWER
+
+
 # Exact phrase Codex uses to denote a clean pass in issue-level comments.
 CODEX_CLEAN_PASS_PHRASE = "Codex Review: Didn\u2019t find any major issues"
 # Accept both curly and straight apostrophes
@@ -228,7 +296,15 @@ def is_codex_review_summary(body: str) -> bool:
     A review with this prefix carries inline review
     comments for the actual findings; the summary body
     itself is not a finding.
+
+    PHASE 3 (PR #412): delegates to the shared module so
+    the audit, poller, gate, and controller share one
+    canonical predicate.
     """
+    if _shared_is_summary is not None:
+        return _shared_is_summary(body)
+    # Fail-closed default if the shared module could not be
+    # imported at startup.
     if not body:
         return False
     return body.lstrip().startswith(CODEX_REVIEW_SUMMARY_PREFIX)
@@ -239,7 +315,11 @@ def is_codex_finding_body(body: str) -> bool:
     inline review comment carrying a finding badge
     (Round-52). Used to classify the summary-format
     review body's inline comments.
+
+    PHASE 3 (PR #412): delegates to the shared module.
     """
+    if _shared_is_finding is not None:
+        return _shared_is_finding(body)
     if not body:
         return False
     return body.lstrip().startswith(CODEX_FINDING_BADGE_PREFIX)
@@ -550,7 +630,15 @@ def gh_graphql_review_threads(
         "reviewThreads(first:100) {",
         "pageInfo { hasNextPage endCursor }",
         "nodes {",
-        "id isResolved isOutdated",
+        # Round-69 Codex review 4769344844 (P1): add
+        # whitespace between ``isOutdated`` and
+        # ``comments`` so the rendered query is
+        # ``... isOutdated comments(first:50) ...``
+        # instead of ``... isOutdatedcomments(first:50) ...``
+        # (the latter is a single nonexistent field that
+        # causes GitHub to return a GraphQL error on every
+        # live run).
+        "id isResolved isOutdated ",
         "comments(first:50) {",
         "pageInfo { hasNextPage endCursor }",
         # ``originalCommit`` is the commit the comment was posted
@@ -579,6 +667,16 @@ def gh_graphql_review_threads(
         "review_thread_comment_inventory_complete": False,
         "review_thread_comment_inventory_error_count": 0,
         "review_thread_comment_incomplete_thread_ids": [],
+        # Round-74 PHASE 3: every genuine fetch, parse, GraphQL,
+        # schema, cursor, or safety-cap failure path must set
+        # outer_page_fetch_succeeded=False so the parent walker
+        # can distinguish a real outer error from a
+        # successfully-fetched terminal outer page with
+        # pending nested work.
+        "outer_page_fetch_succeeded": False,
+        "outer_page_terminal": False,
+        "outer_page_has_next": False,
+        "current_page_nested_pending_ids": [],
     }
     try:
         result = subprocess.run(
@@ -823,34 +921,27 @@ def is_codex_clean_pass_comment(body: str) -> bool:
     emit ``is_clean_pass=True`` for a response that
     actually carries a finding. The same rule applies to
     any body that contains a finding badge line.
+
+    PHASE 3 (PR #412): delegates to the shared module so
+    the audit, poller, gate, and controller share one
+    canonical predicate. The shared module already
+    enforces the Round-64/65 invariants.
     """
+    if _shared_is_clean is not None:
+        return _shared_is_clean(body)
+    # Fail-closed default if the shared module could not be
+    # imported at startup.
     if not body:
         return False
-    # Round-65 fix: if the body contains a finding
-    # badge line, it is NEVER a clean pass, regardless
-    # of any clean fragments also present. This is the
-    # fail-closed default: a finding badge in the body
-    # always wins over a clean fragment.
     if any(
         is_codex_finding_body(line)
         for line in body.splitlines()
     ):
         return False
-    # Round-52: summary-format reviews are clean passes
-    # when they have no inline-finding markers in the
-    # body. The audit already recognizes this for
-    # formal reviews; issue comments that look like
-    # summary reviews (e.g. an echoed review posted
-    # as a PR-level issue comment) are also clean
-    # passes when the body is free of finding
-    # markers.
     if is_codex_review_summary(body):
         return True
-    # Legacy exact phrase check.
     if any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES):
         return True
-    # Round-64: additional clean-pass fragments
-    # mirroring the poller's vocabulary.
     lower = body.lower()
     if any(frag in lower for frag in CODEX_CLEAN_PASS_EXTRA_FRAGMENTS):
         return True
@@ -955,6 +1046,1541 @@ def _fetch_review_inline_comments_with_pr(
 # ---------------------------------------------------------------------------
 # Main classification pipeline
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Canonical shared-pagination wrapper for the audit.
+# Round-69 Codex review 4764653534 (P2): the inline
+# ``gh_graphql_review_threads`` was retained below the
+# ``__main__`` guard, so direct CLI runs exited before this
+# wrapper was defined. Move it above ``classify`` and wire
+# ``classify`` to use the shared paginator instead of the
+# inline first-page-only GraphQL query.
+# ---------------------------------------------------------------------------
+
+def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, timeout: int) -> dict:
+    """Round-70 PHASE 3-P2: follow nested ``comments(after: <cursor>)`` for every
+    thread whose initial comments(first:50) returned
+    ``pageInfo.hasNextPage=true``. Aggregates all nested comments by
+    stable ``databaseId`` and attaches them to the thread node's
+    ``comments`` list under the original key the eligibility/packet
+    builders expect (Round-69 ``comments`` key).
+
+    Returns::
+
+      {
+        "complete": bool,
+        "pages": int,
+        "capped": bool,
+        "error": Optional[str],
+        "fetched_comments_by_thread_id": Dict[str, list],
+      }
+
+    Fail closed on:
+      - missing or non-importable helper;
+      - any thread fetch returning ok=False;
+      - per-thread safety cap exceeded while following nested cursors;
+      - aggregate pages exceeding the operator cap across all threads;
+      - paginate_nested_comments returning complete=False.
+
+    Round-106 follow-up (VUIvY / PRRT_kwDOSHFpYM6VUIvY): the
+    previous implementation passed the full ``safety_cap`` to
+    each per-thread call and only accumulated ``pages_total``
+    without checking it. 31 threads with one additional page
+    each returned ``complete=True`` while carrying
+    ``thread_count × safety_cap`` comments. The fix enforces a
+    separate AGGREGATE pages bound equal to ``safety_cap`` so
+    the audit's runtime and memory bound cannot be defeated by
+    splitting the inventory across many threads. When the
+    aggregate ``pages_total`` crosses the cap, the helper
+    breaks early and returns ``capped=True, complete=False``.
+    """
+    try:
+        from scripts.local._shared_pagination import paginate_nested_comments
+    except Exception:
+        return {
+            "complete": False,
+            "pages": 0,
+            "capped": False,
+            "error": "paginate_nested_comments_unavailable",
+            "fetched_comments_by_thread_id": {},
+        }
+    fetched: dict = {}
+    pages_total = 0
+    for tn in thread_nodes:
+        if not isinstance(tn, dict):
+            continue
+        tid = tn.get("id", "")
+        if not tid:
+            continue
+        # Find the nested cursor from the first-page comments.pageInfo.endCursor.
+        comments_field = tn.get("comments") or {}
+        if not isinstance(comments_field, dict):
+            continue
+        page_info = (comments_field.get("pageInfo") or {})
+        if not isinstance(page_info, dict):
+            page_info = {}
+        nested_cursor = page_info.get("endCursor") or ""
+        nested_has_next = bool(page_info.get("hasNextPage"))
+        if not nested_has_next:
+            continue  # nothing to follow
+        if not nested_cursor:
+            # hasNextPage=true without endCursor is a fail-closed
+            # condition per the contract.
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": False,
+                "error": (
+                    f"hasNextPage_without_endCursor: thread={tid}"
+                ),
+                "fetched_comments_by_thread_id": fetched,
+            }
+        # Round-108 follow-up (VUasS): the previous
+        # check ran AFTER ``paginate_nested_comments``
+        # had already executed. When prior threads
+        # consumed exactly ``safety_cap`` pages and this
+        # thread had ``nested_has_next=True``, the
+        # paginator would execute once more before
+        # detecting overflow, exceeding the operator's
+        # runtime bound by nearly another full
+        # per-thread safety_cap. The fix is a PRE-FETCH
+        # budget check: if ``pages_total`` already
+        # equals ``safety_cap``, this thread would push
+        # the aggregate past the cap, so we fail closed
+        # without invoking the paginator.
+        if pages_total >= safety_cap:
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": True,
+                "error": "aggregate_pages_cap_exceeded",
+                "fetched_comments_by_thread_id": fetched,
+            }
+        # Round-109 follow-up (VUkNY): the previous
+        # call granted the next ``paginate_nested_comments``
+        # the full per-thread ``safety_cap`` rather than
+        # the REMAINING aggregate budget. The fix passes
+        # the REMAINING page-budget as a separate
+        # ``pages_cap`` argument while preserving the
+        # original per-thread item-cap. Round-110 follow-up
+        # (VUtWh) separated the two caps: ``safety_cap``
+        # still bounds the items count, while
+        # ``pages_cap`` bounds only the page count.
+        remaining_budget = safety_cap - pages_total
+        result = paginate_nested_comments(
+            tid,
+            page_size=100,
+            safety_cap=safety_cap,
+            pages_cap=remaining_budget,
+            timeout=timeout,
+            initial_cursor=nested_cursor,
+        )
+        pages_total += int(result.get("pages", 0) or 0)
+        # Round-107 follow-up (VUQ6I): the previous ``>=``
+        # comparison reported the inventory as capped when
+        # the aggregate pages count exactly equaled
+        # ``safety_cap``. By definition, ``thread_count``
+        # successful one-page threads consuming exactly
+        # ``safety_cap`` total pages IS a complete bounded
+        # inventory. The fix uses strict ``>``: a 31st
+        # page triggers ``aggregate_pages_cap_exceeded``,
+        # while 30 one-page results with cap=30 stay complete.
+        # Round-108 follow-up: the post-fetch check is
+        # defensive and rarely fires (the pre-fetch budget
+        # check above stops the next call). It guards
+        # against a paginator returning ``pages > 0`` when
+        # ``pages_total`` was already at the cap.
+        if pages_total > safety_cap:
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": True,
+                "error": "aggregate_pages_cap_exceeded",
+                "fetched_comments_by_thread_id": fetched,
+            }
+        if not result.get("complete"):
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": bool(result.get("capped")),
+                "error": result.get("error") or "nested_pagination_failed",
+                "fetched_comments_by_thread_id": fetched,
+            }
+        fetched[tid] = result.get("nodes", [])
+    return {
+        "complete": True,
+        "pages": pages_total,
+        "capped": False,
+        "error": None,
+        "fetched_comments_by_thread_id": fetched,
+    }
+
+
+
+def _build_raw_thread_node(outer_node: Dict[str, Any]) -> Dict[str, Any]:
+    """Round-76 PHASE 3 helper: build the canonical raw thread node
+    for the nested-pagination follower. One raw node per stable
+    thread id; never per comment.
+    """
+    return {
+        "id": outer_node.get("id", ""),
+        "comments": outer_node.get("comments") or {},
+        "raw": outer_node,
+    }
+
+
+def _dedup_raw_thread_nodes_by_id(
+    raw_nodes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Round-76 PHASE 3 helper: collapse duplicate raw nodes to one
+    per stable thread id. Preserve the most cursor-complete node
+    (longest ``comments.pageInfo.endCursor`` wins, deterministic).
+    If neither cursor is a prefix-extension of the other AND they
+    differ, fail closed with ``conflicting_cursor_for_thread_id``.
+    """
+    if not raw_nodes:
+        return []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for rn in raw_nodes:
+        if not isinstance(rn, dict):
+            continue
+        tid = rn.get("id", "") or ""
+        if not tid:
+            continue
+        candidate = rn
+        if tid in by_id:
+            existing = by_id[tid]
+            ec = (
+                (existing.get("comments") or {}).get("pageInfo") or {}
+            ).get("endCursor") or ""
+            cc = (
+                (candidate.get("comments") or {}).get("pageInfo") or {}
+            ).get("endCursor") or ""
+            if ec and cc and ec != cc:
+                # Two non-empty differing cursors. Compatible iff
+                # one extends the other (the longer is a
+                # continuation of the shorter). When they are
+                # both non-empty but neither extends the other,
+                # they are an irreconcilable conflict — fail
+                # closed.
+                if cc.startswith(ec) or ec.startswith(cc):
+                    if len(cc) > len(ec):
+                        by_id[tid] = candidate
+                else:
+                    raise ValueError(
+                        f"conflicting_cursor_for_thread_id: {tid} "
+                        f"existing={ec!r} candidate={cc!r}"
+                    )
+            elif cc and not ec:
+                # Candidate has a cursor, existing doesn't.
+                by_id[tid] = candidate
+            # If both empty, keep existing.
+        else:
+            by_id[tid] = candidate
+    # Preserve original outer-page insertion order by deduplicating
+    # in first-seen order.
+    seen: set = set()
+    ordered: List[Dict[str, Any]] = []
+    for rn in raw_nodes:
+        if not isinstance(rn, dict):
+            continue
+        tid = rn.get("id", "") or ""
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        ordered.append(by_id[tid])
+    return ordered
+
+
+
+
+def _attach_canonical_thread_participants(
+    thread_id: str,
+    all_threads: List[Dict[str, Any]],
+) -> None:
+    """Round-78 PHASE 3 P2 fix: ensure every flattened record
+    for ``thread_id`` carries the same canonical participant
+    evidence so that ``aed_pr.deduplicate_thread_records()``
+    never fails closed on a duplicate thread that has an
+    empty ``comments`` list on a fetched record.
+
+    The helper:
+
+    1. finds the canonical participant list by taking the
+       union of all ``comments`` entries across every record
+       that shares ``thread_id`` AND adding the explicit
+       ``unknown`` participant for any fetched author label
+       not yet present;
+    2. deduplicates participants by ``(database_id, author)``
+       while preserving first-seen order;
+    3. writes the same canonical list back to every matching
+       record.
+
+    This is a narrow additive helper. It does not fabricate
+    participants that were not actually observed; it only
+    propagates the canonical evidence that was already
+    assembled for the thread by the Round-77 PHASE 3 P1-B
+    branch (which updates the anchor record's ``comments``).
+    """
+    if not thread_id:
+        return
+    canonical: list = []
+    seen_keys: set = set()
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        for c in rec.get("comments") or []:
+            if not isinstance(c, dict):
+                continue
+            key = c.get("database_id") or c.get("author") or ""
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            canonical.append({
+                "author": c.get("author") or "",
+                "database_id": c.get("database_id"),
+            })
+    # Also fold in any fetched author labels that the canonical
+    # list has not yet captured (mirrors the Round-77 anchor
+    # update path).
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        author_label = rec.get("author") or ""
+        if not author_label:
+            continue
+        anchor_key = author_label
+        if anchor_key not in seen_keys:
+            seen_keys.add(anchor_key)
+            canonical.append({
+                "author": author_label,
+                "database_id": None,
+            })
+    if not canonical:
+        return
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        rec["comments"] = list(canonical)
+
+
+
+def _flatten_review_thread_comment(
+    thread_state: Dict[str, Any],
+    raw_comment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Round-76 PHASE 3 helper: build a canonical flattened
+    inventory record for any comment (initial-page or fetched
+    via nested-follower), preserving thread id, anchor state,
+    and the comment's author, body, URL, path, line, original
+    commit OID, and database id.
+    """
+    author_login = ""
+    au = raw_comment.get("author") or {}
+    if isinstance(au, dict):
+        author_login = au.get("login", "") or ""
+    elif isinstance(au, str):
+        author_login = au
+    oc = raw_comment.get("originalCommit")
+    original_commit_oid = ""
+    if isinstance(oc, dict):
+        original_commit_oid = oc.get("oid", "") or ""
+    return {
+        "thread_id": thread_state.get("thread_id", ""),
+        "is_resolved": bool(thread_state.get("is_resolved", False)),
+        "is_outdated": bool(thread_state.get("is_outdated", False)),
+        "comment_database_id": raw_comment.get("databaseId"),
+        "comment_url": raw_comment.get("url", "") or "",
+        "author": author_login,
+        "body": raw_comment.get("body", "") or "",
+        "path": raw_comment.get("path", "") or "",
+        "line": raw_comment.get("line"),
+        "original_commit_sha": original_commit_oid,
+        "comments": [],
+        "nested_incomplete": False,
+    }
+
+
+def _merge_flattened_comment(
+    records: List[Dict[str, Any]],
+    record: Dict[str, Any],
+    dedup_index: Optional[Dict[Tuple[Any, Any], int]] = None,
+) -> None:
+    """Round-76 PHASE 3 helper: append a flattened comment record
+    to the inventory list, deduplicating by stable
+    ``comment_database_id`` and preserving useful original order.
+
+    Round-77 PHASE 3 P1-A defense-in-depth: a null
+    ``comment_database_id`` cannot be deduplicated, so a
+    runaway caller could append the same record many times.
+
+    Round-89 follow-up: the previous implementation used
+    ``for existing in records[:2000]`` which silently
+    allowed duplicate records whose position was past
+    index 2000 to slip through and inflate the audit packet.
+    To support the full inventory correctly, callers that
+    pre-build a ``dedup_index`` (mapping
+    ``(thread_id, comment_database_id) -> index in records``)
+    should pass it in; the loop becomes O(1). Callers that
+    omit ``dedup_index`` fall back to the linear scan but still
+    MUST NOT silently truncate. The linear fallback
+    documents the truncation explicitly so future audits can
+    detect it.
+    """
+    db_id = record.get("comment_database_id")
+    thread_id = record.get("thread_id")
+    if db_id is not None:
+        if dedup_index is not None:
+            key = (thread_id, db_id)
+            if key in dedup_index:
+                # Already materialized; do not duplicate.
+                return
+        else:
+            for existing in records:
+                if (existing.get("thread_id") == thread_id
+                        and existing.get("comment_database_id") == db_id):
+                    # Already materialized; do not duplicate.
+                    return
+    records.append(record)
+    if dedup_index is not None and db_id is not None:
+        dedup_index[(thread_id, db_id)] = len(records) - 1
+
+
+def _canonical_review_thread_inventory(
+    *, owner, name, pr_number, page_size: int = 100,
+    timeout: int = 30,
+    starting_cursor: Optional[str] = None,
+    starting_pages: int = 0,
+    safety_cap: int = 2000,
+    do_walk: bool = False,
+):
+    """Canonical review-thread inventory.
+
+    Round-69 Codex review 4769640328 (P2): the production
+    status/advance/merge path calls this helper with
+    ``max_polls=1`` and cannot advance the cursor across
+    multiple poll iterations. To make the one-shot
+    controller path work, the polling loop in
+    ``classify()`` calls this helper with ``do_walk=True``
+    on the first poll to walk every page internally. The
+    multi-poll cursor path uses ``do_walk=False`` so each
+    poll iteration returns just one page.
+
+    This implementation:
+      - keeps the ``subprocess.run(``gh api graphql``)`` call
+        shape so existing test mocks via ``monkeypatch``
+        continue to work;
+      - requests a single page of ``reviewThreads`` with
+        nested ``comments.pageInfo`` (so the nested-comment
+        fail-closed check is preserved);
+      - returns the visible threads (with
+        ``nested_incomplete=True`` per-thread) so the
+        visible-blocker logic in ``classify()`` can still
+        detect Codex findings on partial inventory;
+      - marks the overall inventory as incomplete via
+        ``ok=False`` and the metadata flags when the
+        first page's outer ``hasNextPage=true`` OR any
+        thread's nested ``comments.pageInfo.hasNextPage=true``.
+
+    Returns ``(ok, threads, error_msg, metadata)``.
+    """
+    empty_metadata: Dict[str, Any] = {
+        "review_thread_comment_inventory_complete": False,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+        "review_thread_inventory_complete": False,
+        "review_thread_inventory_pages": 0,
+        "review_thread_inventory_capped": False,
+        "review_thread_inventory_error": "",
+        # Round-74 PHASE 3: explicit structured per-page status
+        # to distinguish real outer-fetch failure from a
+        # successfully-fetched terminal outer page with
+        # pending nested work.
+        "outer_page_fetch_succeeded": False,
+        "outer_page_terminal": False,
+        "outer_page_has_next": False,
+        "current_page_nested_pending_ids": [],
+    }
+    all_threads: List[Dict[str, Any]] = []
+    # Round-71 PHASE 3-P2-A: keep raw outer review-thread
+    # nodes (with their full ``id`` and nested
+    # ``comments.pageInfo.endCursor``) alongside the
+    # flattened audit records. The nested-pagination
+    # follower needs the raw shape to issue the correct
+    # GraphQL query against the canonical endpoint.
+    raw_thread_nodes: List[Dict[str, Any]] = []
+    incomplete_nested_thread_ids: List[str] = []
+    # Round-76 PHASE 3 P1-F2: per-thread raw-node dedup.
+    per_thread_raw_added: set = set()
+    outer_node_id: str = ""
+    outer_has_next = False
+    outer_end_cursor: Optional[str] = None
+    try:
+        after_clause = (
+            f', after: "{starting_cursor}"'
+            if starting_cursor
+            else ""
+        )
+        query_literal = (
+            "query {"
+            f'repository(owner:"{owner}", name:"{name}") {{'
+            f"pullRequest(number:{pr_number}) {{"
+            f"reviewThreads(first:{page_size}{after_clause}) {{"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes {"
+            # Round-69 Codex review 4769344844 (P1): add
+            # whitespace between ``isOutdated`` and
+            # ``comments`` so the rendered query is
+            # ``... isOutdated comments(first:50) ...``
+            # instead of ``... isOutdatedcomments(first:50) ...``.
+            "id isResolved isOutdated "
+            "comments(first:50) {"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            "author { login } } } } } } } }"
+        )
+        cmd = [
+            "gh", "api", "graphql",
+            "--raw-field", f"query={query_literal}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            ), dict(empty_metadata)
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            ), dict(empty_metadata)
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            ), dict(empty_metadata)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], (
+                f"invalid GraphQL response: {exc}"
+            ), dict(empty_metadata)
+        if not isinstance(data, dict):
+            return False, [], (
+                "GraphQL response is not a JSON object"
+            ), dict(empty_metadata)
+        errors = data.get("errors")
+        if errors:
+            return False, [], (
+                f"GraphQL errors: {errors}"
+            ), dict(empty_metadata)
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], (
+                "GraphQL response missing data object"
+            ), dict(empty_metadata)
+        repository = data_obj.get("repository")
+        if not isinstance(repository, dict):
+            return False, [], (
+                "GraphQL response missing repository"
+            ), dict(empty_metadata)
+        pr_data = repository.get("pullRequest")
+        if not isinstance(pr_data, dict):
+            return False, [], (
+                "GraphQL response missing pullRequest"
+            ), dict(empty_metadata)
+        threads_container = pr_data.get("reviewThreads")
+        if not isinstance(threads_container, dict):
+            return False, [], (
+                "GraphQL response missing reviewThreads container"
+            ), dict(empty_metadata)
+        page_info = threads_container.get("pageInfo") or {}
+        if not isinstance(page_info, dict):
+            return False, [], (
+                "GraphQL reviewThreads.pageInfo is not a dict"
+            ), dict(empty_metadata)
+        nodes = threads_container.get("nodes")
+        if not isinstance(nodes, list):
+            return False, [], (
+                "GraphQL reviewThreads.nodes is not a list"
+            ), dict(empty_metadata)
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            outer_node_id = node.get("id", "") or ""
+            thread_id = outer_node_id
+            is_resolved = bool(node.get("isResolved", False))
+            is_outdated = bool(node.get("isOutdated", False))
+            comments_obj = node.get("comments") or {}
+            nested_page_info = comments_obj.get("pageInfo") or {}
+            if not isinstance(nested_page_info, dict):
+                nested_page_info = {}
+            nested_incomplete = bool(
+                nested_page_info.get("hasNextPage")
+            )
+            if nested_incomplete and thread_id:
+                incomplete_nested_thread_ids.append(thread_id)
+            # Aggregate per-thread participants so the
+            # eligibility check can verify "every reply in
+            # the thread is bot-authored" rather than
+            # looking at a single comment in isolation.
+            thread_participants: Dict[str, List[Dict[str, Any]]] = {}
+            for comment in (comments_obj.get("nodes") or []):
+                if not isinstance(comment, dict):
+                    continue
+                entry = thread_participants.setdefault(
+                    thread_id, []
+                )
+                entry.append({
+                    "author": (
+                        (comment.get("author") or {}).get(
+                            "login", ""
+                        )
+                        if isinstance(comment.get("author"), dict)
+                        else ""
+                    ),
+                    "database_id": comment.get("databaseId"),
+                })
+            for comment in (comments_obj.get("nodes") or []):
+                if not isinstance(comment, dict):
+                    continue
+                author_login = (
+                    (comment.get("author") or {}).get("login", "")
+                    if isinstance(comment.get("author"), dict)
+                    else ""
+                )
+                original_commit_oid = ""
+                oc = comment.get("originalCommit")
+                if isinstance(oc, dict):
+                    original_commit_oid = oc.get("oid", "") or ""
+                entry = {
+                    "thread_id": thread_id,
+                    "is_resolved": is_resolved,
+                    "is_outdated": is_outdated,
+                    "comment_database_id": comment.get("databaseId"),
+                    "comment_url": comment.get("url", "") or "",
+                    "author": author_login,
+                    "body": comment.get("body", "") or "",
+                    "path": comment.get("path", "") or "",
+                    "line": comment.get("line"),
+                    "original_commit_sha": original_commit_oid,
+                    # Round-69 Codex review 4768843522 (P2):
+                    # the packet builder at line 2233 reads
+                    # ``t.get("comments")`` to extract the
+                    # per-thread participant list. Storing
+                    # it under "participants" made the
+                    # shared non-human policy reject
+                    # otherwise eligible Codex-only threads
+                    # as ``unknown_actor_in_thread``. Use
+                    # "comments" to match the original key
+                    # the packet builder expects.
+                    "comments": thread_participants.get(
+                        thread_id, []
+                    ),
+                    "nested_incomplete": nested_incomplete,
+                }
+                # Round-71 PHASE 3-P2-A: keep the raw outer
+                # thread node so the nested-pagination
+                # follower can issue the canonical
+                # ``node(id: $threadId)`` query against the
+                # original payload, not against the
+                # flattened participant record.
+                # Round-76 PHASE 3 P1-F2: build the raw outer
+                # thread node ONCE per thread (NOT per comment),
+                # so a thread with 50 first-page comments no
+                # longer creates 50 duplicate raw nodes. The
+                # helper returns a canonical node; we add it
+                # only on the first time we observe the thread
+                # id on this outer page.
+                if (
+                    outer_node_id
+                    and outer_node_id not in per_thread_raw_added
+                ):
+                    raw_thread_nodes.append(
+                        _build_raw_thread_node(node)
+                    )
+                    per_thread_raw_added.add(outer_node_id)
+                all_threads.append(entry)
+        # Round-76 PHASE 3 P1-F2: dedup raw_thread_nodes by
+        # stable thread id so the nested-pagination follower
+        # walks each connection exactly once.
+        try:
+            raw_thread_nodes = _dedup_raw_thread_nodes_by_id(
+                raw_thread_nodes
+            )
+        except ValueError as _dedup_err:
+            return False, all_threads, str(_dedup_err), {
+                **empty_metadata,
+                "review_thread_inventory_pages": 1,
+                "review_thread_inventory_capped": False,
+                "review_thread_inventory_error": str(_dedup_err),
+                "review_thread_inventory_complete": False,
+                "review_thread_comment_inventory_complete": False,
+            }
+        outer_has_next = bool(page_info.get("hasNextPage"))
+        outer_end_cursor = page_info.get("endCursor")
+        if outer_has_next and not outer_end_cursor:
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true with no "
+                "endCursor"
+            ), {
+                **empty_metadata,
+                "review_thread_inventory_pages": 1,
+                "review_thread_inventory_capped": False,
+            }
+        # When outer or nested pagination is incomplete,
+        # return visible threads but mark inventory as
+        # incomplete so the unified inventory gate in
+        # section 8 fails closed. The visible threads are
+        # preserved so the visible-blocker logic can detect
+        # Codex findings on the visible page.
+        # Round-69 Codex review 4769706200 (P2): when
+        # ``do_walk`` is True and the inventory is
+        # incomplete, do NOT return False early. Fall
+        # through to the walker below so the one-shot
+        # controller path can complete the inventory.
+        # Only return early when ``do_walk`` is False
+        # (i.e. the multi-poll cursor path wants just
+        # one page).
+        if outer_has_next or incomplete_nested_thread_ids:
+            if not do_walk:
+                # Round-74 PHASE 3: distinguish successful terminal
+                # page-with-nested-work from genuine outer-fetch
+                # failure. We do NOT use the parent's accumulated
+                # nested IDs as the gate — we use the current-page
+                # ``outer_page_has_next`` flag plus the explicit
+                # structured status fields below.
+                #
+                # If outer_has_next=True, the parent walker must
+                # advance the outer cursor — return False with
+                # ``review_thread_pagination_incomplete=True`` so
+                # the parent knows to continue walking outer pages.
+                #
+                # If outer_has_next=False and there is pending
+                # nested work, the outer page itself was SUCCESSFULLY
+                # fetched; it is just a terminal page. Return True
+                # with structured ``outer_page_fetch_succeeded=True``,
+                # ``outer_page_terminal=True``, and
+                # ``current_page_nested_pending_ids=[...]``. The
+                # parent walker will then run nested-follow.
+                if outer_has_next:
+                    err_msg = (
+                        "reviewThreads.pageInfo.hasNextPage=true; "
+                        "pagination required"
+                    )
+                    metadata = {
+                        "review_thread_comment_inventory_complete":
+                            not incomplete_nested_thread_ids,
+                        "review_thread_comment_inventory_error_count":
+                            len(incomplete_nested_thread_ids),
+                        "review_thread_comment_incomplete_thread_ids":
+                            list(incomplete_nested_thread_ids),
+                        "review_thread_inventory_complete": False,
+                        "review_thread_inventory_pages": 1,
+                        "review_thread_inventory_capped": False,
+                        "review_thread_inventory_error": err_msg,
+                        "review_thread_pagination_incomplete": True,
+                        "review_thread_pagination_end_cursor":
+                            outer_end_cursor,
+                        # Round-74 PHASE 3: explicit structured
+                        # status: outer page fetched successfully
+                        # and has more pages.
+                        "outer_page_fetch_succeeded": True,
+                        "outer_page_terminal": False,
+                        "outer_page_has_next": True,
+                        "current_page_nested_pending_ids": list(
+                            incomplete_nested_thread_ids
+                        ),
+                        # Round-75 PHASE 3 P1-A: every
+                        # successfully parsed outer page must
+                        # publish the raw review-thread nodes
+                        # it collected. The parent walker needs
+                        # them for nested-pagination follow-up.
+                        "_raw_thread_nodes": list(raw_thread_nodes),
+                    }
+                    return False, all_threads, err_msg, metadata
+                # outer_has_next=False: this is a SUCCESSFUL
+                # terminal page. If nested work is pending, the
+                # parent walker must run nested-follow.
+                if incomplete_nested_thread_ids:
+                    metadata = {
+                        "review_thread_comment_inventory_complete": False,
+                        "review_thread_comment_inventory_error_count":
+                            len(incomplete_nested_thread_ids),
+                        "review_thread_comment_incomplete_thread_ids":
+                            list(incomplete_nested_thread_ids),
+                        "review_thread_inventory_complete": False,
+                        "review_thread_inventory_pages": 1,
+                        "review_thread_inventory_capped": False,
+                        "review_thread_inventory_error": "",
+                        "review_thread_pagination_incomplete": False,
+                        "review_thread_pagination_end_cursor":
+                            outer_end_cursor,
+                        # Round-74 PHASE 3: structured status for
+                        # terminal page with nested work.
+                        "outer_page_fetch_succeeded": True,
+                        "outer_page_terminal": True,
+                        "outer_page_has_next": False,
+                        "current_page_nested_pending_ids": list(
+                            incomplete_nested_thread_ids
+                        ),
+                        # Round-75 PHASE 3 P1-A: every successful
+                        # outer-page must publish the raw
+                        # review-thread nodes it collected so
+                        # the parent walker can pass them to the
+                        # nested follower. The terminal page is
+                        # where the previously-suppressed bug
+                        # manifested: a pending ID without a
+                        # corresponding raw node.
+                        "_raw_thread_nodes": list(raw_thread_nodes),
+                    }
+                    # Round-74 PHASE 3: return True with the
+                    # structured terminal-page status. Parent
+                    # walker reads outer_page_fetch_succeeded /
+                    # outer_page_terminal / current_page_nested_pending_ids
+                    # to decide whether to invoke nested-follow.
+                    return True, all_threads, "", metadata
+            # else: do_walk=True and inventory is
+            # incomplete. Fall through to the success
+            # metadata + walker below so the one-shot
+            # controller path can complete the inventory.
+            # Mark inventory as not complete so the
+            # walker's early-return check sees it.
+            outer_has_next_for_walk = True
+            err_msg = ""
+        else:
+            outer_has_next_for_walk = False
+            err_msg = ""
+        nested_complete = not incomplete_nested_thread_ids
+        metadata = {
+            "review_thread_comment_inventory_complete":
+                nested_complete,
+            "review_thread_comment_inventory_error_count":
+                len(incomplete_nested_thread_ids),
+            "review_thread_comment_incomplete_thread_ids":
+                list(incomplete_nested_thread_ids),
+            # Round-71 PHASE 3-P2-A: publish raw outer
+            # thread nodes so the outer walker drains
+            # them into its unified raw cache before
+            # invoking the nested follower.
+            "_raw_thread_nodes": list(raw_thread_nodes),
+            "review_thread_inventory_complete":
+                not outer_has_next_for_walk,
+            "review_thread_inventory_pages": 1,
+            "review_thread_inventory_capped": False,
+            "review_thread_inventory_error": err_msg,
+            "review_thread_pagination_incomplete":
+                outer_has_next_for_walk,
+            "review_thread_pagination_end_cursor":
+                outer_end_cursor,
+        }
+        # Round-69 Codex review 4769640328 (P2):
+        # when ``do_walk`` is True and the inventory is
+        # incomplete (``review_thread_pagination_incomplete``),
+        # keep walking additional pages until
+        # ``hasNextPage=false`` (or the safety cap fires,
+        # fail-closed). This is the one-shot controller
+        # path; the polling-loop path uses
+        # ``do_walk=False`` (currently the polling loop
+        # also relies on ``do_walk=True`` because the
+        # production path uses ``max_polls=1``).
+        # Round-72 PHASE 3 P1: outer-pagination and nested-cursor
+        # pagination are two separate completion conditions.
+        # Enter the walker whenever EITHER is incomplete.
+        # The walker's body does not issue another outer
+        # request when ``outer_incomplete`` is False, so a
+        # purely nested-pending inventory does not make
+        # any spurious outer requests.
+        # Round-73 PHASE 3 P1-A: derive outer_incomplete from
+        # the FIRST outer page's ``outer_has_next`` flag,
+        # NOT from the combined-inventory metadata flag.
+        # The metadata's ``review_thread_pagination_incomplete``
+        # conflates outer pagination and nested-cursor state
+        # (because it is set by the ``outer_has_next_for_walk``
+        # boolean below which mirrors ``True`` whenever any
+        # inventory remains). Deriving the outer-loop guard
+        # from it caused the walker to re-fetch the first
+        # outer page even when only nested work remained.
+        outer_incomplete = bool(outer_has_next)
+        nested_pending_on_entry = bool(
+            incomplete_nested_thread_ids
+        ) and bool(
+            metadata.get(
+                "review_thread_comment_incomplete_thread_ids", []
+            )
+        )
+        if not do_walk or (
+            not outer_incomplete and not nested_pending_on_entry
+        ):
+            return True, all_threads, "", metadata
+        # The first page had ``hasNextPage=true``. Walk
+        # additional pages internally so the one-shot
+        # controller path can complete the inventory.
+        # Round-72 PHASE 3 P1: gate the outer-while loop on
+        # ``outer_incomplete``. When only nested cursors are
+        # pending, the loop body is skipped entirely and we
+        # transition directly to nested-follow further down.
+        cursor = metadata.get(
+            "review_thread_pagination_end_cursor"
+        )
+        pages = 1
+        # Round-72 PHASE 3 P1: if only nested cursors are
+        # pending (outer pagination already complete on
+        # entry), skip outer page fetching entirely and
+        # proceed directly to nested-follow. We achieve
+        # this by setting the outer-while loop guard to
+        # False so it doesn't execute.
+        if not outer_incomplete and incomplete_nested_thread_ids:
+            # Round-75 PHASE 3 P1-C: validate ID-to-node
+            # coverage in this single-page terminal
+            # path too. Same validation as the multi-page
+            # path below.
+            missing_node_ids = []
+            for _tid in incomplete_nested_thread_ids:
+                _matched = [
+                    rn for rn in raw_thread_nodes
+                    if isinstance(rn, dict)
+                    and rn.get("id") == _tid
+                ]
+                if not _matched:
+                    missing_node_ids.append(_tid)
+                    continue
+                _node = _matched[0]
+                _comments = _node.get("comments")
+                if not isinstance(_comments, dict):
+                    missing_node_ids.append(_tid)
+                    continue
+                _page_info = _comments.get("pageInfo") or {}
+                if not isinstance(_page_info, dict):
+                    missing_node_ids.append(_tid)
+                    continue
+                if not bool(_page_info.get("hasNextPage")):
+                    missing_node_ids.append(_tid)
+                    continue
+                _end_cursor = _page_info.get("endCursor") or ""
+                if not isinstance(_end_cursor, str) or not _end_cursor:
+                    missing_node_ids.append(_tid)
+                    continue
+            if missing_node_ids:
+                return False, all_threads, (
+                    "nested_pending_raw_node_missing"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": False,
+                    "review_thread_comment_inventory_error_count": (
+                        len(missing_node_ids)
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        list(missing_node_ids)
+                    ),
+                    "review_thread_inventory_complete": False,
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": (
+                        "nested_pending_raw_node_missing"
+                    ),
+                }
+            # Transition directly to nested-follow. The
+            # existing nested-follow code lives inside the
+            # outer-while body under the
+            # "Inventory complete. Done." branch. We here
+            # replicate its core logic for the
+            # outer-already-complete case.
+            nested_follow = _follow_nested_cursor_for_threads(
+                raw_thread_nodes,
+                safety_cap=safety_cap,
+                timeout=timeout,
+            )
+            if not nested_follow.get("complete"):
+                return False, all_threads, (
+                    nested_follow.get("error")
+                    or "nested_pagination_failed"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": False,
+                    "review_thread_comment_inventory_error_count": (
+                        len(incomplete_nested_thread_ids)
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        list(incomplete_nested_thread_ids)
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": bool(
+                        nested_follow.get("capped", False)
+                    ),
+                    "review_thread_inventory_error": (
+                        nested_follow.get("error")
+                        or "nested_pagination_failed"
+                    ),
+                }
+            # Round-76 PHASE 3 P1-F1: materialize every fetched
+            # nested comment as a canonical flattened inventory
+            # record via the shared helpers (Finding 1).
+            fetched = nested_follow.get(
+                "fetched_comments_by_thread_id", {}
+            )
+            # Round-77 PHASE 3 P1-A: iterate a snapshot of
+            # ``all_threads`` so that appended fetched
+            # records do not re-enter the loop. The
+            # previous loop iterated ``all_threads``
+            # directly while _merge_flattened_comment
+            # appended to it, producing cubic growth on
+            # large threads (and indefinite growth when a
+            # fetched record has a null databaseId). The
+            # do_walk=True walker branch (line 2190+)
+            # already uses this snapshot; this commit
+            # extends the same fix to the do_walk=True
+            # terminal-page fast path.
+            _r77_terminal_snapshot = list(all_threads)
+            # Round-79 PHASE 3 P2: collect affected thread IDs
+            # in stable order so canonical attachment runs once
+            # per unique thread.
+            _r79_affected_thread_ids: List[str] = []
+            _r79_affected_seen: set = set()
+            # Round-89 follow-up: build the dedup index once
+            # outside the nested-materialization loops so
+            # O(1) lookup replaces the O(2000) linear scan that
+            # silently allowed duplicate records past index
+            # 2000. The index maps ``(thread_id, comment_database_id)``
+            # to the index of the corresponding record in
+            # ``all_threads``. ``Optional`` import is at the
+            # top of this file.
+            _r89_dedup_index: Dict[Tuple[Any, Any], int] = {}
+            _r89_dedup_rebuild = False
+            for _idx, _rt in enumerate(all_threads):
+                _db = _rt.get("comment_database_id")
+                if _db is not None:
+                    _r89_dedup_index[
+                        (_rt.get("thread_id"), _db)
+                    ] = _idx
+            for nt in _r77_terminal_snapshot:
+                tid = nt.get("thread_id") or nt.get("id") or ""
+                if tid not in fetched:
+                    continue
+                thread_state = {
+                    "thread_id": tid,
+                    "is_resolved": bool(nt.get("is_resolved", False)),
+                    "is_outdated": bool(nt.get("is_outdated", False)),
+                }
+                _r77_fetched_records: list = []
+                _r77_fetched_authors: list = []
+                for en in fetched[tid]:
+                    if not isinstance(en, dict):
+                        continue
+                    _rec = _flatten_review_thread_comment(
+                        thread_state, en
+                    )
+                    _r77_fetched_records.append(_rec)
+                    _au_obj = en.get("author") or {}
+                    if isinstance(_au_obj, dict):
+                        _r77_fetched_authors.append(
+                            _au_obj.get("login", "") or ""
+                        )
+                    elif isinstance(_au_obj, str):
+                        _r77_fetched_authors.append(_au_obj)
+                    else:
+                        _r77_fetched_authors.append("")
+                # Extend all_threads once after the loop.
+                for _r77_r in _r77_fetched_records:
+                    _merge_flattened_comment(
+                        all_threads, _r77_r,
+                        dedup_index=_r89_dedup_index,
+                    )
+                # Update anchor participant evidence. Round-77
+                # PHASE 3 P1-B: preserve blank authors as
+                # explicit "unknown" participants so partial
+                # actor evidence fails closed instead of
+                # being dropped (which would let a thread
+                # with a deleted-account comment appear
+                # Codex-only and become eligible for
+                # automatic resolution).
+                if isinstance(nt.get("comments"), list):
+                    _r77_seen_authors = {
+                        c.get("author") if isinstance(c, dict) else ""
+                        for c in nt["comments"]
+                    }
+                    for _r77_au in _r77_fetched_authors:
+                        _r77_label = _r77_au or "unknown"
+                        if _r77_label not in _r77_seen_authors:
+                            nt["comments"].append({
+                                "author": _r77_label,
+                                "database_id": None,
+                            })
+                            _r77_seen_authors.add(_r77_label)
+                nt["nested_incomplete"] = False
+                # Record the affected thread ID once.
+                if tid not in _r79_affected_seen:
+                    _r79_affected_seen.add(tid)
+                    _r79_affected_thread_ids.append(tid)
+            # Round-78 PHASE 3 P2 + Round-79 PHASE 3 P2:
+            # propagate canonical participant evidence
+            # exactly once per unique affected thread.
+            for _r79_tid in _r79_affected_thread_ids:
+                _attach_canonical_thread_participants(
+                    _r79_tid, all_threads
+                )
+            return True, all_threads, "", {
+                **empty_metadata,
+                "review_thread_comment_inventory_complete": True,
+                "review_thread_comment_inventory_error_count": 0,
+                "review_thread_comment_incomplete_thread_ids": [],
+                "review_thread_inventory_complete": (
+                    not bool(nested_follow.get("capped", False))
+                ),
+                "review_thread_inventory_pages": pages,
+                "review_thread_inventory_capped": bool(
+                    nested_follow.get("capped", False)
+                ),
+                "review_thread_inventory_error": "",
+            }
+        while outer_incomplete:
+            if pages >= safety_cap:
+                # Safety cap fired. The inventory is
+                # incomplete in this case; the section 8
+                # inventory gate will refuse merge-ready.
+                return False, all_threads, (
+                    f"review_thread_pagination_capped: "
+                    f"pages={pages} safety_cap={safety_cap}"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        not incomplete_nested_thread_ids
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": True,
+                    "review_thread_inventory_error": (
+                        "review_thread_pagination_capped"
+                    ),
+                }
+            pages += 1
+            # Recursively call ourselves for the next page.
+            ok_next, more_threads, err_next, meta_next = (
+                _canonical_review_thread_inventory(
+                    owner=owner, name=name, pr_number=pr_number,
+                    starting_cursor=cursor,
+                    starting_pages=pages,
+                    do_walk=False,
+                )
+            )
+            all_threads.extend(more_threads or [])
+            # Round-71 PHASE 3-P2-A: drain raw outer-page nodes
+            # the recursive page call collected into our own
+            # raw cache so nested-follow sees the full set.
+            for raw_node in (meta_next.get("_raw_thread_nodes", [])
+                             if isinstance(meta_next, dict) else []):
+                if not any(r.get("id") == raw_node.get("id")
+                           for r in raw_thread_nodes):
+                    raw_thread_nodes.append(raw_node)
+            # Propagate nested-comment completeness across
+            # pages. If any page reports an incomplete
+            # nested inventory, the overall inventory is
+            # incomplete.
+            if not meta_next.get(
+                "review_thread_comment_inventory_complete", False
+            ):
+                metadata[
+                    "review_thread_comment_inventory_complete"
+                ] = False
+            # Round-69 Codex review 4769796846 (P2): when
+            # the recursive call returns ok_next=False
+            # AND ``review_thread_pagination_incomplete`` is
+            # True, the recursive call signaled "more
+            # pages available" (the helper's
+            # single-page-mode ``do_walk=False`` returns
+            # ok=False with pagination_incomplete=True
+            # for the controller's polling protocol).
+            # Treat this as a normal "keep walking" signal
+            # by updating the cursor and continuing the
+            # walker loop. Only treat it as a terminal
+            # error when the recursive call's
+            # ``err_next`` indicates a real failure (e.g.
+            # GraphQL error, cursor missing, cap fired).
+            cursor = meta_next.get(
+                "review_thread_pagination_end_cursor"
+            )
+            # Round-73 PHASE 3 P1-B: when ``ok_next=False`` and
+            # the recursion says pagination is complete,
+            # check whether the recursion still has
+            # incomplete nested thread IDs. If so, this is
+            # NOT a terminal outer error — it is terminal
+            # outer pagination with nested work pending
+            # on the terminal page. Transfer that work into
+            # the parent state, drain raw nodes, and let
+            # the normal nested-follow branch (further down
+            # this same walker invocation) handle it. The
+            # pre-existing outer-metadata ``err_next`` is
+            # typically empty for the success-but-with-
+            # nested-pending case; if a real error
+            # accompanies the nested work, we'll surface it
+            # via the nested-follow branch fail-closed
+            # return.
+            if isinstance(meta_next, dict):
+                # Promote any recursive-page raw nodes
+                # into our cache so nested-follow sees the
+                # terminal-page threads.
+                for raw_node in meta_next.get(
+                    "_raw_thread_nodes", []
+                ):
+                    if not any(
+                        r.get("id") == raw_node.get("id")
+                        for r in raw_thread_nodes
+                    ):
+                        raw_thread_nodes.append(raw_node)
+                # Promote the recursive incomplete-nested
+                # thread IDs into our list.
+                for tid in meta_next.get(
+                    "review_thread_comment_incomplete_thread_ids",
+                    []
+                ) or []:
+                    if tid not in incomplete_nested_thread_ids:
+                        incomplete_nested_thread_ids.append(tid)
+            # Round-74 PHASE 3 P1: a recursive call returning
+            # ``ok_next=False`` is ALWAYS a real outer failure
+            # (subprocess non-zero, GraphQL errors, malformed
+            # JSON, missing outer connection, missing cursor,
+            # safety cap, etc.). The Round-73 fix relaxed this
+            # condition to ``and not incomplete_nested_thread_ids``
+            # but that suppressed genuine outer failures whenever
+            # earlier pages had pending nested work. Outer fetch
+            # success MUST be proven independently of
+            # accumulated nested IDs. Fail closed; preserve the
+            # outer failure reason; do NOT invoke the nested
+            # follower; do NOT mark inventory complete.
+            if not ok_next and not meta_next.get(
+                "review_thread_pagination_incomplete", False
+            ):
+                # The page walker hit a real error
+                # (not "more pages available"). Propagate
+                # ``err_next`` and return ok=False so the
+                # section 8 inventory gate fails closed.
+                return False, all_threads, err_next, {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": err_next,
+                }
+            if not meta_next.get(
+                "review_thread_pagination_incomplete", False
+            ):
+                # Outer inventory complete. If any nested
+                # pagination remained incomplete across
+                # pages, follow cursors now.
+                if incomplete_nested_thread_ids:
+                    # Round-75 PHASE 3 P1-C: BEFORE invoking
+                    # the nested follower, validate that every
+                    # pending nested thread ID has exactly one
+                    # matching cursor-bearing raw node in
+                    # ``raw_thread_nodes``. A pending ID without
+                    # a matching valid raw node means a terminal
+                    # page failed to publish its raw evidence
+                    # and the nested follower would silently
+                    # skip that thread. Fail closed with a
+                    # specific ``nested_pending_raw_node_missing``
+                    # error and preserve the affected thread IDs.
+                    missing_node_ids = []
+                    for _tid in incomplete_nested_thread_ids:
+                        _matched = [
+                            rn for rn in raw_thread_nodes
+                            if isinstance(rn, dict)
+                            and rn.get("id") == _tid
+                        ]
+                        if not _matched:
+                            missing_node_ids.append(_tid)
+                            continue
+                        _node = _matched[0]
+                        _comments = _node.get("comments")
+                        if not isinstance(_comments, dict):
+                            missing_node_ids.append(_tid)
+                            continue
+                        _page_info = _comments.get("pageInfo") or {}
+                        if not isinstance(_page_info, dict):
+                            missing_node_ids.append(_tid)
+                            continue
+                        if not bool(_page_info.get("hasNextPage")):
+                            missing_node_ids.append(_tid)
+                            continue
+                        _end_cursor = _page_info.get("endCursor") or ""
+                        if not isinstance(_end_cursor, str) or not _end_cursor:
+                            missing_node_ids.append(_tid)
+                            continue
+                    if missing_node_ids:
+                        # Round-75 PHASE 3 P1-C fail-closed:
+                        # preserve every missing ID, mark both
+                        # outer and nested inventories incomplete,
+                        # do NOT invoke the nested follower, do
+                        # NOT report clean or merge-ready.
+                        return False, all_threads, (
+                            "nested_pending_raw_node_missing"
+                        ), {
+                            **empty_metadata,
+                            "review_thread_comment_inventory_complete": False,
+                            "review_thread_comment_inventory_error_count": (
+                                len(missing_node_ids)
+                            ),
+                            "review_thread_comment_incomplete_thread_ids": (
+                                list(missing_node_ids)
+                            ),
+                            "review_thread_inventory_complete": False,
+                            "review_thread_inventory_pages": pages,
+                            "review_thread_inventory_capped": False,
+                            "review_thread_inventory_error": (
+                                "nested_pending_raw_node_missing"
+                            ),
+                        }
+                    # Round-71 PHASE 3-P2-A: pass the *raw*
+                    # outer thread nodes (with their full
+                    # ``id`` and nested
+                    # ``comments.pageInfo.endCursor``) to
+                    # the nested follower so the helper
+                    # can issue the canonical
+                    # ``node(id: $threadId) { ... }``
+                    # GraphQL query against the raw
+                    # shape, not against the flattened
+                    # audit record.
+                    nested_follow = (
+                        _follow_nested_cursor_for_threads(
+                            raw_thread_nodes,
+                            safety_cap=safety_cap,
+                            timeout=timeout,
+                        )
+                    )
+                    if not nested_follow.get("complete"):
+                        # Round-71 PHASE 3-P2-B: fail closed.
+                        return False, all_threads, (
+                            nested_follow.get("error")
+                            or "nested_pagination_failed"
+                        ), {
+                            **empty_metadata,
+                            "review_thread_comment_inventory_complete": False,
+                            "review_thread_comment_inventory_error_count": len(incomplete_nested_thread_ids),
+                            "review_thread_comment_incomplete_thread_ids": list(incomplete_nested_thread_ids),
+                            "review_thread_inventory_pages": pages,
+                            "review_thread_inventory_capped": bool(nested_follow.get("capped", False)),
+                            "review_thread_inventory_error": (
+                                nested_follow.get("error") or "nested_pagination_failed"
+                            ),
+                        }
+                    # Round-76 PHASE 3 P1-F1: materialize every
+                    # fetched nested comment as a canonical
+                    # flattened inventory record (not just a
+                    # participant-list entry). The active-blocker
+                    # scan reads top-level record authors and
+                    # bodies, so a later Codex finding on the
+                    # 51st comment MUST appear as a top-level
+                    # record.
+                    fetched = nested_follow.get(
+                        "fetched_comments_by_thread_id", {}
+                    )
+                    # Round-77 PHASE 3 P1-A: snapshot
+                    # ``all_threads`` before iteration so that
+                    # fetched records appended via
+                    # _merge_flattened_comment do not re-enter
+                    # the outer loop (cubic growth / indefinite
+                    # append on null-databaseId records).
+                    _r77_anchor_snapshot = list(all_threads)
+                    # Round-89 follow-up: build the dedup index
+                    # once outside the nested-materialization
+                    # loops so O(1) lookup replaces the
+                    # O(2000) linear scan that silently allowed
+                    # duplicate records past index 2000.
+                    _r89_dedup_index: Dict[Tuple[Any, Any], int] = {}
+                    for _idx, _rt in enumerate(all_threads):
+                        _db = _rt.get("comment_database_id")
+                        if _db is not None:
+                            _r89_dedup_index[
+                                (_rt.get("thread_id"), _db)
+                            ] = _idx
+                    # Round-79 PHASE 3 P2 narrow repair:
+                    # collect affected thread IDs in a stable
+                    # ordered set so the canonical participant
+                    # attachment runs exactly once per unique
+                    # thread, regardless of how many flattened
+                    # records the snapshot contains.
+                    _r79_affected_thread_ids: List[str] = []
+                    _r79_affected_seen: set = set()
+                    for nt in _r77_anchor_snapshot:
+                        tid = nt.get("thread_id") or nt.get("id") or ""
+                        if tid not in fetched:
+                            continue
+                        thread_state = {
+                            "thread_id": tid,
+                            "is_resolved": bool(nt.get("is_resolved", False)),
+                            "is_outdated": bool(nt.get("is_outdated", False)),
+                        }
+                        _r77_fetched_records: list = []
+                        _r77_fetched_authors: list = []
+                        for en in fetched[tid]:
+                            if not isinstance(en, dict):
+                                continue
+                            _flatten_review_thread_comment_rec = (
+                                _flatten_review_thread_comment(
+                                    thread_state, en
+                                )
+                            )
+                            _r77_fetched_records.append(
+                                _flatten_review_thread_comment_rec
+                            )
+                            _au_obj = en.get("author") or {}
+                            if isinstance(_au_obj, dict):
+                                _r77_fetched_authors.append(
+                                    _au_obj.get("login", "") or ""
+                                )
+                            elif isinstance(_au_obj, str):
+                                _r77_fetched_authors.append(_au_obj)
+                            else:
+                                _r77_fetched_authors.append("")
+                        # Append fetched records once after
+                        # the inner loop completes.
+                        for _r77_r in _r77_fetched_records:
+                            _merge_flattened_comment(
+                                all_threads, _r77_r,
+                                dedup_index=_r89_dedup_index,
+                            )
+                        # Round-77 PHASE 3 P1-B: preserve
+                        # blank authors as explicit
+                        # "unknown" participant entries.
+                        if isinstance(nt.get("comments"), list):
+                            _r77_seen_authors = {
+                                c.get("author") if isinstance(c, dict) else ""
+                                for c in nt["comments"]
+                            }
+                            for _r77_au in _r77_fetched_authors:
+                                _r77_label = _r77_au or "unknown"
+                                if _r77_label not in _r77_seen_authors:
+                                    nt["comments"].append({
+                                        "author": _r77_label,
+                                        "database_id": None,
+                                    })
+                                    _r77_seen_authors.add(_r77_label)
+                        nt["nested_incomplete"] = False
+                        # Record the affected thread ID once;
+                        # canonical attachment happens after the
+                        # loop, once per unique thread.
+                        if tid not in _r79_affected_seen:
+                            _r79_affected_seen.add(tid)
+                            _r79_affected_thread_ids.append(tid)
+                    # Round-78 PHASE 3 P2 + Round-79 PHASE 3 P2:
+                    # propagate canonical participant evidence
+                    # exactly once per unique affected thread.
+                    for _r79_tid in _r79_affected_thread_ids:
+                        _attach_canonical_thread_participants(
+                            _r79_tid, all_threads
+                        )
+                    # Round-71 PHASE 3-P2-B: after every
+                    # required nested cursor succeeds,
+                    # reset the inventory-completeness flags
+                    # regardless of the outer-loop metadata
+                    # value computed earlier (which reflected
+                    # the pre-nested view).
+                    final_metadata = {
+                        **empty_metadata,
+                        "review_thread_comment_inventory_complete": True,
+                        "review_thread_comment_inventory_error_count": 0,
+                        "review_thread_comment_incomplete_thread_ids": [],
+                        "review_thread_inventory_complete": (
+                            not nested_follow.get("capped", False)
+                        ),
+                        "review_thread_inventory_pages": pages,
+                        "review_thread_inventory_capped": bool(
+                            nested_follow.get("capped", False)
+                        ),
+                        "review_thread_inventory_error": "",
+                    }
+                    return True, all_threads, "", final_metadata
+                # Inventory complete. Done.
+                return True, all_threads, "", {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": "",
+                }
+            # ok_next=False with
+            # pagination_incomplete=True: the
+            # recursive call signaled "more pages
+            # available". Continue walking with the
+            # new cursor.
+            if not ok_next and not cursor:
+                # ``hasNextPage=true`` with no
+                # ``endCursor`` is an error inside
+                # the wrapper.
+                return False, all_threads, (
+                    f"{err_next}; cursor_missing"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": (
+                        "cursor_missing"
+                    ),
+                }
+    except Exception as exc:
+        return False, [], (
+            f"review_thread_inventory_failed: {exc}"
+        ), dict(empty_metadata)
 
 
 def classify(
@@ -1111,6 +2737,26 @@ def classify(
                 "'2026-06-11T17:30:00+00:00') and re-run."
             )
 
+    # Round-69 Codex review 4769230169 (P2): advance the
+    # review-thread cursor between audit polls. The
+    # previous implementation called
+    # ``_canonical_review_thread_inventory`` on every
+    # poll with the same ``starting_cursor=None`` so PRs
+    # with more than ``page_size`` review threads would
+    # refetch the same first page on every poll and
+    # ``review_thread_inventory_complete`` would stay
+    # False until ``max_polls`` expired. Track the
+    # last seen endCursor across polls and pass it as
+    # the next poll's starting cursor. Reset on a fresh
+    # classification cycle.
+    pagination_cursor: Optional[str] = None
+    # Round-69 Codex review 4769344844 (P1): accumulate
+    # the review-thread page list across polls. Initialize
+    # once before the polling loop so the aggregate
+    # inventory reflects every page walked. Per-poll
+    # resets for inventory completeness flags remain
+    # unchanged; only the per-thread list is accumulated.
+    accumulated_review_threads: List[Dict[str, Any]] = []
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
 
@@ -1168,7 +2814,14 @@ def classify(
         # actually observe.
         pr_issue_comments = []
         pr_reviews = []
-        review_threads = []
+        # Round-69 Codex review 4769344844 (P1): the
+        # ``review_threads`` list is accumulated across
+        # polls (see ``accumulated_review_threads``
+        # above) so the aggregate inventory reflects
+        # every page walked. Do NOT reset it to ``[]``
+        # here. The local ``review_threads`` variable
+        # below aliases the accumulator for the
+        # downstream per-poll logic.
         # Reset terminal decision state.
         final_status = STATUS_HOLD_CODEX_PENDING
         recommendation = RECOMMENDATIONS[STATUS_HOLD_CODEX_PENDING]
@@ -1335,15 +2988,123 @@ def classify(
         # failed. The unified inventory gate in section 8 treats
         # this as incomplete review-thread inventory and fails
         # closed at HOLD_CODEX_RESPONSE_PENDING.
-        ok_thr, thread_data, err_thr, thread_metadata = gh_graphql_review_threads(
-            repo, pr_number, timeout=api_timeout,
+        #
+        # Round-69 Codex review 4764653534 (P2): use the
+        # canonical shared-pagination wrapper instead of the
+        # inline first-page-only GraphQL fetch. The wrapper
+        # is defined above ``classify()`` (not below the
+        # ``__main__`` guard) so direct CLI runs invoke the
+        # shared paginator.
+        # Round-69 Codex review 4768977809 (P2): the audit
+        # does NOT walk additional pages within a single
+        # poll. The classify() loop is the entity that polls
+        # and each call to the inventory helper is a
+        # single-page fetch. If ``hasNextPage=true`` the
+        # helper returns ``ok=False`` so the next poll
+        # iteration makes the next call with the cursor.
+        owner, name = repo.split("/", 1)
+        # Round-69 Codex review 4769640328 (P2): on
+        # the first poll (or when the previous poll
+        # had no starting cursor), call the helper
+        # with ``do_walk=True`` so the cursor walk
+        # happens within a single audit pass. The
+        # one-shot controller path (``max_polls=1``)
+        # then completes the inventory without
+        # needing multiple poll iterations. The
+        # multi-poll path also benefits: the first
+        # poll completes the inventory and the
+        # remaining polls re-verify.
+        do_walk_this_poll = (
+            pagination_cursor is None
+        )
+        ok_thr, thread_data, err_thr, thread_metadata = _canonical_review_thread_inventory(
+            owner=owner, name=name, pr_number=pr_number,
+            starting_cursor=pagination_cursor,
+            do_walk=do_walk_this_poll,
         )
         if not ok_thr:
             api_errors.append(f"review_threads: {err_thr}")
             review_thread_inventory_complete = False
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
-        review_threads = thread_data
+        # Round-69 Codex review 4769856466 (P2): the
+        # helper can return ok_thr=True after walking
+        # later outer pages while its metadata still
+        # reports
+        # review_thread_comment_inventory_complete=False
+        # (e.g. a non-final page had
+        # comments.pageInfo.hasNextPage=true). The
+        # section 8 inventory gate only checks the
+        # boolean flag, so on PRs with multiple
+        # review-thread pages and a long thread on an
+        # earlier page, the audit could emit
+        # CODEX_CLEAN_PASS / merge-ready even though
+        # later nested comments were never fetched.
+        # Honor the metadata's explicit completeness
+        # flags here so the gate fails closed when the
+        # nested-comment inventory is incomplete.
+        if ok_thr and not thread_metadata.get(
+            "review_thread_comment_inventory_complete", False
+        ):
+            review_thread_inventory_complete = False
+            review_thread_inventory_error_count += 1
+            review_thread_inventory_last_error = (
+                "review_thread_comment_inventory_incomplete"
+            )
+        if ok_thr and not thread_metadata.get(
+            "review_thread_inventory_complete", False
+        ):
+            review_thread_inventory_complete = False
+            review_thread_inventory_error_count += 1
+            review_thread_inventory_last_error = (
+                "review_thread_inventory_incomplete"
+            )
+        # Round-69 Codex reviews 4769289362 (P1),
+        # 4769344844 (P1), and 4769487744 (P1):
+        # the per-thread list is now handled by the
+        # helper's internal do_walk loop, so the
+        # accumulator simply mirrors the helper's
+        # return value. When the helper returns
+        # ok_thr=True (inventory complete after the
+        # walk), reset the accumulator to the helper's
+        # threads so a fresh first-page poll starts
+        # clean and an old unresolved entry from a
+        # previous poll is replaced by the latest
+        # state. When the helper returns ok_thr=False
+        # (inventory incomplete — walk capped or
+        # errored), extend the accumulator with the
+        # visible threads so the audit's
+        # visible-blocker logic catches the
+        # active-finding even when the cursor walker
+        # fails.
+        if ok_thr:
+            accumulated_review_threads[:] = list(
+                thread_data or []
+            )
+        else:
+            accumulated_review_threads.extend(
+                thread_data or []
+            )
+        review_threads = accumulated_review_threads
+        # Round-69 Codex review 4769230169 (P2): advance
+        # the cursor between polls. When the current poll
+        # returns ``hasNextPage=true`` and the helper
+        # exposes a ``review_thread_pagination_end_cursor``,
+        # use it as the next poll's starting cursor so
+        # the audit eventually walks every page of the
+        # review-thread connection. When ``hasNextPage=false``
+        # (inventory complete), reset the cursor to None
+        # so the next fresh classification cycle starts at
+        # the first page.
+        _outer_end_cursor = thread_metadata.get(
+            "review_thread_pagination_end_cursor"
+        )
+        if ok_thr and not thread_metadata.get(
+            "review_thread_pagination_incomplete", False
+        ):
+            pagination_cursor = None
+        else:
+            pagination_cursor = _outer_end_cursor or pagination_cursor
         # Propagate the nested-comment inventory state from the
         # fetch metadata. The metadata flags are reported as-is;
         # the section 8 inventory gate will refuse merge-ready if
@@ -1971,8 +3732,21 @@ def classify(
         # 3) Codex clean-pass exists AND no newer active finding -> resolve-only or merge-ready
         # 4) Otherwise -> HOLD_CODEX_RESPONSE_PENDING
 
+        # Round-412 (FINAL direct-CLI micro-repair): the
+        # local fallback uses ``_local_codex_login_fallback``
+        # which is type-safe (rejects non-string values) and
+        # case-insensitive (delegates to the canonical
+        # ``is_codex_login`` when available, otherwise uses
+        # the precomputed ``_LOCAL_CODEX_LOGINS_LOWER`` set).
+        # The previous inline fallback
+        # ``(t.get("author", "") or "").lower() in {...}``
+        # raised ``AttributeError`` on truthy non-string
+        # authors.
         has_active_blocker = any(
-            t.get("author", "") in CODEX_BOT_LOGINS for t in active_threads
+            _shared_is_codex_login(t.get("author", ""))
+            if _shared_is_codex_login is not None
+            else _local_codex_login_fallback(t.get("author", ""))
+            for t in active_threads
         )
         # If a clean pass exists, we also need to check whether any NEWER
         # Codex comment/review (with a real finding) arrived after it.
@@ -2722,4 +4496,5 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _sys.exit(main())
+

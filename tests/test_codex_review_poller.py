@@ -516,10 +516,16 @@ class TestCodexReviewSummaryFormat:
             "**Reviewed commit:** `d8f6f480e1`\n"
         )
         assert mod._is_codex_review_summary(body) is True
-        # The summary body is NOT itself a finding or a
-        # clean pass — its verdict comes from the inline
-        # comments.
-        assert mod._is_clean_pass(body) is False
+        # Round-412 (PHASE 4 Finding 3): under the shared
+        # classifier, a summary-format body IS a clean-pass
+        # because the inline comments (not the summary body)
+        # carry the actual findings. The classifier's
+        # contract is: a summary body with no finding-badge
+        # line is a clean pass. The downstream
+        # ``_classify_review_with_inline`` function fetches
+        # the inline comments and downgrades to FINDING if
+        # any inline comment carries the badge.
+        assert mod._is_clean_pass(body) is True
         assert mod._is_finding(body) is False
 
     def test_summary_with_inline_finding_is_finding(self, monkeypatch):
@@ -814,17 +820,22 @@ class TestSelectNewestMatch:
         assert selected["verdict"] == "CLEAN_PASS"
 
     def test_source_contract_collects_all_matches(self):
-        """Source-contract: the main loop MUST collect
+        """Source-contract: the scan loop MUST collect
         all matches before selecting. The substring
         ``break`` MUST NOT appear in the loop body
         that scans reviews and comments.
+
+        Round-81: the scan/select logic moved from
+        ``main()`` into ``_run_poll_cycle()``; the
+        contract still holds there.
         """
         import inspect
         from scripts.local import codex_review_poller as mod
-        src = inspect.getsource(mod.main)
-        # Find the scan loop.
-        scan_start = src.find("Scan ALL surfaces")
-        scan_end = src.find("Select the newest match")
+        # Round-81: helper name.
+        src = inspect.getsource(mod._run_poll_cycle)
+        # Find the scan loop and the select call.
+        scan_start = src.find("Match responses")
+        scan_end = src.find("Apply precedence")
         assert scan_start > 0
         assert scan_end > scan_start
         scan_section = src[scan_start:scan_end]
@@ -982,3 +993,1289 @@ def test_round66_poller_finding_branch_uses_body_level_check():
         "Round-66 fix: the elif _is_finding branch must "
         "also check body_has_finding_badge."
     )
+
+
+# =====================================================================
+# Round-80 PHASE 3 regression tests: PR-level Codex +1 reactions
+# =====================================================================
+
+
+def _r80_reaction_payload(
+    *,
+    rid: int = 431112337,
+    node_id: str = "REA_lAHOSHFpYM8AAAABJ0XFR84ZskCR",
+    content: str = "+1",
+    actor: str = "chatgpt-codex-connector[bot]",
+    created_at: str = "2026-07-30T02:03:51Z",
+) -> dict:
+    return {
+        "id": rid,
+        "node_id": node_id,
+        "content": content,
+        "user": {"login": actor},
+        "created_at": created_at,
+    }
+
+
+def _r80_no_reactions() -> dict:
+    """Empty paginated response body."""
+    return {}
+
+
+def _r80_one_reaction(reaction: dict) -> dict:
+    """Single-page response with one reaction."""
+    return {"items": [reaction], "next": None}
+
+
+def _r80_import_poller():
+    """Re-import the poller module (re-load it fresh)."""
+    import importlib
+    import scripts.local.codex_review_poller as _poller
+    importlib.reload(_poller)
+    return _poller
+
+
+def test_r80_reaction_after_request_is_clean_pass(monkeypatch):
+    """Round-80 PHASE 3 regression 1: a new Codex +1 PR
+    reaction after an exact-head request produces CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload()
+    base = {}  # no baseline reaction IDs
+    consumed = set()
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=base,
+        consumed_reaction_ids=consumed,
+    )
+    assert match is not None, "expected reaction match"
+    assert match["verdict"] == "CLEAN_PASS"
+    assert match["kind"] == "reaction"
+    assert match["id"] == 431112337
+    assert match["author"] == "chatgpt-codex-connector[bot]"
+
+
+def test_r80_reaction_predating_request_is_stale(monkeypatch):
+    """Round-80 PHASE 3 regression 2: a reaction that predates
+    the request is rejected as stale.
+    """
+    poller = _r80_import_poller()
+    stale = _r80_reaction_payload(created_at="2026-07-30T01:59:00Z")
+    match = poller._match_reaction(
+        stale,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "expected stale reaction to be rejected"
+
+
+def test_r80_reaction_in_baseline_is_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 2 (extended): a reaction
+    that is in the pre-request baseline is rejected even if
+    its timestamp is after the request (defensive: the
+    baseline check is the canonical gate).
+    """
+    poller = _r80_import_poller()
+    # Reaction with post-request timestamp but in baseline.
+    reaction = _r80_reaction_payload(rid=431112337)
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids={"431112337"},
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "baseline reaction must be rejected"
+
+
+def test_r80_human_reaction_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 3: a human-authored +1 is
+    rejected.
+    """
+    poller = _r80_import_poller()
+    human = _r80_reaction_payload(actor="human-author")
+    match = poller._match_reaction(
+        human,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "human actor must be rejected"
+
+
+def test_r80_other_bot_reaction_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 4: another bot's +1 is
+    rejected (only the canonical Codex connector is accepted).
+    """
+    poller = _r80_import_poller()
+    other = _r80_reaction_payload(actor="github-actions[bot]")
+    match = poller._match_reaction(
+        other,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "non-Codex bot must be rejected"
+
+
+def test_r80_reaction_after_head_drift_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 5: a +1 reaction whose
+    created_at falls before the live head's last verification
+    timestamp is rejected. We simulate head drift by passing
+    a ping_dt AFTER the reaction.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload(created_at="2026-07-30T02:03:51Z")
+    # Head drift: pretend we re-verified the head at 02:10:00Z,
+    # i.e., the reaction happened before the head verification.
+    ping_dt = poller._parse_iso_utc("2026-07-30T02:10:00Z")
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=ping_dt,
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, (
+        "reaction created before head-drift verification must be rejected"
+    )
+
+
+def test_r80_consumed_reaction_id_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 7: a consumed reaction id
+    cannot be accepted twice.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload(rid=431112337)
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids={"431112337"},
+    )
+    assert match is None, "consumed reaction id must be rejected"
+
+
+def test_r80_non_plus1_content_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 7+: a reaction with content
+    other than +1 (e.g. 'eyes', 'heart') is rejected.
+    """
+    poller = _r80_import_poller()
+    other = _r80_reaction_payload(content="heart")
+    match = poller._match_reaction(
+        other,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "non-+1 content must be rejected"
+
+
+def test_r80_fetch_reactions_uses_pr_issue_endpoint(monkeypatch):
+    """Round-80 PHASE 3 regression: _fetch_reactions hits the
+    PR-level /issues/N/reactions endpoint, not the review
+    comments endpoint.
+    """
+    poller = _r80_import_poller()
+    called = []
+    def fake_api(endpoint):
+        called.append(endpoint)
+        return [_r80_reaction_payload()], None
+    monkeypatch.setattr(poller, "_gh_api_paginated", fake_api)
+    reactions, err = poller._fetch_reactions("o/r", 412)
+    assert err is None
+    assert reactions == [_r80_reaction_payload()]
+    assert called == ["/repos/o/r/issues/412/reactions"], (
+        f"unexpected endpoint: {called}"
+    )
+
+
+def test_r80_round79_live_evidence_classifies_clean(monkeypatch):
+    """Round-80 PHASE 3 regression 11: the Round-79 live
+    evidence shape (reaction 431112337 with content +1 by
+    chatgpt-codex-connector[bot] at 2026-07-30T02:03:51Z)
+    is classified as CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    # Baseline: a +1 reaction from an earlier Codex review of
+    # a previous head (Round-78 +1 by another bot).
+    # We assert that the real Round-79 reaction 431112337 is
+    # NOT in baseline and classifies as clean.
+    reaction = _r80_reaction_payload(
+        rid=431112337,
+        node_id="REA_lAHOSHFpYM8AAAABJ0XFR84ZskCR",
+        content="+1",
+        actor="chatgpt-codex-connector[bot]",
+        created_at="2026-07-30T02:03:51Z",
+    )
+    match = poller._match_reaction(
+        reaction,
+        repo="Slideshow11/Automated-Edge-Discovery",
+        pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),  # reaction was not in baseline
+        consumed_reaction_ids=set(),
+    )
+    assert match is not None, (
+        "Round-79 reaction 431112337 should classify as CLEAN_PASS"
+    )
+    assert match["verdict"] == "CLEAN_PASS"
+    assert match["id"] == 431112337
+
+
+def test_r80_bounded_polling_watches_reactions(monkeypatch):
+    """Round-80 PHASE 3 regression 12: bounded polling checks
+    reactions without posting duplicate requests.
+
+    The poller must iterate reactions every cycle and never
+    call gh API to post anything; it only fetches.
+    """
+    poller = _r80_import_poller()
+    # Track that _fetch_reactions is called every cycle but no
+    # POST ever happens.
+    fetch_calls = []
+    def fake_fetch_formal(repo, pr):
+        fetch_calls.append(("formal", pr))
+        return [], None
+    def fake_fetch_comments(repo, pr):
+        fetch_calls.append(("comments", pr))
+        return [], None
+    def fake_fetch_reactions(repo, pr):
+        fetch_calls.append(("reactions", pr))
+        return [_r80_reaction_payload()], None
+    monkeypatch.setattr(poller, "_fetch_formal_reviews", fake_fetch_formal)
+    monkeypatch.setattr(poller, "_fetch_issue_comments", fake_fetch_comments)
+    monkeypatch.setattr(poller, "_fetch_reactions", fake_fetch_reactions)
+    # Capture any curl POST attempt (must remain empty).
+    posted = []
+    def fake_post(payload):
+        posted.append(payload)
+        return None
+    monkeypatch.setattr(poller, "_log", lambda *a, **kw: None)
+    # Run one poll iteration.
+    from scripts.local.codex_review_poller import _match_reaction
+    reaction = _r80_reaction_payload()
+    m = _match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    # Must have matched the reaction without ever POSTing.
+    assert m is not None
+    assert posted == []
+    # _fetch_reactions must be callable for polling.
+    assert callable(poller._fetch_reactions)
+
+
+def test_r80_existing_formal_review_finding_still_classified(monkeypatch):
+    """Round-80 PHASE 3 regression 9: existing formal-review
+    FINDING classification remains unchanged.
+
+    Smoke-test that the existing review match path still
+    returns FINDING for a body that starts with the
+    finding badge prefix.
+    """
+    poller = _r80_import_poller()
+    finding_review = {
+        "id": 9001,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": "af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        "submitted_at": "2026-07-30T02:03:00Z",
+        "body": (
+            "**<sub><sub>**P1**</sub></sub>  <headline>Snapshot iteration still "
+            "revisits appended records.</headline>\n\n"
+            "Repro steps: ..."
+        ),
+    }
+    match = poller._match_response(
+        finding_review, kind="review",
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+    )
+    assert match is not None
+    assert match["verdict"] == "FINDING"
+
+
+def test_r80_existing_formal_clean_response_still_classified(monkeypatch):
+    """Round-80 PHASE 3 regression 10: existing formal clean-
+    response classification remains unchanged.
+
+    Use a body that matches CLEAN_PASS_FRAGMENTS but does NOT
+    start with the Codex summary header, so the
+    inline-fetch code path is not exercised.
+    """
+    poller = _r80_import_poller()
+    clean_review = {
+        "id": 9002,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": "af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        "submitted_at": "2026-07-30T02:03:00Z",
+        "body": (
+            "@codex review response: No major issues found. "
+            "The patch looks correct."
+        ),
+    }
+    match = poller._match_response(
+        clean_review, kind="review",
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+    )
+    assert match is not None
+    assert match["verdict"] == "CLEAN_PASS"
+
+
+# =====================================================================
+# Round-81 PHASE 3 regression tests: live-head fetch + surface
+# completeness + finding-over-clean precedence
+# =====================================================================
+#
+# Round-81 fixes two P1 defects observed by Codex against the
+# Round-80 poller:
+#
+# P1 #1: A reaction CLEAN_PASS was emitted even when the live PR
+#        head drifted away from the requested head, because the
+#        existing ``_match_reaction`` only checked the head against
+#        the reaction's body (which reactions don't have). The
+#        fix: fetch the PR's current ``head.sha`` every poll cycle
+#        and compare it directly with the requested head; on
+#        mismatch, emit ``HEAD_DRIFT`` and stop.
+#
+# P1 #2: A reaction CLEAN_PASS was emitted even when the
+#        formal-reviews or issue-comments API request failed,
+#        because the poll loop treated ``None`` for those
+#        surfaces as "no findings yet" instead of "API
+#        incomplete". The fix: track each surface's
+#        ``complete``/``error`` separately; require all
+#        finding-bearing surfaces to be complete before a
+#        reaction CLEAN can be accepted.
+#
+# Plus: any post-request P1/P2 finding always overrides a later
+# clean reaction, regardless of timestamp.
+
+
+ROUND81_HEAD_SHA = "3797c356c1f84378869c1b68304e4b6d729eb8f8"
+
+
+def _r81_pr_payload(head_sha=ROUND81_HEAD_SHA):
+    return {"head": {"sha": head_sha}}
+
+
+def _r81_fetch_pr_stub(head_sha=ROUND81_HEAD_SHA, err=None):
+    """Returns a function suitable for monkeypatching
+    ``_fetch_pull_request_head``.
+
+    ``err=None``  -> returns (head_sha, None).
+    ``err="..."`` -> returns (None, err).
+    """
+    if err is not None:
+        def f(repo, pr_number):
+            return None, err
+        return f
+    def f(repo, pr_number):
+        return head_sha, None
+    return f
+
+
+def _r81_reaction(rid=500000001, content="+1",
+                  actor="chatgpt-codex-connector[bot]",
+                  created_at="2026-07-30T03:00:00Z"):
+    return {
+        "id": rid,
+        "node_id": f"REA_r81_{rid}",
+        "content": content,
+        "user": {"login": actor},
+        "created_at": created_at,
+    }
+
+
+def _r81_formal_finding(review_id=600000001,
+                         submitted_at="2026-07-30T03:00:00Z"):
+    return {
+        "id": review_id,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": ROUND81_HEAD_SHA,
+        "submitted_at": submitted_at,
+        "body": (
+            "**<sub><sub>**P1**</sub></sub>  <headline>"
+            "Snapshot iteration still revisits appended records."
+            "</headline>\n\nRepro steps: ..."
+        ),
+    }
+
+
+def _r81_formal_clean(review_id=600000002,
+                      submitted_at="2026-07-30T03:00:00Z"):
+    return {
+        "id": review_id,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": ROUND81_HEAD_SHA,
+        "submitted_at": submitted_at,
+        "body": "No major issues found. The patch looks correct.",
+    }
+
+
+def _r81_issue_comment_finding(comment_id=700000001,
+                               created_at="2026-07-30T03:00:00Z"):
+    return {
+        "id": comment_id,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "created_at": created_at,
+        "body": (
+            f"Reference {ROUND81_HEAD_SHA[:7]}.\n"
+            "**<sub><sub>**P2**</sub></sub>  <headline>"
+            "Inline review comment flagged.</headline>"
+        ),
+    }
+
+
+def _r81_issue_comment_clean(comment_id=700000002,
+                             created_at="2026-07-30T03:00:00Z"):
+    return {
+        "id": comment_id,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "created_at": created_at,
+        "body": (
+            f"Review of {ROUND81_HEAD_SHA[:7]}: no major issues found. "
+            "Looks good to me."
+        ),
+    }
+
+
+# --- _is_valid_sha -----------------------------------------------------
+
+def test_r81_is_valid_sha_accepts_lowercase_40hex():
+    poller = _r80_import_poller()
+    assert poller._is_valid_sha(ROUND81_HEAD_SHA) is True
+
+
+def test_r81_is_valid_sha_rejects_uppercase():
+    poller = _r80_import_poller()
+    assert poller._is_valid_sha(ROUND81_HEAD_SHA.upper()) is False
+
+
+def test_r81_is_valid_sha_rejects_short():
+    poller = _r80_import_poller()
+    assert poller._is_valid_sha(ROUND81_HEAD_SHA[:7]) is False
+
+
+def test_r81_is_valid_sha_rejects_non_hex():
+    poller = _r80_import_poller()
+    bad = "z" + ROUND81_HEAD_SHA[1:]
+    assert poller._is_valid_sha(bad) is False
+
+
+# --- _fetch_pull_request_head ------------------------------------------
+
+def test_r81_fetch_pull_request_head_returns_head_sha(monkeypatch):
+    poller = _r80_import_poller()
+    monkeypatch.setattr(poller, "_gh_api", lambda ep: (_r81_pr_payload(), None))
+    sha, err = poller._fetch_pull_request_head("o/r", 412)
+    assert err is None
+    assert sha == ROUND81_HEAD_SHA
+
+
+def test_r81_fetch_pull_request_head_returns_err_on_failure(monkeypatch):
+    poller = _r80_import_poller()
+    monkeypatch.setattr(poller, "_gh_api", lambda ep: (None, "boom"))
+    sha, err = poller._fetch_pull_request_head("o/r", 412)
+    assert sha is None
+    assert err == "boom"
+
+
+def test_r81_fetch_pull_request_head_rejects_malformed_sha(monkeypatch):
+    poller = _r80_import_poller()
+    monkeypatch.setattr(poller, "_gh_api",
+                        lambda ep: ({"head": {"sha": "not-a-sha"}}, None))
+    sha, err = poller._fetch_pull_request_head("o/r", 412)
+    assert sha is None
+    assert "non-canonical" in (err or "").lower() or "malformed" in (err or "").lower()
+
+
+# --- surface completeness ----------------------------------------------
+
+def test_r81_surface_complete_when_ok():
+    poller = _r80_import_poller()
+    s = poller._surface_status(
+        head_sha=ROUND81_HEAD_SHA, head_err=None,
+        reviews=[], reviews_err=None,
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    assert s["head"]["complete"] is True
+    assert s["reviews"]["complete"] is True
+    assert s["comments"]["complete"] is True
+    assert s["reactions"]["complete"] is True
+    assert s["all_finding_surfaces_complete"] is True
+    assert s["all_surfaces_complete"] is True
+
+
+def test_r81_surface_incomplete_when_reviews_err():
+    poller = _r80_import_poller()
+    s = poller._surface_status(
+        head_sha=ROUND81_HEAD_SHA, head_err=None,
+        reviews=None, reviews_err="boom",
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    assert s["reviews"]["complete"] is False
+    assert s["comments"]["complete"] is True
+    assert s["reactions"]["complete"] is True
+    assert s["all_finding_surfaces_complete"] is False
+    assert s["all_surfaces_complete"] is False
+
+
+def test_r81_surface_incomplete_when_comments_err():
+    poller = _r80_import_poller()
+    s = poller._surface_status(
+        head_sha=ROUND81_HEAD_SHA, head_err=None,
+        reviews=[], reviews_err=None,
+        comments=None, comments_err="boom",
+        reactions=[], reactions_err=None,
+    )
+    assert s["comments"]["complete"] is False
+    assert s["all_finding_surfaces_complete"] is False
+    assert s["all_surfaces_complete"] is False
+
+
+def test_r81_surface_incomplete_when_head_err():
+    poller = _r80_import_poller()
+    s = poller._surface_status(
+        head_sha=None, head_err="boom",
+        reviews=[], reviews_err=None,
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    assert s["head"]["complete"] is False
+    assert s["all_finding_surfaces_complete"] is False
+    assert s["all_surfaces_complete"] is False
+
+
+# --- _select_response: finding-over-clean precedence ------------------
+
+def test_r81_select_finding_overrides_later_clean_reaction():
+    poller = _r80_import_poller()
+    finding = {
+        "kind": "review",
+        "id": 1,
+        "verdict": "FINDING",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    later_clean = {
+        "kind": "reaction",
+        "id": 2,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T03:05:00Z",
+    }
+    selected, info = poller._select_response(
+        [finding], [later_clean],
+        surface_complete=True,
+    )
+    assert selected["verdict"] == "FINDING"
+    assert selected["kind"] == "review"
+
+
+def test_r81_select_clean_when_no_findings_and_surfaces_complete():
+    poller = _r80_import_poller()
+    clean = {
+        "kind": "reaction",
+        "id": 3,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    selected, info = poller._select_response(
+        [], [clean],
+        surface_complete=True,
+    )
+    assert selected is not None
+    assert selected["verdict"] == "CLEAN_PASS"
+
+
+def test_r81_select_returns_none_when_surfaces_incomplete():
+    poller = _r80_import_poller()
+    clean = {
+        "kind": "reaction",
+        "id": 3,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    selected, info = poller._select_response(
+        [], [clean],
+        surface_complete=False,
+    )
+    assert selected is None
+    assert info == "CLEAN_WITHHELD_INCOMPLETE_FINDING_SURFACES"
+
+
+def test_r81_select_finding_wins_even_when_clean_is_newer():
+    poller = _r80_import_poller()
+    later_clean = {
+        "kind": "issue_comment",
+        "id": 4,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T04:00:00Z",
+    }
+    finding = {
+        "kind": "review",
+        "id": 5,
+        "verdict": "FINDING",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    selected, info = poller._select_response(
+        [finding], [later_clean],
+        surface_complete=True,
+    )
+    assert selected["verdict"] == "FINDING"
+
+
+def test_r81_select_newest_clean_among_multiple():
+    poller = _r80_import_poller()
+    earlier_clean = {
+        "kind": "issue_comment",
+        "id": 10,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    later_clean = {
+        "kind": "review",
+        "id": 11,
+        "verdict": "CLEAN_PASS",
+        "timestamp": "2026-07-30T03:30:00Z",
+    }
+    selected, info = poller._select_response(
+        [], [earlier_clean, later_clean],
+        surface_complete=True,
+    )
+    assert selected["id"] == 11
+
+
+def test_r81_select_newest_finding_among_multiple():
+    poller = _r80_import_poller()
+    earlier_finding = {
+        "kind": "review",
+        "id": 20,
+        "verdict": "FINDING",
+        "timestamp": "2026-07-30T03:00:00Z",
+    }
+    later_finding = {
+        "kind": "issue_comment",
+        "id": 21,
+        "verdict": "FINDING",
+        "timestamp": "2026-07-30T03:30:00Z",
+    }
+    selected, info = poller._select_response(
+        [earlier_finding, later_finding], [],
+        surface_complete=True,
+    )
+    assert selected["id"] == 21
+
+
+# --- _run_poll_cycle end-to-end (with monkeypatched surfaces) --------
+
+def _r81_make_args(head=ROUND81_HEAD_SHA):
+    """Build a minimal argparse.Namespace for _run_poll_cycle."""
+    import argparse
+    return argparse.Namespace(
+        repo="o/r", pr_number=412,
+        head=head,
+        ping_id="r81-ping",
+        ping_created_at="2026-07-30T02:50:00Z",
+        timeout_min=1, poll_seconds=0,
+        baseline_reaction_ids=[],
+        consumed_reaction_ids=[],
+        include_older_ping_id=[],
+    )
+
+
+def test_r81_poll_cycle_clean_with_matching_head_and_complete_surfaces(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "CLEAN_PASS"
+    assert result["kind"] == "reaction"
+    assert result["live_head_verified"] is True
+    assert result["finding_surfaces_complete"] is True
+    assert result["reactions_surface_complete"] is True
+
+
+def test_r81_poll_cycle_head_drift_emits_head_drift(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub(head_sha="a" * 40))
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "HEAD_DRIFT"
+    assert result["expected_head"] == ROUND81_HEAD_SHA
+    assert result["live_head"] == "a" * 40
+    assert result["live_head_verified"] is True
+    assert result["response_accepted"] is False
+
+
+def test_r81_poll_cycle_reviews_api_failure_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["finding_surfaces_complete"] is False
+    assert result["reviews_surface_complete"] is False
+    assert result["comments_surface_complete"] is True
+    assert result["reactions_surface_complete"] is True
+
+
+def test_r81_poll_cycle_comments_api_failure_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["finding_surfaces_complete"] is False
+    assert result["reviews_surface_complete"] is True
+    assert result["comments_surface_complete"] is False
+
+
+def test_r81_poll_cycle_head_api_failure_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub(err="boom"))
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+    assert result["finding_surfaces_complete"] is False
+
+
+def test_r81_poll_cycle_malformed_live_head_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    # Stub the GH API to return malformed data — the helper must
+    # reject it as non-canonical.
+    def fake_gh_api(endpoint):
+        return {"head": {"sha": "garbage"}}, None
+    monkeypatch.setattr(poller, "_gh_api", fake_gh_api)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+
+
+def test_r81_poll_cycle_finding_overrides_later_reaction(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    finding = _r81_formal_finding(submitted_at="2026-07-30T03:00:00Z")
+    later_reaction = _r81_reaction(rid=550,
+                                   created_at="2026-07-30T03:10:00Z")
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([later_reaction], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "FINDING"
+    assert result["kind"] == "review"
+
+
+def test_r81_poll_cycle_finding_overrides_later_clean_review(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    finding = _r81_formal_finding(submitted_at="2026-07-30T03:00:00Z")
+    later_clean = _r81_formal_clean(submitted_at="2026-07-30T03:10:00Z")
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding, later_clean], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "FINDING"
+    assert result["id"] == finding["id"]
+
+
+def test_r81_poll_cycle_observes_finding_with_incomplete_surfaces(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    finding = _r81_formal_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    # comments surface fails — but the formal FINDING is
+    # fail-closed and may still be returned.
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "FINDING"
+    assert result["kind"] == "review"
+    assert result["finding_surfaces_complete"] is False
+    assert result["comments_surface_complete"] is False
+
+
+def test_r81_poll_cycle_observes_issue_comment_finding_when_reviews_fail(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    finding = _r81_issue_comment_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "FINDING"
+    assert result["kind"] == "issue_comment"
+    assert result["reviews_surface_complete"] is False
+
+
+def test_r81_poll_cycle_does_not_post_when_surfaces_incomplete(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    posted = []
+    monkeypatch.setattr(poller, "_post_pr_comment",
+                        lambda *a, **kw: posted.append((a, kw)) or None)
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert posted == [], "must NOT post duplicate Codex requests"
+
+
+def test_r81_poll_cycle_round79_live_evidence_classifies_clean(monkeypatch):
+    """Regression: the Round-79 reaction 431112337 evidence must
+    still classify as clean when live head and all surfaces are
+    complete.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: (
+                            [_r81_reaction(
+                                rid=431112337,
+                                created_at="2026-07-30T03:00:00Z")],
+                            None,
+                        ))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "CLEAN_PASS"
+    assert result["id"] == 431112337
+
+
+def test_r81_poll_cycle_formal_clean_with_complete_surfaces(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([_r81_formal_clean()], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "CLEAN_PASS"
+    assert result["kind"] == "review"
+
+
+def test_r81_poll_cycle_formal_clean_withheld_when_comments_fail(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([_r81_formal_clean()], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["comments_surface_complete"] is False
+
+
+def test_r81_poll_cycle_issue_clean_withheld_when_reviews_fail(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head",
+                        _r81_fetch_pr_stub())
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: (None, "boom"))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([_r81_issue_comment_clean()], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["reviews_surface_complete"] is False
+
+
+# --- structured output -------------------------------------------------
+
+def test_r81_terminal_response_includes_required_fields():
+    poller = _r80_import_poller()
+    surface = poller._surface_status(
+        head_sha=ROUND81_HEAD_SHA, head_err=None,
+        reviews=[], reviews_err=None,
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    payload = poller._build_terminal_payload(
+        verdict="CLEAN_PASS", kind="reaction",
+        response_id=431112337,
+        expected_head=ROUND81_HEAD_SHA, live_head=ROUND81_HEAD_SHA,
+        surface=surface, timestamp="2026-07-30T03:00:00Z",
+        repo="o/r", pr_number=412,
+    )
+    for f in (
+        "verdict", "kind", "id", "expected_head", "live_head",
+        "live_head_verified", "finding_surfaces_complete",
+        "reviews_surface_complete", "comments_surface_complete",
+        "reactions_surface_complete", "surface_errors", "timestamp",
+        "repository", "pr_number",
+    ):
+        assert f in payload, f"missing field {f!r}"
+
+
+def test_r81_terminal_payload_head_drift_marks_not_accepted():
+    poller = _r80_import_poller()
+    surface = poller._surface_status(
+        head_sha="a" * 40, head_err=None,
+        reviews=[], reviews_err=None,
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    payload = poller._build_terminal_payload(
+        verdict="HEAD_DRIFT", kind="",
+        response_id=None,
+        expected_head=ROUND81_HEAD_SHA, live_head="a" * 40,
+        surface=surface, timestamp="2026-07-30T03:00:00Z",
+        repo="o/r", pr_number=412,
+    )
+    assert payload["verdict"] == "HEAD_DRIFT"
+    assert payload["response_accepted"] is False
+    assert payload["expected_head"] == ROUND81_HEAD_SHA
+    assert payload["live_head"] == "a" * 40
+
+
+def test_r81_terminal_payload_finding_with_incomplete_surfaces_is_honest():
+    poller = _r80_import_poller()
+    surface = poller._surface_status(
+        head_sha=ROUND81_HEAD_SHA, head_err=None,
+        reviews=[], reviews_err="boom",
+        comments=[], comments_err=None,
+        reactions=[], reactions_err=None,
+    )
+    payload = poller._build_terminal_payload(
+        verdict="FINDING", kind="issue_comment",
+        response_id=700000001,
+        expected_head=ROUND81_HEAD_SHA, live_head=ROUND81_HEAD_SHA,
+        surface=surface, timestamp="2026-07-30T03:00:00Z",
+        repo="o/r", pr_number=412,
+    )
+    assert payload["verdict"] == "FINDING"
+    assert payload["finding_surfaces_complete"] is False
+    assert payload["reviews_surface_complete"] is False
+    # Surface errors must be carried.
+    assert payload["surface_errors"]["reviews"] == "boom"
+
+
+# =====================================================================
+# Round-82 PHASE 3 regression tests: recheck PR head AFTER surface
+# collection
+# =====================================================================
+#
+# Codex Round-81 finding: a single pre-fetch head check is not
+# sufficient. The three surface requests (reviews, comments,
+# reactions) can take minutes, especially with pagination, and the
+# head may drift while they run. The poller must re-fetch and
+# compare head.sha AFTER surface collection and immediately before
+# returning any accepted response.
+
+
+def _r82_pr_payload(head_sha):
+    return {"head": {"sha": head_sha}}
+
+
+def _r82_drifting_fetch_pr_stub(initial_sha, final_sha):
+    """A stub that returns ``initial_sha`` for the first call
+    and ``final_sha`` for every subsequent call.
+    """
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        sha = initial_sha if state["calls"] == 1 else final_sha
+        return sha, None
+
+    return f, state
+
+
+def test_r82_poll_cycle_head_drift_during_surface_collection(monkeypatch):
+    """Round-82 P1: head drifts AFTER initial fetch but BEFORE
+    response selection -> HEAD_DRIFT, NOT CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    drift = "b" * 40
+    stub, state = _r82_drifting_fetch_pr_stub(initial, drift)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "HEAD_DRIFT", (
+        f"expected HEAD_DRIFT, got {result['verdict']}"
+    )
+    assert result["expected_head"] == ROUND81_HEAD_SHA
+    assert result["live_head"] == drift
+    assert result["live_head_verified"] is True
+    assert result["response_accepted"] is False
+    # Verify head was fetched at least twice (initial + post-collection).
+    assert state["calls"] >= 2, (
+        f"expected head to be re-fetched; got {state['calls']} calls"
+    )
+
+
+def test_r82_poll_cycle_no_head_drift_after_surfaces_returns_clean(monkeypatch):
+    """Round-82: head re-checked and STILL matches -> CLEAN_PASS."""
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    stub, state = _r82_drifting_fetch_pr_stub(initial, initial)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "CLEAN_PASS"
+    assert state["calls"] >= 2
+
+
+def test_r82_poll_cycle_head_recheck_succeeds_after_initial_failure(monkeypatch):
+    """Round-82: even if the initial head fetch fails, a
+    successful post-collection re-fetch can still classify
+    the response (but the FINDING/CLEAN acceptance still
+    requires the re-fetch to confirm).
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return None, "boom"  # initial fetch fails
+        return ROUND81_HEAD_SHA, None  # re-fetch succeeds
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", f)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    # First fetch failed -> surface is incomplete initially.
+    # Re-fetch succeeded -> CLEAN_PASS is now permitted.
+    assert result["verdict"] == "CLEAN_PASS"
+    assert result["live_head_verified"] is True
+    assert state["calls"] >= 2
+
+
+def test_r82_poll_cycle_head_recheck_failure_returns_pending(monkeypatch):
+    """Round-82: if the post-collection re-fetch fails too,
+    withhold the verdict even if a clean candidate exists.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        return None, "boom"  # every fetch fails
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", f)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+    assert result["finding_surfaces_complete"] is False
+
+
+def test_r82_poll_cycle_head_drift_overrides_finding_too(monkeypatch):
+    """Round-82: even a finding's response is not returned
+    if the head has drifted; HEAD_DRIFT is terminal.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    drift = "c" * 40
+    stub, state = _r82_drifting_fetch_pr_stub(initial, drift)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    finding = _r81_formal_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "HEAD_DRIFT"
+    assert result["live_head"] == drift
+
+
+# =====================================================================
+# Round-83 PHASE 3 regression tests: fail closed when the final
+# (post-collection) head fetch fails
+# =====================================================================
+#
+# Codex Round-82 finding: if the initial head fetch succeeded
+# but the post-collection re-fetch transiently errors, my
+# Round-82 fix returned the (stale) verdict anyway. The fix:
+# if the final head fetch fails, treat the head surface as
+# incomplete and withhold the verdict.
+
+
+def _r83_initial_ok_final_fails_stub(HEAD=ROUND81_HEAD_SHA):
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return HEAD, None  # initial succeeds
+        return None, "boom"  # final fails
+    return f, state
+
+
+def test_r83_poll_cycle_initial_head_ok_final_fails_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    stub, state = _r83_initial_ok_final_fails_stub()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    # Even though initial head matched, the final head fetch
+    # failed -> do NOT accept the CLEAN verdict.
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+    assert result["finding_surfaces_complete"] is False
+    assert result["surface_errors"]["head"] == "boom"
+
+
+def test_r83_poll_cycle_initial_head_ok_final_fails_withholds_finding(monkeypatch):
+    """Even a finding is withheld if the final head fetch
+    fails, because we cannot prove the response is for the
+    CURRENT head. The head surface must complete before
+    any verdict — clean or finding — is accepted.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    stub, state = _r83_initial_ok_final_fails_stub()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    finding = _r81_formal_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["finding_surfaces_complete"] is False

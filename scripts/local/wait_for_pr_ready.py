@@ -671,6 +671,13 @@ def poll_ci_checks(
         if not pending_checks:
             return STATUS_READY_FOR_FINAL_GATES, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, None
 
+        # poll_seconds <= 0 means "immediate deadline": return HOLD_TIMEOUT
+        # on the first iteration without sleeping. Otherwise the loop with
+        # poll_seconds=0 would call time.sleep(0) repeatedly and never make
+        # progress against the wall-clock deadline.
+        if poll_seconds <= 0:
+            return STATUS_HOLD_TIMEOUT, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat(), "pending_at_timeout": pending_checks}, "immediate deadline with pending checks"
+
         if remaining <= poll_seconds:
             return STATUS_HOLD_TIMEOUT, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat(), "pending_at_timeout": pending_checks}, f"timeout with pending: {pending_checks}"
 

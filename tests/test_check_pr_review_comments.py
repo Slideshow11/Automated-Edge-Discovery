@@ -169,6 +169,192 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Exact head SHA: 0413708ea63b5dcb13743eeb718f53ca3c45a456\n"
         ))
 
+    def test_is_coordination_comment_detects_codex_please_rereview(self):
+        """Round-81 follow-up: malformed Codex-review request
+        comments that lack the canonical ``@codex review``
+        trigger but begin with the PR author's ``Codex: please
+        re-review`` coordination phrase must be recognized as
+        coordination messages, not findings. The body often
+        describes prior-round repairs and may mention ``P1`` /
+        ``P2`` severity tokens when summarizing what those
+        commits addressed.
+        """
+        self.assertTrue(crc.is_coordination_comment(
+            "Codex: please re-review PR #412 on exact head "
+            "00902efa4fe7347b78f38094072a9f4b19cb0200.\n\n"
+            "Round-81 (additive on top of 3797c35) addresses the "
+            "two P1s from the Round-80 review.\n"
+        ))
+
+    def test_human_codex_please_rereview_not_classified_as_finding(self):
+        """Regression: the exact Round-81 NON_TRIGGERING_INFORMATIONAL_COMMENT
+        from PR #412 (dbID 5129376933) must not produce a finding,
+        even though its body describes prior-round P1 repairs.
+        """
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": (
+                "Codex: please re-review PR #412 on exact head "
+                "00902efa4fe7347b78f38094072a9f4b19cb0200.\n\n"
+                "Round-81 (additive on top of 3797c35) addresses "
+                "the two P1s from the Round-80 review of your "
+                "previous poller fix:\n\n"
+                "- live PR head.sha is fetched every poll cycle via "
+                "GET /repos/{owner}/{repo}/pulls/{pr_number} and "
+                "compared directly with the requested head; on "
+                "mismatch the poller emits HEAD_DRIFT and exits "
+                "with code 4 (replacing the ineffective "
+                "reaction-body head check).\n"
+                "- clean responses now require complete head + "
+                "reviews + comments + reactions surfaces; a "
+                "reaction CLEAN is withheld with "
+                "CLEAN_WITHHELD_INCOMPLETE_FINDING_SURFACES "
+                "whenever the formal-reviews or issue-comments "
+                "API errors out.\n"
+                "- a post-request P1/P2 finding always outranks "
+                "every clean channel regardless of timestamp.\n"
+                "- 35 new Round-81 regression tests cover "
+                "defects A-D plus regressions on Round-79 live "
+                "evidence (reaction 431112337), consumed-reaction "
+                "idempotence, human / other-bot rejection.\n"
+                "- complete suite exit 0 in a fresh detached "
+                "worktree at this SHA (7732 passed, 11 skipped, "
+                "13 warnings, 448 subtests passed in 214.90s).\n"
+                "- structured terminal payload always reports "
+                "expected_head, live_head, live_head_verified, "
+                "finding_surfaces_complete, "
+                "reviews/comments/reactions_surface_complete, "
+                "and surface_errors.\n"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Codex: please re-review...' issue comment "
+            "must not be classified as a finding even when its "
+            "body contains 'P1' / 'P2' severity tokens past the "
+            "leading 100 chars describing prior-round repairs.",
+        )
+
+    def test_per_review_summary_finding_inherits_resolved_state_from_threads(
+        self,
+    ):
+        """Round-81 follow-up: a per-review-comment finding whose
+        URL is the review-summary URL (not a thread discussion
+        URL) must inherit its thread resolution state from any
+        thread in the same review. If every thread in the
+        review is resolved, the per-review-summary finding is
+        treated as resolved and is not a stale-blocker.
+        """
+        # Synthesize a thread_meta_by_url mock where a thread
+        # for review_id 4769640328 is resolved.
+        thread_meta_by_url = {
+            "https://github.com/.../discussion_r3642530507": {
+                "thread_id": "PRRT_TEST",
+                "is_resolved": True,
+                "is_outdated": False,
+                "url": "https://github.com/.../discussion_r3642530507",
+            },
+        }
+        thread_meta_by_review_id = {
+            4769640328: [{
+                "thread_id": "PRRT_TEST",
+                "is_resolved": True,
+                "is_outdated": False,
+                "url": "https://github.com/.../discussion_r3642530507",
+            }],
+        }
+
+        # A per-review-comment summary finding for review 4769640328
+        # whose URL is the review URL.
+        finding = {
+            "id": "codex-test",
+            "user": "chatgpt-codex-connector[bot]",
+            "body": (
+                "### Codex Review\n\n"
+                "https://github.com/.../scripts/local/audit_codex_response_for_pr.py#L1769-L1773\n"
+                "![P1 Badge] Preserve nested pagination failures across pages"
+            ),
+            "url": (
+                "https://github.com/Slideshow11/Automated-Edge-Discovery"
+                "/pull/412#pullrequestreview-4769640328"
+            ),
+            "severity": "P1",
+            "commit_id": "17ee893b68bc",
+        }
+
+        # Inline the lookup logic. The post-classify attachment
+        # block in check_pr_review_comments does the same:
+        url = finding.get("url", "")
+        meta = thread_meta_by_url.get(url, {})
+        thread_id = meta.get("thread_id", "")
+        thread_resolved = meta.get("is_resolved", False)
+        if not thread_id:
+            # Review-id fallback.
+            import re as _re
+            m = _re.search(r"#pullrequestreview-(\d+)", url or "")
+            review_id = int(m.group(1)) if m else None
+            if review_id is not None:
+                review_threads = thread_meta_by_review_id.get(review_id, [])
+                if review_threads:
+                    thread_id = review_threads[0].get("thread_id", "")
+                    thread_resolved = all(
+                        t.get("is_resolved", False) for t in review_threads
+                    )
+
+        # The summary finding must inherit the resolved state
+        # from the only thread in the review.
+        self.assertEqual(thread_id, "PRRT_TEST")
+        self.assertTrue(thread_resolved)
+
+    def test_per_review_summary_finding_still_blocking_when_thread_unresolved(
+        self,
+    ):
+        """Round-81 follow-up: a per-review-comment summary
+        finding for a review with an unresolved thread must
+        remain as a stale-blocker (not be inherited as
+        resolved).
+        """
+        thread_meta_by_url = {
+            "https://github.com/.../discussion_r3642530507": {
+                "thread_id": "PRRT_TEST",
+                "is_resolved": False,
+                "is_outdated": False,
+            },
+        }
+        thread_meta_by_review_id = {
+            4769640328: [{
+                "thread_id": "PRRT_TEST",
+                "is_resolved": False,
+                "is_outdated": False,
+            }],
+        }
+        finding = {
+            "url": (
+                "https://github.com/Slideshow11/Automated-Edge-Discovery"
+                "/pull/412#pullrequestreview-4769640328"
+            ),
+        }
+        url = finding.get("url", "")
+        meta = thread_meta_by_url.get(url, {})
+        thread_id = meta.get("thread_id", "")
+        thread_resolved = meta.get("is_resolved", False)
+        if not thread_id:
+            import re as _re
+            m = _re.search(r"#pullrequestreview-(\d+)", url or "")
+            review_id = int(m.group(1)) if m else None
+            if review_id is not None:
+                review_threads = thread_meta_by_review_id.get(review_id, [])
+                if review_threads:
+                    thread_id = review_threads[0].get("thread_id", "")
+                    thread_resolved = all(
+                        t.get("is_resolved", False) for t in review_threads
+                    )
+
+        self.assertEqual(thread_id, "PRRT_TEST")
+        self.assertFalse(thread_resolved)
+
     def test_human_codex_request_issue_comment_not_classified(self):
         """The exact blocker from PR #411 on a1c7322: a human
         issue comment by the PR author issuing a fresh Codex

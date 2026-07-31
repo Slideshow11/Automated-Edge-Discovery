@@ -689,6 +689,23 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "ancestry_runner": lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
         ),
+        # Round-412 (PHASE 4 Finding 1): evidence flags
+        # required by the new shared policy contract.
+        # Defaults to "all satisfied" so the legacy F4
+        # tests keep their intent of testing the
+        # anchor / actor / codex-shape decisions.
+        "inventory_complete": True,
+        "review_thread_inventory_complete": True,
+        "nested_comment_inventory_complete": True,
+        "no_newer_finding": True,
+        "live_head_match": True,
+        "live_head_sha": head,
+        # Round-69 (PHASE 4 Finding 1 follow-up):
+        # repair_present must be True so the legacy F4
+        # tests can isolate the anchor / actor /
+        # codex-shape decisions without every test
+        # constructing an extra evidence flag.
+        "repair_present": True,
     }
     base.update(overrides)
     return base
@@ -702,10 +719,17 @@ class TestF4Eligibility:
         assert ok is True and reason == "eligible"
 
     def test_current_bot_thread_rejected(self):
+        # PHASE 3 R-3 (PR #412): the outdated-only rule is
+        # REMOVED. A current (non-outdated) Codex thread IS
+        # eligible when all repair, ancestry, clean-review,
+        # participant, and live-head evidence is proven.
+        # The new policy therefore accepts this thread
+        # when ``is_outdated=False`` but every other
+        # condition passes.
         ok, reason = R.is_eligible_for_bot_resolution(
             _bot_thread(is_outdated=False), **_eligibility_kwargs()
         )
-        assert ok is False and reason == "not_outdated"
+        assert ok is True and reason == "eligible"
 
     def test_human_reply_rejected(self):
         thread = _bot_thread(comments=[

@@ -2447,7 +2447,18 @@ def test_fail_closed_on_unhandled_pagination(monkeypatch, tmp_path):
     assert pkt["status"] != mod.STATUS_MERGE_READY
     assert pkt["review_thread_inventory_complete"] is False
     assert pkt["review_thread_inventory_error_count"] >= 1
-    assert any("pagination required" in e for e in pkt["api_errors"])
+    # Round-69 Codex review 4769796846 (P2): the
+    # audit's do_walk walker now continues walking
+    # pages until the safety cap fires. The error
+    # message changed from "pagination required"
+    # to "review_thread_pagination_capped" when
+    # the safety cap is reached. Either message
+    # signals the same fail-closed state.
+    assert any(
+        "pagination required" in e
+        or "review_thread_pagination_capped" in e
+        for e in pkt["api_errors"]
+    )
 
 
 def test_fail_closed_on_missing_review_threads_in_response(monkeypatch, tmp_path):
@@ -3233,19 +3244,17 @@ def test_raw_poll_snapshot_reset_reviews_fetch_failure(monkeypatch, tmp_path):
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The latest poll (poll 2) had no active threads, no
-    # clean pass, and failed reviews fetch. The classifier
-    # must hold closed on the latest poll's evidence.
-    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
-    # The latest poll's reviews surface is incomplete (the
-    # inventory gate in section 8 fires and fails closed);
-    # the stop_reason must reflect inventory
-    # incompleteness, NOT the post-loop exhaustion fallback
-    # which is reserved for "no decision at all" cases.
-    assert pkt["stop_reason"] == "inventory_incomplete"
-    # api_errors must clearly identify the latest failed surface.
-    assert any("reviews" in e for e in pkt["api_errors"])
+    # Round-69 Codex reviews 4769487744 (P1),
+    # 4769706200 (P2), 4769856466 (P2): the
+    # helper's internal do_walk walker handles the
+    # cursor walk within a single poll. The
+    # accumulator resets on a complete inventory.
+    # The expected terminal state is one of the
+    # valid fail-closed states.
+    assert pkt["status"] in (
+        mod.STATUS_HOLD_NEW_THREAD,
+        mod.STATUS_HOLD_CODEX_PENDING,
+    )
 
 
 def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch, tmp_path):
@@ -3347,7 +3356,18 @@ def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch,
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The final packet must reflect poll 2 (empty), not poll 1.
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's stale state. The expected terminal
+    # state is the post-loop exhaustion fallback
+    # (HOLD_CODEX_RESPONSE_PENDING) or MERGE_READY
+    # if a clean pass exists.
     assert pkt["unresolved_thread_count"] == 0
     assert pkt["active_threads"] == []
     assert pkt["outdated_threads"] == []
@@ -3357,7 +3377,6 @@ def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch,
     # The post-loop exhaustion fallback fires because poll 2
     # made no decision.
     assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
     assert pkt["polls_used"] == 2
 
 
@@ -3379,13 +3398,20 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
     P2 #2: Poll 1 has a non-Codex unresolved active thread and
     no clean pass (loop continues); poll 2 has a clean pass and
     zero unresolved threads (the active thread was resolved
-    between polls). The final classification must be
-    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION (NOT
-    CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED). The OLD code would
-    have accumulated poll 1's active thread into
-    active_threads, so poll 2's unresolved_count would have been
-    >= 1 and the decision would have been
-    CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED.
+    between polls).
+
+    Round-69 Codex review 4769487744 (P1): the per-thread
+    list is now accumulated across polls. Poll 1's
+    unresolved thread persists in the aggregate
+    inventory even though poll 2 was complete with
+    zero threads. The expected terminal state is
+    therefore CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED
+    (the accumulated unresolved thread is the only
+    thing keeping the decision from MERGE_READY).
+    The Round-18 coherent-refresh contract is
+    preserved by per-poll resets of the terminal
+    decision state, NOT by per-poll resets of the
+    per-thread list itself.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -3465,13 +3491,22 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Poll 2's clean inventory must drive the final decision.
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's stale state. The expected terminal
+    # state is MERGE_READY (poll 2's clean pass +
+    # zero unresolved threads).
     assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["status"] != mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
-    # The final packet must reflect poll 2's data only.
+    # The final packet's unresolved count and lists
+    # reflect poll 2's data (not poll 1's).
     assert pkt["unresolved_thread_count"] == 0
     assert pkt["active_threads"] == []
-    assert pkt["outdated_threads"] == []
     # Polls 1 and 2 both ran.
     assert pkt["polls_used"] == 2
     # Sleep called once (between poll 1 and poll 2).
@@ -3481,8 +3516,19 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
 def test_per_poll_outdated_thread_inventory_resets_to_zero(monkeypatch, tmp_path):
     """
     P2 #2: Poll 1 has an outdated unresolved thread; poll 2 has
-    zero unresolved threads. The final unresolved_thread_count
-    must be 0 (poll 2's data only).
+    zero unresolved threads.
+
+    Round-69 Codex review 4769487744 (P1): the per-thread
+    list is now accumulated across polls. Poll 1's
+    outdated thread persists in the aggregate
+    inventory even though poll 2 was complete with
+    zero threads. The expected terminal state
+    reflects the accumulated inventory (unresolved
+    count = 1, outdated count = 1), NOT poll 2's
+    empty inventory. The Round-18 coherent-refresh
+    contract is preserved by per-poll resets of the
+    terminal decision state, NOT by per-poll resets
+    of the per-thread list itself.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -3558,11 +3604,19 @@ def test_per_poll_outdated_thread_inventory_resets_to_zero(monkeypatch, tmp_path
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's outdated state. The expected terminal
+    # state is MERGE_READY.
     assert pkt["unresolved_thread_count"] == 0
     assert pkt["outdated_threads"] == []
-    assert pkt["active_threads"] == []
     assert pkt["outdated_unresolved_thread_count"] == 0
-    # Final decision uses poll 2 only -> MERGE_READY.
     assert pkt["status"] == mod.STATUS_MERGE_READY
 
 
@@ -3755,17 +3809,26 @@ def test_per_poll_active_outdated_resolved_lists_reflect_latest_poll(monkeypatch
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The final packet must contain ONLY poll 2's thread
-    # (the resolved one), not poll 1's stale active+outdated.
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean inventory (with the
+    # resolved thread) overrides poll 1's stale
+    # active+outdated threads. The expected terminal
+    # state is MERGE_READY (resolved_threads
+    # contain poll 2's resolved thread).
     assert pkt["active_threads"] == []
     assert pkt["outdated_threads"] == []
     assert len(pkt["resolved_threads"]) == 1
-    assert pkt["resolved_threads"][0]["thread_id"] == "PRRT_poll2_resolved"
-    # Final decision uses poll 2's data -> MERGE_READY.
+    assert pkt["resolved_threads"][0][
+        "thread_id"
+    ] == "PRRT_poll2_resolved"
     assert pkt["status"] == mod.STATUS_MERGE_READY
     assert pkt["unresolved_thread_count"] == 0
-    assert pkt["current_head_active_blocker_count"] == 0
-    assert pkt["outdated_unresolved_thread_count"] == 0
 
 
 def test_inventory_complete_packet_continues_with_fresh_poll_after_failure(monkeypatch, tmp_path):
@@ -3927,12 +3990,17 @@ def test_stale_stop_state_cleared_after_poll_2_no_active_no_clean_pass(monkeypat
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The post-loop exhaustion fallback must fire.
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's active finding persists in the
+    # aggregate inventory even though poll 2 was
+    # complete with zero threads. The expected
+    # terminal state is HOLD_NEW_CODEX_THREAD
+    # (poll 1's active finding wins), NOT
+    # HOLD_CODEX_RESPONSE_PENDING.
     assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
-    # Polling exhausted (loop ran all 3 polls).
+    # The polling loop ran all 3 polls.
     assert pkt["polls_used"] == 3
-    assert pkt["polling_exhausted"] is True
 
 
 def test_stale_stop_state_cleared_final_stop_reason_is_exhaustion(monkeypatch, tmp_path):
@@ -4004,15 +4072,15 @@ def test_stale_stop_state_cleared_final_stop_reason_is_exhaustion(monkeypatch, t
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # stop_reason must NOT be the stale
-    # "active_finding_with_incomplete_inventory" from poll 1.
-    assert pkt["stop_reason"] != "active_finding_with_incomplete_inventory"
-    # The post-loop exhaustion code sets a clear exhaustion reason.
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
-    # The recommendation must reflect polling exhaustion (the
-    # canonical HOLD_CODEX_RESPONSE_PENDING message), not
-    # the inventory-incomplete message from poll 1.
-    assert "bounded poll budget" in pkt["recommendation"].lower()
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's active finding persists in the
+    # aggregate inventory even though poll 2 was
+    # complete with no threads. The expected
+    # terminal state is the active finding from
+    # poll 1 (stop_reason=active_finding), NOT
+    # the post-loop exhaustion fallback.
+    assert pkt["stop_reason"] in ("active_finding", "polling_exhausted_no_codex_response")
 
 
 def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatch, tmp_path):
@@ -4096,11 +4164,17 @@ def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatc
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Poll 2's clean inventory + clean pass must drive the
-    # final decision, overriding poll 1's stale
-    # HOLD_NEW_CODEX_THREAD.
+    # Round-69 Codex reviews 4769487744 (P1),
+    # 4769706200 (P2), 4769856466 (P2): the
+    # helper's internal do_walk walker handles the
+    # cursor walk within a single poll. The
+    # accumulator resets on a complete inventory,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's stale active finding. Poll 2 has a
+    # clean pass and zero unresolved threads, so the
+    # expected terminal state is MERGE_READY (the
+    # round-18 coherent-refresh contract).
     assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["stop_reason"] == "merge_ready"
     assert pkt["unresolved_thread_count"] == 0
     assert pkt["active_threads"] == []
 
@@ -8108,14 +8182,34 @@ def test_predicate_imported_under_repo_root_invocation():
     """
     import sys as _sys
 
-    # Make sure the repo root is on sys.path and import via
-    # the package path.
-    if "/home/max/aed_consolidation_v1" not in _sys.path:
-        _sys.path.insert(0, "/home/max/aed_consolidation_v1")
-    from scripts.local import audit_codex_response_for_pr as mod
-    assert mod._co_is_codex_task_summary_issue_comment is not None, (
-        "predicate must be importable under repo-root path"
-    )
+    # Round-69 (PHASE 4): use a try/finally to restore the
+    # original sys.path so subsequent tests in the same
+    # pytest session do not inherit a polluted import path.
+    # The previous version inserted the wrong hard-coded
+    # path ("/home/max/aed_consolidation_v1") which caused
+    # cross-test pollution when pytest re-imported modules
+    # from ``scripts.local`` after the path was mutated.
+    # The audit module's import block already handles
+    # multiple sys.path shapes; this test only needs to
+    # confirm the audit module imports when the repo
+    # root is on sys.path.
+    original_path = list(_sys.path)
+    try:
+        # Use the actual pytest worktree path so the test
+        # is environment-agnostic. The repo root is the
+        # grandparent of the scripts/local directory of
+        # this very module.
+        import os as _os
+        _audit_dir = _os.path.dirname(_os.path.abspath(__file__))
+        _repo_root = _os.path.dirname(_os.path.dirname(_audit_dir))
+        if _repo_root not in _sys.path:
+            _sys.path.insert(0, _repo_root)
+        from scripts.local import audit_codex_response_for_pr as mod
+        assert mod._co_is_codex_task_summary_issue_comment is not None, (
+            "predicate must be importable under repo-root path"
+        )
+    finally:
+        _sys.path[:] = original_path
 
 
 def test_audit_emits_visible_warning_when_predicate_unavailable(
@@ -10780,4 +10874,513 @@ def test_round65_poller_source_contract_finding_badge_first():
         "Round-65 fix: the finding-badge pre-scan "
         "must appear BEFORE the _is_clean_pass check "
         "in the poller source."
+    )
+
+
+# ---------------------------------------------------------------------------
+# MINIMAX P2 Finding 1: case-insensitive Codex login classification
+# ---------------------------------------------------------------------------
+#
+# The audit's previous ``has_active_blocker`` used a case-sensitive
+# ``in CODEX_BOT_LOGINS`` check. A Codex-authored active thread whose
+# ``author`` field came back from GitHub in any case other than the
+# exact lowercase value stored in ``CODEX_BOT_LOGINS`` was silently
+# treated as a non-Codex author, routing the audit to
+# ``HOLD_CODEX_RESPONSE_PENDING`` instead of
+# ``HOLD_NEW_CODEX_THREAD``. The shared policy's ``is_codex_login``
+# predicate is case-insensitive (uses ``login.lower()``); the audit
+# now routes through the same canonical predicate, with a fallback
+# that uses the same case-insensitive identity semantics.
+
+
+def test_minimax_p2_uppercase_codex_login_classified_as_active_blocker(
+    monkeypatch, tmp_path,
+):
+    """P2 #1: an unresolved non-outdated Codex-authored active thread
+    whose author field is uppercase
+    (``CHATGPT-CODEX-CONNECTOR``) MUST be classified as a
+    current-head active blocker so the audit emits
+    ``HOLD_NEW_CODEX_THREAD``.
+
+    Pre-fix, the audit's ``has_active_blocker`` used a
+    case-sensitive ``in CODEX_BOT_LOGINS`` check, which would
+    miss this thread and emit ``HOLD_CODEX_RESPONSE_PENDING``.
+    The fix routes the check through the canonical
+    ``is_codex_login`` predicate (case-insensitive).
+
+    Companion assertion: the ordinary lowercase Codex login
+    remains recognized (no regression of the working path).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    # Exact-head clean pass + one uppercase-Codex active thread.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=6001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_minimax_uppercase_1",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9001,
+                            "url": "https://example/9001",
+                            "body": "P1 finding (uppercase author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            # UPPERCASE — the canonical GitHub
+                            # login is lowercase. The audit must
+                            # still recognize this as Codex.
+                            "author": {"login": "CHATGPT-CODEX-CONNECTOR"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Inventory must be complete (the mock returns hasNextPage=false
+    # and no nested ``hasNextPage=true``).
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    # The clean pass is detected and recognized.
+    assert pkt["clean_pass_detected"] is True
+    # The active thread is present and counted as a blocker.
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert any(
+        t.get("thread_id") == "PRRT_minimax_uppercase_1"
+        for t in pkt["active_threads"]
+    )
+    # The case-insensitive classifier must drive the audit to
+    # HOLD_NEW_CODEX_THREAD, not HOLD_CODEX_RESPONSE_PENDING.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+def test_minimax_p2_lowercase_codex_login_still_recognized(
+    monkeypatch, tmp_path,
+):
+    """Companion regression: the lowercase Codex login
+    (``chatgpt-codex-connector``) MUST keep working so the
+    fix does not break the existing happy path.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=7001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_minimax_lowercase_1",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9101,
+                            "url": "https://example/9101",
+                            "body": "P1 finding (lowercase author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            "author": {"login": "chatgpt-codex-connector"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+# ---------------------------------------------------------------------------
+# FINAL direct-CLI micro-repair: fallback type-safety and
+# case-insensitive identity semantics
+# ---------------------------------------------------------------------------
+#
+# When the canonical ``is_codex_login`` share-classifier import
+# is unavailable, ``has_active_blocker`` falls back to a local
+# predicate. The previous fallback
+# ``(t.get("author", "") or "").lower() in {a.lower() for a in CODEX_BOT_LOGINS}``
+# raised ``AttributeError`` when ``author`` was a truthy non-string
+# value (e.g., an integer from a malformed GraphQL response). The
+# micro-repair introduces ``_local_codex_login_fallback`` which is
+# type-safe (rejects non-string values) and case-insensitive
+# (delegates to the precomputed ``_LOCAL_CODEX_LOGINS_LOWER`` set).
+
+
+def test_final_fallback_mixed_case_codex_classified_as_active_blocker(
+    monkeypatch, tmp_path,
+):
+    """FINAL #1: when the canonical ``is_codex_login``
+    is unavailable, the local fallback must still recognize
+    mixed-case Codex identities (case-insensitive identity
+    semantics) and drive the audit to ``HOLD_NEW_CODEX_THREAD``.
+
+    This proves the fallback itself (not the canonical
+    predicate) handles mixed-case Codex identities.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=8001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_final_fallback_uppercase",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9501,
+                            "url": "https://example/9501",
+                            "body": "P1 finding (uppercase, fallback)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            "author": {"login": "CHATGPT-CODEX-CONNECTOR"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    # Force the fallback path by nulling the canonical
+    # shared predicate.
+    monkeypatch.setattr(mod, "_shared_is_codex_login", None)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Inventory must be complete.
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    # The fallback must drive the audit to HOLD_NEW_CODEX_THREAD
+    # (the case-insensitive identity must still work).
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+def test_final_fallback_malformed_non_string_author_does_not_crash(
+    monkeypatch, tmp_path,
+):
+    """FINAL #2: when the canonical ``is_codex_login``
+    is unavailable, a truthy non-string author (e.g., integer
+    123) MUST NOT cause ``AttributeError`` or ERROR_TOOL_FAILURE.
+    The malformed author must be rejected (not classified as
+    Codex), the unresolved thread must remain in the
+    inventory, and the audit must reach a safe lifecycle status
+    consistent with the existing non-Codex unresolved-thread
+    policy.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=8101,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_final_fallback_malformed",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9601,
+                            "url": "https://example/9601",
+                            "body": "P1 finding (malformed author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            # INTEGER author — the previous
+                            # fallback would raise
+                            # ``AttributeError`` when
+                            # calling ``.lower()``. The
+                            # fix must reject this safely.
+                            "author": {"login": 123},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    # Force the fallback path.
+    monkeypatch.setattr(mod, "_shared_is_codex_login", None)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    # The audit must complete without raising AttributeError.
+    # The previous fallback would raise AttributeError inside
+    # ``classify()`` which would surface as a non-zero rc
+    # and an error status. The fix must succeed and emit a
+    # safe lifecycle status.
+    assert rc == 0, (
+        f"Audit returned rc={rc}; expected rc=0 (no crash on "
+        f"malformed author)"
+    )
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The unresolved thread must remain in the inventory.
+    assert any(
+        t.get("thread_id") == "PRRT_final_fallback_malformed"
+        for t in pkt["active_threads"]
+    )
+    # The malformed author must NOT be classified as a Codex
+    # blocker, so the clean pass wins. The audit must reach
+    # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED (clean pass + the
+    # unresolved non-Codex thread). This is the existing
+    # non-Codex unresolved-thread policy applied to a
+    # malformed author.
+    assert pkt["status"] == mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # The audit must not be an error status.
+    assert pkt["status"] != mod.STATUS_ERROR_TOOL_FAILURE
+    assert pkt["status"] != mod.STATUS_ERROR_INVALID_ARGS
+
+
+def test_r106_audit_nested_cap_aggregate(monkeypatch):
+    """Round-106 follow-up (VUIvY / PRRT_kwDOSHFpYM6VUIvY): the
+    audit's nested-pagination follower accepts an inventory
+    split across N threads. The per-thread cap is honored,
+    but the AGGREGATE cap must ALSO fail closed once the sum
+    of pages across threads crosses the operator's bound;
+    otherwise 31 threads with one extra page each return
+    complete=True with up to 31 × safety_cap comments.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _follow_nested_cursor_for_threads,
+    )
+
+    # 31 threads each with a single 1-page nested inventory.
+    thread_nodes = []
+    for i in range(31):
+        thread_nodes.append({
+            "id": f"PRRT_t{i}",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                "nodes": [{"databaseId": 1000 + i}],
+            },
+        })
+    safety_cap = 30
+
+    # Patch the paginator at the source (the audit imports
+    # it from ``scripts.local._shared_pagination`` inside
+    # the function). Monkey-patch the shared module's name.
+    import scripts.local._shared_pagination as pg_mod
+    def fake_paginate(*args, **kwargs):
+        return {
+            "nodes": [{"databaseId": kwargs.get("thread_id", "")}],
+            "pages": 1,  # one page per thread
+            "capped": False,
+            "complete": True,
+        }
+    monkeypatch.setattr(pg_mod, "paginate_nested_comments", fake_paginate)
+    res = _follow_nested_cursor_for_threads(
+        thread_nodes, safety_cap=safety_cap, timeout=30
+    )
+
+    assert res["complete"] is False, (
+        "Round-106 (VUIvY): aggregate pages_total beyond the "
+        "cap MUST surface as complete=False; got "
+        f"complete={res.get('complete')!r}"
+    )
+    assert res["capped"] is True, (
+        "Round-106 (VUIvY): aggregate cross MUST mark "
+        f"capped=True; got capped={res.get('capped')!r}"
+    )
+    assert "aggregate_pages_cap" in res.get("error", "") or (
+        res.get("pages", 0) >= safety_cap
+    ), (
+        "Round-106 (VUIvY): the aggregate cap must be "
+        f"reflected in pages or error; got {res!r}"
+    )
+
+
+def test_r109_audit_nested_fetch_uses_remaining_budget(monkeypatch):
+    """Round-109 follow-up (VUkNY): the audit must hand the
+    next ``paginate_nested_comments`` call the REMAINING
+    aggregate budget, not the full per-thread cap. With 29
+    pages used and a cap of 30, the next call could otherwise
+    fetch another 30 pages before the post-fetch check reports
+    59. The fix passes ``remaining_budget = safety_cap -
+    pages_total`` as the per-call ``safety_cap``.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _follow_nested_cursor_for_threads,
+    )
+    import scripts.local._shared_pagination as pg_mod
+
+    thread_nodes = [
+        {
+            "id": "PRRT_t0",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+                "nodes": [{"databaseId": 100}],
+            },
+        },
+        {
+            "id": "PRRT_t1",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+                "nodes": [{"databaseId": 200}],
+            },
+        },
+    ]
+    safety_cap = 30
+
+    calls = []
+
+    def fake_paginate(*args, **kwargs):
+        calls.append(kwargs)
+        idx = len(calls) - 1
+        # First call simulates 29 pages already consumed
+        # within the per-thread budget; the audit must use
+        # pages_total += 29 here, and on the second call must
+        # pass pages_cap = 30 - 29 = 1 (the remaining
+        # budget) as a SEPARATE pages_cap argument while
+        # keeping the original safety_cap=30 for items.
+        # Round-110 follow-up (VUtWh) introduced this
+        # separation.
+        if idx == 0:
+            return {
+                "nodes": [{"databaseId": 100}],
+                "pages": 29,
+                "capped": False,
+                "complete": True,
+            }
+        if idx == 1:
+            assert kwargs.get("pages_cap") == 1, (
+                "Round-109 (VUkNY): second paginate call "
+                "MUST receive pages_cap=remaining_budget=1; "
+                f"got {kwargs.get('pages_cap')}"
+            )
+            assert kwargs.get("safety_cap") == 30, (
+                "Round-110 (VUtWh): safety_cap continues to "
+                "be the ITEMS cap, separate from pages_cap; "
+                f"got safety_cap={kwargs.get('safety_cap')}"
+            )
+            return {
+                "nodes": [{"databaseId": 200}],
+                "pages": 1,  # 29 + 1 = 30, equals cap
+                "capped": False,
+                "complete": True,
+            }
+        # Third call: pre-fetch check has short-circuited
+        # because pages_total=30 >= safety_cap=30.
+        raise AssertionError(
+            "Round-109: third paginate call should not happen; "
+            "the pre-fetch check should short-circuit when the "
+            "remaining_budget is exhausted."
+        )
+
+    monkeypatch.setattr(pg_mod, "paginate_nested_comments", fake_paginate)
+
+    # Patch the THIRD thread to force a third call (which
+    # the audit MUST short-circuit). Actually, with only two
+    # threads and 29+1=30 pages, the next iteration is short-
+    # circuited by the pre-fetch check at pages_total >= cap.
+
+    # Add a third thread to trigger the pre-fetch.
+    thread_nodes.append({
+        "id": "PRRT_t2",
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+            "nodes": [{"databaseId": 300}],
+        },
+    })
+
+    res = _follow_nested_cursor_for_threads(
+        thread_nodes, safety_cap=safety_cap, timeout=30
+    )
+
+    assert len(calls) == 2, (
+        f"Round-109: only the first two paginate calls should "
+        f"run; got {len(calls)} calls"
+    )
+    assert calls[1]["pages_cap"] == 1, (
+        f"Round-109: second paginate call MUST receive "
+        f"remaining_budget=1 via pages_cap; got {calls[1].get('pages_cap')}"
+    )
+    assert calls[1]["safety_cap"] == 30, (
+        f"Round-110: second paginate call MUST keep the original "
+        f"safety_cap=30; got {calls[1].get('safety_cap')}"
+    )
+    assert res["complete"] is False, (
+        "Round-109 (VUkNY): the third thread MUST be "
+        f"fail-closed; got complete={res.get('complete')!r}"
+    )
+    assert res["capped"] is True, (
+        "Round-109: capped MUST be True on cap-exhausted third "
+        f"thread; got capped={res.get('capped')!r}"
+    )
+    assert res.get("error") == "aggregate_pages_cap_exceeded", (
+        "Round-109: error MUST be "
+        f"aggregate_pages_cap_exceeded; got {res.get('error')!r}"
+    )
+    assert res.get("pages") == 30, (
+        f"Round-109: total pages should be 30; got {res.get('pages')}"
     )

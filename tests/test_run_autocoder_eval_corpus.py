@@ -356,13 +356,21 @@ class TestResolveBaseSha:
     def test_current_main_resolves_to_sha(self):
         ns = _ns()
         repo = Path(".").resolve()
-        # Skip if main branch is not available (e.g., CI checks out feature branch only)
-        try:
-            main_sha = subprocess.check_output(
-                ["git", "-C", str(repo), "rev-parse", "main"], text=True
-            ).strip()
-        except subprocess.CalledProcessError:
-            pytest.skip("main branch not available")
+        # The production resolve_base_sha prefers origin/main, then
+        # falls back to local main. Mirror the SAME precedence so the
+        # test compares production's chosen reference rather than a
+        # local-only ref that production would never use.
+        main_sha = None
+        for ref in ["origin/main", "main"]:
+            try:
+                main_sha = subprocess.check_output(
+                    ["git", "-C", str(repo), "rev-parse", ref], text=True
+                ).strip()
+                break
+            except subprocess.CalledProcessError:
+                continue
+        if main_sha is None:
+            pytest.skip("main branch not available locally and origin/main unreachable")
         ok, msg, sha = ns["resolve_base_sha"]("current_main", repo)
         assert ok, msg
         assert len(sha) == 40

@@ -33,7 +33,14 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+import time
+from typing import Any, Dict, List, Optional
+
+# Round-70 PHASE 3-P1: bring the standalone planner and runner
+# into this controller's namespace without introducing
+# side-effect imports at module load. The seam is a dict the
+# production flow uses by default and tests can swap.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 
 # ---------------------------------------------------------------------------
@@ -858,8 +865,35 @@ def _record_codex_review(args: argparse.Namespace) -> None:
         "repair_attempt": codex.get("repair_attempts", 0),
         "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
         "summary": args.summary or "",
+        # Round-86 follow-up: persist changed_paths on every
+        # repair event so the Round-85
+        # ``_derive_changed_paths_from_state`` helper has a
+        # reliable second-source after ``codex_review.findings``.
+        "changed_paths": list(getattr(args, "changed_path", []) or []),
     }
     state["codex_repair_events"].append(codex_repair_event)
+    if codex_repair_event["changed_paths"]:
+        # Update last_validated_changed_paths whenever the
+        # controller observes a non-empty changed-path list.
+        # This is the third derivation source for
+        # ``record-codex-repair-result --status repaired``
+        # when the documented invocation omits --changed-path.
+        existing = list(state.get("last_validated_changed_paths") or [])
+        for p in codex_repair_event["changed_paths"]:
+            if p not in existing:
+                existing.append(p)
+        state["last_validated_changed_paths"] = existing
+        # Round-89 follow-up: capture the head_sha and the
+        # repair_attempt count alongside the validated path
+        # list so the Round-89 cycle-scoped derivation helper
+        # can verify that the validated list belongs to the
+        # current repair cycle. Without these two fields the
+        # helper would silently re-use historical validated
+        # paths in a later flagless invocation.
+        state["last_validated_head_sha"] = codex.get("head_sha") or args.head_sha or ""
+        state["last_validated_attempt"] = codex_repair_event.get(
+            "repair_attempt", 0
+        )
 
     # Determine next action based on status
     if status == "clean":
@@ -898,12 +932,203 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                 "reason": "codex_repair_limit_exceeded",
             }
         else:
-            next_action = {
-                "action": "repair_task",
-                "task_id": None,
-                "reason": "codex_findings",
-                "source": "codex_review",
-            }
+            # Round-70 PHASE 3-P1: when --status=findings, the
+            # autonomous production path MUST persist a repair
+            # plan produced by the planner seam. The operator
+            # supplies --findings-file as the evidence input.
+            findings_evidence_path = getattr(args, "findings_file", None) or ""
+            plan_persisted = False
+            plan_error = ""
+            # Round-107 follow-up (VUQ6M): initialize
+            # ``skip_plan = False`` so the planner-call branch
+            # below is gated by an explicit skip flag (set True
+            # when ``plan_dir.mkdir`` failed). This prevents
+            # the planner call from running AND overwriting
+            # ``plan_error`` with a downstream
+            # ``planner_failed:plan_dir_unavailable`` note when
+            # the user-visible reason is the mkdir failure.
+            skip_plan = False
+            if not findings_evidence_path or not str(findings_evidence_path).strip():
+                plan_error = "findings_evidence_missing"
+            else:
+                fpath = Path(str(findings_evidence_path))
+                if not fpath.exists():
+                    plan_error = "findings_evidence_not_found"
+                else:
+                    try:
+                        with open(fpath) as _ffh:
+                            findings_data = json.load(_ffh)
+                    except (OSError, json.JSONDecodeError) as exc:
+                        plan_error = f"findings_evidence_malformed:{type(exc).__name__}"
+                        findings_data = None
+                    else:
+                        if (not isinstance(findings_data, list)
+                                or not findings_data):
+                            plan_error = "findings_evidence_empty"
+                        else:
+                            valid = True
+                            for _i, _f in enumerate(findings_data):
+                                if (not isinstance(_f, dict)
+                                        or not (
+                                            _f.get("finding_id")
+                                            or _f.get("id")
+                                        )):
+                                    plan_error = (
+                                        f"findings_invalid_index:{_i}"
+                                    )
+                                    valid = False
+                                    break
+                            if valid:
+                                # Round-86 follow-up: persist the
+                                # parsed findings list on the
+                                # controller state so the
+                                # Round-85 derivation helper
+                                # ``_derive_changed_paths_from_state``
+                                # has findings paths to fall back
+                                # on when ``record-codex-repair-result``
+                                # is invoked without
+                                # ``--changed-path``. Without
+                                # this, the derivation helper
+                                # returns ``[]`` and the
+                                # documented repaired transition
+                                # silently drops to
+                                # ``validation_failed_no_repair:
+                                # no_changed_paths_supplied``.
+                                codex["findings"] = list(findings_data)
+                                seam = _autonomous_repair_seam()
+                                plan_dir = (
+                                    Path(str(args.state)).parent
+                                    / "plans"
+                                )
+                                # Round-106 follow-up (VUIvd /
+                                # PRRT_kwDOSHFpYM6VUIvd): when
+                                # ``<state-parent>/plans`` cannot
+                                # be created — because that path
+                                # already exists as a regular
+                                # file or the directory is
+                                # read-only — this unguarded
+                                # ``mkdir`` raises before the
+                                # planner and persistence
+                                # handlers run. The Round-101
+                                # guard on the
+                                # ``<state.parent>/validations``
+                                # path was applied only to
+                                # ``record-codex-repair-result``;
+                                # the equivalent for plans was
+                                # missing. The fix wraps
+                                # ``plan_dir.mkdir`` in
+                                # try/except and routes the
+                                # failure through the same
+                                # ``repair_planning_failed``
+                                # transition path so the
+                                # controller fails closed with
+                                # ``next_action = request_human``
+                                # instead of crashing.
+                                try:
+                                    plan_dir.mkdir(
+                                        parents=True, exist_ok=True
+                                    )
+                                except OSError as exc:
+                                    # Round-107 follow-up
+                                    # (VUQ6M): the previous
+                                    # shape assigned the mkdir
+                                    # failure to a new local
+                                    # ``planner_error`` and
+                                    # then went on to call
+                                    # ``seam["planner_call"]``
+                                    # which overwrote the
+                                    # failure category with
+                                    # ``planner_failed:plan_dir_unavailable``.
+                                    # The state transition below
+                                    # only inspects ``plan_error``,
+                                    # so the promised
+                                    # ``plan_dir_create_failed``
+                                    # reason was never persisted.
+                                    # The fix: assign
+                                    # ``plan_error`` directly,
+                                    # raise a non-exception flag
+                                    # (``skip_plan = True``),
+                                    # and short-circuit the
+                                    # planner call so the
+                                    # original failure category
+                                    # survives to the transition.
+                                    skip_plan = True
+                                    plan_error = (
+                                        f"plan_dir_create_failed:"
+                                        f"{type(exc).__name__}"
+                                    )
+                                    plan_path = None
+                                else:
+                                    skip_plan = False
+                                    plan_path = (
+                                        plan_dir
+                                        / f"repair-plan-{int(time.time())}.json"
+                                    )
+                                if not skip_plan:
+                                    try:
+                                        plan = seam["planner_call"](
+                                            findings=findings_data,
+                                            changed_paths=[],
+                                            tier="tier_2_cohesive_batch",
+                                            final_candidate=False,
+                                        )
+                                    except Exception as exc:
+                                        plan_error = (
+                                            f"planner_failed:"
+                                            f"{type(exc).__name__}"
+                                        )
+                                    else:
+                                        try:
+                                            with open(plan_path, "w") as _pfh:
+                                                json.dump(plan, _pfh, indent=2)
+                                        except OSError as exc:
+                                            plan_error = (
+                                                f"plan_persist_failed:"
+                                                f"{type(exc).__name__}"
+                                            )
+                                        else:
+                                            plan_persisted = True
+                                            codex[
+                                                "repair_plan_path"
+                                            ] = str(plan_path)
+                                            codex[
+                                                "repair_plan_generated_at"
+                                            ] = _utcnow()
+                                            codex[
+                                                "repair_plan_finding_count"
+                                            ] = plan.get(
+                                                "finding_count", 0
+                                            )
+                                            codex[
+                                                "repair_plan_batch_count"
+                                            ] = plan.get(
+                                                "batch_count", 0
+                                            )
+
+            if plan_error:
+                # Fail closed: do NOT silently advance to
+                # repair_task. Request human instead.
+                codex["repair_plan_error"] = plan_error
+                next_action = {
+                    "action": "request_human",
+                    "task_id": None,
+                    "reason": f"repair_planning_failed:{plan_error}",
+                }
+            elif plan_persisted:
+                next_action = {
+                    "action": "repair_task",
+                    "task_id": None,
+                    "reason": "codex_findings_plan_generated",
+                    "source": "codex_review",
+                }
+            else:
+                # No findings-file supplied but counter-intuitive
+                # flag (we got past the if/else above). Fail closed.
+                next_action = {
+                    "action": "request_human",
+                    "task_id": None,
+                    "reason": "repair_planning_missing_input",
+                }
     elif status == "blocked":
         next_action = {
             "action": "request_human",
@@ -951,6 +1176,141 @@ def _record_codex_review(args: argparse.Namespace) -> None:
     print(f"  next action: {next_action['action']} — {next_action['reason']}")
 
 
+def _derive_changed_paths_from_state(
+    state: dict, codex: dict, *, repair_cycle_id: Optional[Any] = None
+) -> list:
+    """Round-85 follow-up: derive the changed-paths list from
+    the controller state when ``record-codex-repair-result``
+    is invoked without ``--changed-path``.
+
+    The documented invocation
+    ``record-codex-repair-result --status repaired``
+    (docs/autocoder_run_controller_v0.md:598-602) does not
+    supply ``--changed-path``. Without derivation, the
+    handler emits ``validation_failed_no_repair:
+    no_changed_paths_supplied`` and the supported repair
+    workflow silently stops. The derivation order is:
+
+    1. The most-recent codex_review.findings[].path list.
+    2. The last-known changed_paths list from any prior
+       repair event recorded on this run.
+    3. The controller's ``last_validated_changed_paths``.
+
+    Round-89 follow-up: when ``repair_cycle_id`` is supplied,
+    the helper MUST restrict derivation to evidence
+    associated with that cycle boundary. Findings paths are
+    always eligible (they describe the current finding);
+    repair-event ``changed_paths`` are eligible only when
+    their ``repair_attempt`` matches ``repair_cycle_id`` or
+    the helper was called without a cycle binding;
+    ``last_validated_changed_paths`` are eligible only when
+    the latest ``head_sha`` matches the most-recent
+    codex_review head. The discriminator prevents a
+    flagless repaired invocation from silently reusing
+    historical paths from an earlier repair cycle.
+
+    Returns a deduplicated, ordered list of strings. Empty
+    list means every derivation failed and the caller MUST
+    fail closed.
+    """
+    seen: set = set()
+    derived: list = []
+
+    def _add(p: Any) -> None:
+        s = str(p or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            derived.append(s)
+
+    # 1. Findings paths from the current codex review. These
+    # always describe the current finding boundary so they
+    # are always eligible.
+    for finding in (codex.get("findings") or []):
+        if isinstance(finding, dict):
+            _add(finding.get("path") or finding.get("file_path") or "")
+        else:
+            _add(finding)
+    # 2. Paths from any prior repair event on this run. When
+    # ``repair_cycle_id`` is supplied, restrict to the
+    # ``codex_repair_events`` entry whose ``repair_attempt``
+    # matches the cycle binding. If no event matches, do NOT
+    # silently fall back to an unrelated historical event —
+    # that would defeat the cycle-scoped repair evidence
+    # gate. A later flagless ``repaired`` invocation is then
+    # constrained to the cycle it is operating in.
+    events = list(state.get("codex_repair_events") or [])
+    if repair_cycle_id is not None:
+        # Round-89 follow-up: do not silently re-use historical
+        # paths from earlier cycles. If no event matches the
+        # cycle binding, this source contributes nothing to
+        # ``derived`` — the caller's flagless invocation will
+        # then fail closed at the no-evidence boundary if no
+        # other source has paths.
+        matching_events = [
+            ev for ev in events
+            if isinstance(ev, dict)
+            and ev.get("repair_attempt") == repair_cycle_id
+        ]
+        events = matching_events
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for p in (event.get("changed_paths") or []):
+            _add(p)
+    # 3. The controller's last-known validated paths. When
+    # ``repair_cycle_id`` is supplied, only include paths whose
+    # recorded head_sha matches the most-recent
+    # ``codex_review.head_sha`` AND whose ``last_validated_attempt``
+    # matches the cycle binding exactly. This keeps validated-path
+    # evidence scoped to the current cycle.
+    if repair_cycle_id is not None:
+        head_sha = codex.get("head_sha") or ""
+        if not head_sha:
+            return derived
+        validated = state.get("last_validated_changed_paths") or []
+        # Round-89 follow-up: align last_validated_attempt
+        # with the cycle binding. ``last_validated_attempt``
+        # is the ``repair_attempt`` count of the
+        # controller's last validated event; if it does
+        # not match the cycle binding, do not promote the
+        # validated list.
+        stored_attempt = state.get("last_validated_attempt")
+        # Round-90 follow-up: legacy state may have
+        # ``last_validated_changed_paths`` set but no
+        # ``last_validated_head_sha`` / ``last_validated_attempt``
+        # fields. Require BOTH discriminators to be present
+        # and match the current cycle before promoting the
+        # validated list. Without this guard an existing
+        # controller state that was upgraded mid-run could
+        # silently re-use historical validated paths against
+        # a later cycle whose evidence is no longer
+        # available.
+        # Round-91 follow-up: compare the stored attempt
+        # against ``repair_cycle_id`` directly. The previous
+        # comparison ``codex[\"repair_attempts\"] + 1``
+        # mis-aligned with the stored value because the
+        # cycle binding comes from the just-recorded
+        # ``codex_repair_event[\"repair_attempt\"]`` (which
+        # is already the post-increment value), while the
+        # caller may have already mutated
+        # ``codex[\"repair_attempts\"]`` by the time this
+        # guard runs. Use ``repair_cycle_id`` directly so
+        # every place that produces ``last_validated_attempt``
+        # uses the same input.
+        stored_head = state.get("last_validated_head_sha", "")
+        if (not stored_head
+                or stored_head != head_sha
+                or stored_attempt is None
+                or stored_attempt != repair_cycle_id):
+            return derived
+        for p in validated:
+            _add(p)
+    else:
+        for p in (state.get("last_validated_changed_paths") or []):
+            _add(p)
+    return derived
+
+
 def _record_codex_repair_result(args: argparse.Namespace) -> None:
     """Record the result of a Codex repair attempt.
 
@@ -966,6 +1326,17 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
 
     codex = state.get("codex_review", {})
 
+    # Compute the cleaned changed_paths list once so the
+    # event, the derivation fallback, and the validated-path
+    # state all observe the same input.
+    cleaned_paths_for_event = [
+        str(p or "").strip()
+        for p in (getattr(args, "changed_path", []) or [])
+    ]
+    cleaned_paths_for_event = [
+        p for p in cleaned_paths_for_event if p
+    ]
+
     # Append codex_repair_event
     codex_repair_event = {
         "timestamp": _utcnow(),
@@ -978,21 +1349,264 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
         "repair_attempt": codex.get("repair_attempts", 0) + 1,
         "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
         "summary": args.summary or "",
+        # Round-87 follow-up: persist the supplied
+        # --changed-path list on every repair-result event so
+        # the Round-85 derivation helper has a second-source
+        # after ``codex_review.findings`` and the
+        # ``record-codex-review`` events. Without this a
+        # caller that supplies impact evidence ONLY on
+        # ``record-codex-repair-result --changed-path`` still
+        # leaves subsequent derivations with no evidence.
+        "changed_paths": cleaned_paths_for_event,
     }
     state["codex_repair_events"].append(codex_repair_event)
+    # Round-103 follow-up: defer the codex_repair_event status
+    # until after validation so the append-only history reflects
+    # the actual validation outcome. The previous shape appended
+    # ``status=repair_status`` (which is the CLI-supplied
+    # ``--status``) before the validator ran and never corrected
+    # the event when validation failed (e.g. the skip_runner
+    # path or a non-zero return code). The status is updated
+    # in place after validation below so the append-only
+    # history is consistent with ``last_validation_outcome``
+    # and ``next_action``.
+    if cleaned_paths_for_event:
+        # Round-89 follow-up: update last_validated_changed_paths
+        # whenever the controller observes a non-empty
+        # changed-path list on a repair-result event. The
+        # Round-86 fix only updated this on
+        # ``record-codex-review`` events; the validator
+        # handler in this same function must also persist
+        # the impact evidence so the documented flagless
+        # ``repaired`` invocation can derive from this state.
+        existing = list(state.get("last_validated_changed_paths") or [])
+        for p in cleaned_paths_for_event:
+            if p not in existing:
+                existing.append(p)
+        state["last_validated_changed_paths"] = existing
+        # Round-89 follow-up: capture the head_sha and the
+        # repair_attempt count so the cycle-scoped derivation
+        # helper can verify the validated list belongs to the
+        # current repair cycle. Without these two fields the
+        # helper would silently re-use historical validated
+        # paths in a later flagless invocation.
+        state["last_validated_head_sha"] = codex.get("head_sha") or ""
+        state["last_validated_attempt"] = codex_repair_event.get(
+            "repair_attempt", 0
+        )
 
     codex["repair_attempts"] = codex.get("repair_attempts", 0) + 1
 
     if repair_status == "repaired":
-        # After repair, reset findings state so operator can run a new Codex review
-        codex["status"] = "not_started"
-        codex["findings_count"] = 0
-        codex["highest_severity"] = "none"
-        next_action = {
-            "action": "request_human",
-            "task_id": None,
-            "reason": "await_codex_review_after_repair",
-        }
+        # Round-70 PHASE 3-P1: when --status=repaired the
+        # autonomous production path MUST invoke the
+        # impact-selected runner seam. Failed validation
+        # preserves findings state (no advance to
+        # ``await_codex_review_after_repair``).
+        validation_outcome = "pending"
+        validation_log_path = ""
+        validation_return_code = None
+        validation_error = ""
+        # Round-87 follow-up: reuse the cleaned paths list
+        # computed for the event so the validator observes the
+        # same input as the persisted event. The previous
+        # Round-85 code rebuilt the list here, which would
+        # have silently diverged from the event's cleaned_paths
+        # if the args env ever changed between computation
+        # points.
+        cleaned_paths = list(cleaned_paths_for_event)
+        # Round-85 follow-up: when --changed-path is omitted,
+        # derive impact evidence from the controller state
+        # before failing closed. The previous behavior emitted
+        # ``no_changed_paths_supplied`` for the documented
+        # ``record-codex-repair-result --status repaired``
+        # invocation (docs/autocoder_run_controller_v0.md:598-602),
+        # silently stopping the supported repair workflow. The
+        # derivation order is:
+        #   1. The most-recent codex_review.findings[].path list.
+        #   2. The last-known changed_paths list from any prior
+        #      repair event recorded on this run.
+        #   3. The controller's last_validated_changed_paths.
+        # If every derivation is empty the documented command
+        # still fails closed, but only AFTER the controller has
+        # exhausted every reasonable impact-evidence source.
+        if not cleaned_paths:
+            # Round-89 follow-up: bind the derivation helper to
+            # the current repair cycle so a flagless repaired
+            # invocation does not silently reuse historical
+            # ``changed_paths`` recorded on an earlier cycle.
+            # The repair event (written earlier in this same
+            # function) already carries
+            # ``repair_attempt = codex[\"repair_attempts\"] + 1``
+            # so the cycle binding MUST come from the event,
+            # not from re-incrementing the controller counter.
+            # Round-90 follow-up: ``codex[\"repair_attempts\"]``
+            # is incremented LATER in this function; passing
+            # ``codex[\"repair_attempts\"] + 1`` here would over-
+            # count by one and align the helper to a future
+            # cycle that the validated/recorded sources cannot
+            # reach. Use ``codex_repair_event[\"repair_attempt\"]``
+            # which is the just-recorded value.
+            derived = _derive_changed_paths_from_state(
+                state, codex,
+                repair_cycle_id=codex_repair_event.get("repair_attempt"),
+            )
+            if derived:
+                cleaned_paths = derived
+                codex["changed_paths_derived"] = True
+                codex["changed_paths_derived_source"] = "state"
+            else:
+                validation_error = "no_changed_paths_supplied"
+        else:
+            codex["changed_paths_derived"] = False
+            codex["changed_paths_derived_source"] = "cli"
+        if cleaned_paths:
+            log_dir = (
+                Path(str(args.state)).parent / "validations"
+            )
+            # Round-101 follow-up (VQb5p): wrap the
+            # ``log_dir.mkdir`` call in try/except so a
+            # directory-creation failure surfaces as
+            # ``validation_log_create_error`` rather than as
+            # an uncaught OSError that crashes the command
+            # before the controller state is saved. The
+            # previous shape raised OSError directly, leaving
+            # ``state`` unsaved and the operator without an
+            # actionable failure record.
+            #
+            # Round-102 follow-up (VRxoP): clearing
+            # ``cleaned_paths`` to empty was insufficient —
+            # the unconditional ``runner_call`` below would
+            # still execute with an empty path list and
+            # undefined ``validation_log_path``, producing a
+            # spurious ``validation_outcome=passed``. The fix
+            # flips a ``skip_runner`` flag so the runner
+            # block is fully bypassed on a directory-creation
+            # failure, and ``validation_log_path`` is left
+            # empty (no artifact exists).
+            skip_runner = False
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                validation_error = f"validation_log_dir_error: {type(exc).__name__}: {exc}"
+                skip_runner = True
+                validation_log_path = ""
+            else:
+                validation_log_path = str(
+                    log_dir / f"validation-{int(time.time())}.json"
+                )
+            if not skip_runner:
+                seam = _autonomous_repair_seam()
+                try:
+                    result = seam["runner_call"](
+                        changed_paths=cleaned_paths,
+                        tier="tier_2_cohesive_batch",
+                        final_candidate=False,
+                        log_path=validation_log_path,
+                    )
+                except Exception as exc:
+                    validation_error = (
+                        f"runner_failed:{type(exc).__name__}"
+                    )
+                    # Round-104 follow-up (PRRT_kwDOSHFpYM6VSVDA):
+                    # when ``runner_call`` raises (e.g. pytest
+                    # cannot be launched), the previous handler
+                    # set only ``validation_error`` and left
+                    # ``validation_outcome`` as ``"pending"``.
+                    # The Round-103 follow-up guard
+                    # (``if validation_outcome in ("passed",
+                    # "failed")``) then SKIPPED the status
+                    # correction and persisted a
+                    # ``codex_repair_event`` with
+                    # ``status="repaired"`` even though
+                    # ``next_action`` reports
+                    # ``validation_failed_no_repair:runner_failed``.
+                    # The fix sets the exception outcome to
+                    # ``"failed"`` and a non-zero return code so
+                    # the append-only history remains
+                    # consistent with ``last_validation_outcome``
+                    # and ``next_action``.
+                    validation_outcome = "failed"
+                    validation_return_code = -1
+                else:
+                    # Round-71 PHASE 3-P1-B: the production facade
+                    # ``run_selected_tests`` returns canonical keys
+                    # ``returncode`` / ``duration_seconds`` / ``selected``.
+                    # Older alias keys ``return_code`` / ``duration`` /
+                    # ``selected_tests`` are read only as backward-compat
+                    # fallbacks; the canonical value always wins.
+                    def _canonical_int(keys, default=-1):
+                        for k in keys:
+                            v = result.get(k)
+                            if v is not None:
+                                try:
+                                    return int(v)
+                                except (TypeError, ValueError):
+                                    pass
+                        return default
+                    validation_return_code = _canonical_int(
+                        ("returncode", "return_code"), -1
+                    )
+                    if validation_return_code == 0:
+                        validation_outcome = "passed"
+                    else:
+                        validation_outcome = "failed"
+            else:
+                # Skip path: the runner was not invoked. Mark
+                # the validation as failed so the controller
+                # fails closed rather than claiming a passing
+                # validation without an evidence artifact.
+                validation_outcome = "failed"
+                validation_return_code = -1
+
+        codex["last_validation_outcome"] = validation_outcome
+        codex["last_validation_log_path"] = validation_log_path
+        if validation_return_code is not None:
+            codex["last_validation_return_code"] = (
+                validation_return_code
+            )
+        if validation_error:
+            codex["last_validation_error"] = validation_error
+
+        # Round-103 follow-up: correct the codex_repair_event
+        # status in place to reflect the actual validation
+        # outcome. The event was appended above with
+        # ``status=repair_status`` (the CLI-supplied
+        # ``--status``); after validation we override it to
+        # ``failed`` so the append-only history is consistent
+        # with ``last_validation_outcome`` and ``next_action``.
+        # Only override when validation actually produced a
+        # terminal outcome (passed or failed); when the
+        # validator was not invoked (no changed-paths
+        # supplied) ``validation_outcome`` is still
+        # ``"pending"`` and we leave the event's CLI-supplied
+        # status alone.
+        if validation_outcome in ("passed", "failed"):
+            if validation_outcome != "passed":
+                codex_repair_event["status"] = "failed"
+
+        if validation_outcome == "passed":
+            # Validation succeeded: clear findings state and
+            # advance to awaiting another Codex review.
+            codex["status"] = "not_started"
+            codex["findings_count"] = 0
+            codex["highest_severity"] = "none"
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": "await_codex_review_after_repair",
+            }
+        else:
+            # Validation failed (or no paths supplied):
+            # preserve findings state and do NOT advance.
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": (
+                    f"validation_failed_no_repair:"
+                    f"{validation_error or 'rc' + str(validation_return_code)}"
+                ),
+            }
     elif repair_status == "failed":
         if codex["repair_attempts"] >= codex.get("max_repair_attempts", DEFAULT_MAX_CODEX_REPAIR):
             codex["status"] = "repair_limit_exceeded"
@@ -1040,6 +1654,373 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
     print(f"Recorded Codex repair result: {repair_status}")
     print(f"  repair_attempts: {codex['repair_attempts']}/{codex.get('max_repair_attempts', DEFAULT_MAX_CODEX_REPAIR)}")
     print(f"  next action: {next_action['action']} — {next_action['reason']}")
+
+
+def _autonomous_repair_seam():
+    """Return the planner/runner seam for autonomous repair.
+
+    Round-70 PHASE 3-P1: the controller's autonomous
+    Codex-repair path now consults this seam rather than
+    only mutating state. Tests inject a fake dict with the
+    keys ``planner_call`` and ``runner_call`` to capture
+    what would have been invoked without doing the work.
+    """
+    try:
+        from scripts.local import aed_repair_planner as _planner
+        from scripts.local import aed_test_runner as _runner
+        return {
+            "planner_call": lambda **kw: _planner.build_repair_plan(**kw),
+            "runner_call": lambda **kw: _runner.run_impact_selected_tests(**kw),
+            "planner_module": _planner,
+            "runner_module": _runner,
+        }
+    except Exception:
+        # If the planner/runner modules fail to import, return a
+        # fail-closed seam that raises if invoked (the controller
+        # must explicitly fail closed when the wiring is broken).
+        def _raise(_exc):
+            def _f(**_kw):
+                raise _exc
+            return _f
+        return {
+            "planner_call": _raise(ImportError("aed_repair_planner unavailable")),
+            "runner_call": _raise(ImportError("aed_test_runner unavailable")),
+            "planner_module": None,
+            "runner_module": None,
+        }
+
+
+def _record_autonomous_repair_plan(args: argparse.Namespace) -> None:
+    """Record the plan produced by the autonomous planner.
+
+    Round-70 PHASE 3-P1: this records the plan path and key
+    plan metadata in controller state so the operator and
+    downstream tooling can verify cohesive batching and
+    impact-selected tests were actually produced. Sets
+    next_action=repair_task on success. Fails closed (no
+    state mutation) when the planner input is missing or
+    malformed.
+    """
+    state = _load_state(args.state)
+
+    if not args.findings_file or not str(args.findings_file).strip():
+        print("ERROR: --findings-file is required to record a repair plan",
+              file=sys.stderr)
+        sys.exit(2)
+    findings_path = Path(str(args.findings_file))
+    if not findings_path.exists():
+        print(f"ERROR: findings file not found: {findings_path}",
+              file=sys.stderr)
+        sys.exit(2)
+    try:
+        with open(findings_path) as f:
+            findings = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: findings file could not be parsed: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(findings, list) or not findings:
+        print("ERROR: findings file must contain a non-empty list",
+              file=sys.stderr)
+        sys.exit(2)
+    # Validate each finding is a dict with a finding_id
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            print(f"ERROR: findings[{i}] must be a dict", file=sys.stderr)
+            sys.exit(2)
+        if not f.get("finding_id") and not f.get("id"):
+            print(f"ERROR: findings[{i}] missing finding_id", file=sys.stderr)
+            sys.exit(2)
+
+    output_plan = Path(str(args.output_plan or ""))
+
+    # Invoke planner seam (or test seam).
+    seam = _autonomous_repair_seam()
+    try:
+        plan = seam["planner_call"](
+            findings=findings,
+            changed_paths=[],
+            tier="tier_2_cohesive_batch",
+            final_candidate=False,
+        )
+    except Exception as e:
+        print(f"ERROR: planner failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Persist the plan if output_plan is given. The planner API
+    # performs no GitHub mutation and writes only when given an
+    # explicit output path. We then record the path in state.
+    if output_plan:
+        output_plan.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(output_plan, "w") as fh:
+                json.dump(plan, fh, indent=2)
+        except OSError as e:
+            print(f"ERROR: could not persist plan to {output_plan}: {e}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    codex = state.get("codex_review", {})
+    codex["repair_plan_path"] = str(output_plan) if output_plan else ""
+    codex["repair_plan_generated_at"] = _utcnow()
+    codex["repair_plan_finding_count"] = plan.get("finding_count", 0)
+    codex["repair_plan_batch_count"] = plan.get("batch_count", 0)
+    state["codex_review"] = codex
+
+    next_action = {
+        "action": "repair_task",
+        "task_id": None,
+        "reason": "codex_findings_plan_generated",
+        "source": "codex_review",
+    }
+    state["next_action"] = next_action
+    state["updated_at"] = _utcnow()
+    state["human_action_required"] = False
+
+    _save_state(state, args.state)
+
+    print(
+        f"Recorded autonomous repair plan: "
+        f"findings={plan.get('finding_count', 0)} "
+        f"batches={plan.get('batch_count', 0)} "
+        f"plan={output_plan or '(in-memory)'}"
+    )
+
+
+def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
+    """Record the impact-selected validation run after repair.
+
+    Round-70 PHASE 3-P1: this records the test-runner outcome
+    so the operator can verify selected tests actually ran
+    before the repaired transition was claimed. Fails closed
+    (does NOT advance to await_codex_review_after_repair)
+    when validation fails or evidence is malformed.
+    """
+    state = _load_state(args.state)
+
+    # Round-96 follow-up (VPRYe): the log-write failure flag is
+    # initialized to False here so subsequent
+    # ``if log_write_failure:`` checks at the codex state write
+    # below have a stable binding. ``log_path`` is also
+    # normalized so a missing caller-supplied value forces a
+    # controller-derived default path under
+    # ``<state.parent>/validations/``.
+    log_write_failure = False
+    log_write_failure_error = ""
+    log_write_failure_path = ""
+
+    # argparse action='append' populates args.changed_path (singular)
+    raw_paths = list(getattr(args, "changed_path", []) or [])
+    cleaned_paths = [p for p in raw_paths if str(p or "").strip()]
+    if not cleaned_paths:
+        print("ERROR: at least one non-empty --changed-path is required "
+              "to record repair validation", file=sys.stderr)
+        sys.exit(2)
+
+    log_path: Optional[Path] = (
+        Path(str(args.output_log or "")) if str(args.output_log or "").strip() else None
+    )
+    # Round-96 follow-up (VPRYe): when the caller does not supply
+    # an ``--output-log``, the previous handler silently skipped
+    # the log write and recorded an empty
+    # ``last_validation_log_path`` while still advancing to
+    # ``await_codex_review_after_repair``. Derive a default path
+    # under ``<state.parent>/validations/`` so the on-disk
+    # evidence artifact exists whenever a validation run
+    # completes successfully. A separate failure flag handles
+    # write-time errors below.
+    if log_path is None:
+        log_path = (
+            Path(str(args.state)).parent
+            / "validations"
+            / f"validation-{int(time.time())}.json"
+        )
+    # Invoke the runner seam.
+    seam = _autonomous_repair_seam()
+    try:
+        # argparse action='append' populates args.changed_path (singular)
+        changed_paths = cleaned_paths
+        result = seam["runner_call"](
+            changed_paths=changed_paths,
+            tier=str(args.tier or "tier_2_cohesive_batch"),
+            final_candidate=bool(args.final_candidate),
+            log_path=str(log_path) if log_path else None,
+        )
+    except Exception as e:
+        # On runner failure, do NOT advance to repaired state.
+        # Record the failure but leave the finding state intact
+        # so the operator can re-run validation.
+        codex = state.get("codex_review", {})
+        codex["last_validation_status"] = "runner_error"
+        codex["last_validation_error"] = (
+            f"{type(e).__name__}: {e}"
+        )
+        codex["last_validation_at"] = _utcnow()
+        state["codex_review"] = codex
+        state["updated_at"] = _utcnow()
+        # Mark human action required to inspect.
+        state["human_action_required"] = True
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_runner_error",
+        }
+        _save_state(state, args.state)
+        print(f"ERROR: runner failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Persist the runner log. Round-96 follow-up (VPRYe):
+    # a missing ``log_path`` used to silently skip the log-write
+    # step while the rest of the function declared a
+    # successful validation. The controller would then
+    # record an empty ``last_validation_log_path`` and
+    # advance to ``await_codex_review_after_repair`` even
+    # though no evidence artifact existed. The default
+    # path is supplied above so ``log_path`` is always
+    # non-None at this point. Treat a write failure as
+    # ``log_write_failure = True`` so the codex transition
+    # below surfaces the failure instead of silently
+    # treating the run as ``returncode == 0`` against a
+    # nonexistent artifact.
+    log_path_str = ""
+    if log_path and isinstance(log_path, Path) and str(log_path):
+        # Round-97 follow-up (VPhYp): put the ``mkdir`` inside
+        # the same try block as the write so a parent-directory
+        # creation failure surfaces as ``log_write_error``
+        # rather than as a raw OSError escaping the function.
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "w") as fh:
+                json.dump(result, fh, indent=2)
+        except OSError as e:
+            # Round-96 follow-up: capture the failure but
+            # do not call ``sys.exit(2)`` because the caller
+            # is non-interactive. Mark the state shape so the
+            # transition below picks up the failure.
+            print(f"ERROR: could not persist log to {log_path}: {e}",
+                  file=sys.stderr)
+            log_write_failure = True
+            log_write_failure_error = (
+                f"{type(e).__name__}: {e}"
+            )
+            log_write_failure_path = str(log_path)
+            log_path = None  # do not record a missing artifact
+        else:
+            log_path_str = str(log_path)
+    # If log write succeeded, this string is non-empty.
+
+    # Apply transition:
+    # alias keys.
+    rc = int(result.get("returncode", result.get("return_code", -1)))
+    selected = list(result.get("selected", result.get("selected_tests", [])))
+    duration = result.get("duration_seconds", result.get("duration", 0.0))
+
+    codex = state.get("codex_review", {})
+    codex["last_validation_at"] = _utcnow()
+    codex["last_validation_status"] = "passed" if rc == 0 else "failed"
+    codex["last_validation_return_code"] = rc
+    codex["last_validation_returncode"] = rc
+    codex["last_validation_duration_seconds"] = duration
+    codex["last_validation_selected"] = selected
+    codex["last_validation_selected_tests"] = selected
+    codex["last_validation_command"] = result.get("command", [])
+    codex["last_validation_selection_reason"] = result.get(
+        "selection_reason", ""
+    )
+    codex["last_validation_tier"] = result.get("tier", "")
+    codex["last_validation_requires_full_validation"] = result.get(
+        "requires_full_validation", False
+    )
+    codex["last_validation_log_path"] = str(log_path) if log_path else ""
+
+    # Apply transition:
+    #  - rc == 0: validated successfully, allow transition to
+    #    await_codex_review_after_repair (mirrors the contract).
+    #  - rc != 0: validation failed, do NOT reset findings state
+    #    and do NOT claim repair succeeded.
+    #  - log_write_failure: the log write failed and the
+    #    evidence artifact does not exist; mark the repair
+    #    event ``failed`` even when ``rc == 0`` so the
+    #    append-only history does not falsely claim a
+    #    successful repair. Round-98 follow-up (VPyKS).
+    repair_event_status = "failed"
+    if rc == 0 and not log_write_failure:
+        repair_event_status = "repaired"
+    codex_repair_event = {
+        "timestamp": _utcnow(),
+        "source": "autonomous_validation",
+        "head_sha": codex.get("head_sha") or "",
+        "artifact_path": codex.get("artifact_path") or "",
+        "status": repair_event_status,
+        "findings_count": codex.get("findings_count", 0),
+        "highest_severity": codex.get("highest_severity", "none"),
+        "repair_attempt": codex.get("repair_attempts", 0),
+        "blocker_fingerprint": codex.get("last_blocker_fingerprint") or "",
+        "summary": (
+            f"validation rc={rc} duration={duration:.1f}s"
+            + (" log_write_error" if log_write_failure else "")
+        ),
+    }
+    state["codex_repair_events"] = state.get("codex_repair_events", [])
+    state["codex_repair_events"].append(codex_repair_event)
+
+    # Round-96 follow-up (VPRYe): when the log write failed but
+    # ``rc == 0``, the controller MUST NOT advance to
+    # ``await_codex_review_after_repair``. Surface the log-write
+    # failure as a separate failure source so the operator
+    # notices the missing artifact.
+    if log_write_failure:
+        # Round-97 follow-up (VPhYm): persist the
+        # ``next_action`` dict on the controller state before
+        # saving it. The previous shape created a local
+        # ``next_action`` and called ``_save_state`` without
+        # assigning ``state[\"next_action\"]``, so the
+        # failure mode did not persist to disk and was
+        # overwritten by the previous ``next_action``.
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_log_write_error",
+        }
+        codex["last_validation_status"] = "log_write_error"
+        codex["last_validation_error"] = log_write_failure_error
+        codex["last_validation_at"] = _utcnow()
+        state["human_action_required"] = True
+        state["codex_review"] = codex
+        state["updated_at"] = _utcnow()
+        state["next_action"] = next_action
+        _save_state(state, args.state)
+        sys.exit(2)
+    if rc == 0:
+        codex["status"] = "not_started"
+        codex["findings_count"] = 0
+        codex["highest_severity"] = "none"
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "await_codex_review_after_repair",
+        }
+        state["human_action_required"] = True
+    else:
+        # Validation failed; do NOT reset finding state. Remain repairable.
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_failed_does_not_repair",
+        }
+        state["human_action_required"] = True
+    state["codex_review"] = codex
+    state["next_action"] = next_action
+    state["updated_at"] = _utcnow()
+
+    _save_state(state, args.state)
+    print(
+        f"Recorded autonomous validation: rc={rc} duration={duration:.1f}s "
+        f"selected={len(selected)}"
+    )
+
 
 
 def _finalize_run(args: argparse.Namespace) -> None:
@@ -1136,6 +2117,21 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Highest severity among findings")
     p_codex_rev.add_argument("--summary", help="Summary text of findings or clean result")
     p_codex_rev.add_argument("--blocker-fingerprint", help="Fingerprint/hash identifying the blocker")
+    p_codex_rev.add_argument("--findings-file",
+                              help="Path to JSON findings artifact (Round-70 PHASE 3-P1: "
+                                   "the controller invokes the planner seam on this). "
+                                   "Required when --status=findings to enable the "
+                                   "autonomous repair plan path; otherwise the "
+                                   "controller fails closed to a human-actionable state.")
+    # Round-86 follow-up: --changed-path on record-codex-review
+    # persists the impact evidence on every repair event so the
+    # Round-85 derivation helper has a second-source after
+    # ``codex_review.findings``. Optional for backward
+    # compatibility; the documented Round-70 PHASE 3-P1 caller
+    # does not supply it but may in future round-71 cycles.
+    p_codex_rev.add_argument("--changed-path", action="append",
+                              help="Changed path(s) for impact-selected "
+                                   "validation. Repeatable. Optional.")
 
     # record-codex-repair-result
     p_codex_rep = sub.add_parser("record-codex-repair-result",
@@ -1146,6 +2142,49 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Repair outcome")
     p_codex_rep.add_argument("--summary", help="Brief description of what was done")
     p_codex_rep.add_argument("--blocker-fingerprint", help="Fingerprint matching the original blocker")
+    # Round-85 follow-up: --changed-path remains optional so the
+    # documented invocation
+    #   ``record-codex-repair-result --status repaired``
+    # (docs/autocoder_run_controller_v0.md:598-602) continues to
+    # work. The handler derives the changed paths from the
+    # controller state when --changed-path is omitted, falling
+    # back to ``codex_review.findings`` paths or the last-known
+    # changed-paths list. Round-69 Codex review (this finding's
+    # prompt) chose this option over argparse-required so the
+    # documented command never silently drops to
+    # ``validation_failed_no_repair:no_changed_paths_supplied``.
+    p_codex_rep.add_argument("--changed-path", action="append",
+                              help="Changed path(s) for impact-selected validation "
+                                   "(Round-70 PHASE 3-P1). Repeatable. Optional "
+                                   "after Round-85: the controller derives "
+                                   "impact evidence from state when omitted.")
+
+    # record-autonomous-repair-plan (Round-70 P1 wiring)
+    p_arp = sub.add_parser(
+        "record-autonomous-repair-plan",
+        help="Record a cohesive repair plan generated from findings evidence",
+    )
+    p_arp.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_arp.add_argument("--findings-file", required=True,
+                       help="JSON file containing the findings list")
+    p_arp.add_argument("--output-plan",
+                       help="Destination JSON file for the plan")
+
+    # record-autonomous-repair-validation (Round-70 P1 wiring)
+    p_arv = sub.add_parser(
+        "record-autonomous-repair-validation",
+        help="Record the impact-selected validation run after repair",
+    )
+    p_arv.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_arv.add_argument("--changed-path", action="append", required=True,
+                       help="Changed path (repeatable)")
+    p_arv.add_argument("--tier",
+                       choices=["tier_1_inner_repair", "tier_2_cohesive_batch",
+                                "tier_3_final_candidate"],
+                       default="tier_2_cohesive_batch")
+    p_arv.add_argument("--final-candidate", action="store_true")
+    p_arv.add_argument("--output-log",
+                       help="Destination JSON file for the validation log")
 
     # finalize-run
     p_fin = sub.add_parser("finalize-run", help="Mark run as complete")
@@ -1345,6 +2384,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-pr-result": _record_pr_result,
         "record-codex-review": _record_codex_review,
         "record-codex-repair-result": _record_codex_repair_result,
+        "record-autonomous-repair-plan": _record_autonomous_repair_plan,
+        "record-autonomous-repair-validation": _record_autonomous_repair_validation,
         "finalize-run": _finalize_run,
         "record-persistent-guard-snapshot": _record_persistent_guard_snapshot,
         "record-persistent-guard-compare": _record_persistent_guard_compare,

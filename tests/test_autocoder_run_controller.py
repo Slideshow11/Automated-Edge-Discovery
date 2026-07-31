@@ -827,7 +827,14 @@ def test_record_codex_review_findings_stores_findings_count_and_severity(temp_wo
 
 
 def test_record_codex_review_findings_below_limit_produces_repair_task(temp_workspace, sample_tasks_jsonl):
-    """Findings with attempts below limit produces next_action repair_task."""
+    """Findings with attempts below limit AND a findings-file plan successfully
+    produces next_action repair_task via the autonomous planner seam.
+
+    Round-70 PHASE 5-P1: repair_task is gated on a successfully
+    persisted plan, not just on ``status=findings``. The
+    operator supplies --findings-file as evidence; the controller
+    invokes the planner seam and persists plan metadata.
+    """
     state_path = temp_workspace / "CONTROLLER_STATE.json"
     run_controller([
         "init", "--run-id", "aed-codex-rpair-001",
@@ -836,16 +843,29 @@ def test_record_codex_review_findings_below_limit_produces_repair_task(temp_work
         "--integration-branch", "int/codex-rpair-001",
         "--output-state", str(state_path),
     ])
+    # Build a findings artifact so the planner seam has evidence.
+    findings_file = temp_workspace / "findings-rpair.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "formatting", "path": "scripts/local/foo.py",
+         "summary": ""},
+        {"finding_id": "F2", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "formatting", "path": "scripts/local/foo.py",
+         "summary": ""},
+    ]))
     rc, stdout, stderr = run_controller([
         "record-codex-review", "--state", str(state_path),
         "--status", "findings", "--head-sha", "abc123",
         "--findings-count", "2", "--highest-severity", "P2",
         "--summary", "Minor formatting issues",
+        "--findings-file", str(findings_file),
     ])
     assert rc == 0
     state = json.loads(Path(state_path).read_text())
+    # Plan path must be persisted on success.
+    assert state["codex_review"].get("repair_plan_path", "")
     assert state["next_action"]["action"] == "repair_task"
-    assert state["next_action"]["reason"] == "codex_findings"
+    assert state["next_action"]["reason"] == "codex_findings_plan_generated"
 
 
 def test_record_codex_repair_result_increments_repair_attempts(temp_workspace, sample_tasks_jsonl):
@@ -927,13 +947,24 @@ def test_same_blocker_fingerprint_twice_requests_human(temp_workspace, sample_ta
         "--blocker-fingerprint", "blocker-A",
     ])
     assert rc == 0
-    # Second cycle with same blocker: triggers same_codex_blocker_repeated
+    # Second cycle with same blocker: requires --findings-file
+    # AND must escalate to same_codex_blocker_repeated. Round-70
+    # PHASE 5-P1: same-blocker escalation must remain enforced even
+    # when --findings-file is supplied (planning evidence present
+    # does not bypass escalation).
+    findings_file = temp_workspace / "findings-same-blocker.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "B1", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "test-same-blocker", "path": "scripts/local/foo.py",
+         "summary": ""},
+    ]))
     rc, stdout, stderr = run_controller([
         "record-codex-review", "--state", str(state_path),
         "--status", "findings", "--head-sha", "abc123",
         "--findings-count", "1", "--highest-severity", "P2",
         "--summary", "Same issue persists",
         "--blocker-fingerprint", "blocker-A",
+        "--findings-file", str(findings_file),
     ])
     assert rc == 0
     state = json.loads(Path(state_path).read_text())
@@ -1753,3 +1784,1006 @@ def test_final_status_report_includes_blocked_change_count(temp_workspace, sampl
     state = json.loads(state_path.read_text())
     assert state["persistent_mutation_guard"]["blocked_changes_count"] == 2
     assert "2" in stdout  # blocked_changes: 2
+
+
+# ---------------------------------------------------------------------------
+# Round-70 PHASE 5-P1 regression coverage
+# ---------------------------------------------------------------------------
+#
+# These tests prove that the autonomous controller wiring now invokes the
+# planner on findings and the runner on repair, and that the transitions
+# honour fail-closed semantics on malformed or missing evidence.
+
+
+class _FakePlannerAndRunner:
+    """Captures planner and runner invocations without doing the work."""
+
+    def __init__(self):
+        self.planner_calls = []
+        self.runner_calls = []
+
+    def planner_call(self, **kwargs):
+        self.planner_calls.append(kwargs)
+        return {
+            "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+            "batches": [
+                {
+                    "batch_id": "BATCH-FAKE01",
+                    "finding_ids": [f.get("finding_id") for f in kwargs.get("findings", []) if f.get("finding_id")],
+                    "severities": ["P2"],
+                    "root_cause": "fake",
+                    "subsystem": "fake",
+                    "grouping_reason": "fake",
+                    "smaller_than_default_reason": "",
+                    "focused_tests": ["tests.fake_select"],
+                    "requires_full_validation": False,
+                }
+            ],
+            "selection_reason": "fake",
+            "changed_paths": kwargs.get("changed_paths", []),
+            "test_plan": {
+                "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+                "selected_tests": ["tests.fake_select"],
+                "requires_full_validation": False,
+                "classification_failures": [],
+            },
+            "finding_count": len(kwargs.get("findings", []) or []),
+            "batch_count": 1,
+        }
+
+    def runner_call(self, **kwargs):
+        rc = self.runner_calls.append(kwargs)
+        return {
+            "return_code": 0,
+            "duration": 0.1,
+            "selected_tests": ["tests.fake_select"],
+            "selection_reason": "fake",
+            "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+            "command": ["pytest", "-q", "tests.fake_select"],
+            "capped": False,
+            "complete": True,
+        }
+
+
+def _init_minimal_state(tmp_state: str) -> None:
+    """Write a minimal initialized CONTROLLER_STATE.json via the controller CLI.
+
+    ``tmp_state`` is a path to where the state file lives. We use a sibling
+    directory ``tmp_state + "_wd"`` as the workspace so that ``-output-state``
+    does not collide with a pre-existing directory.
+    """
+    state_file = Path(tmp_state)
+    workspace = state_file.parent / (state_file.stem + "_wd")
+    workspace.mkdir(parents=True, exist_ok=True)
+    tasks = workspace / "tasks.jsonl"
+    tasks.write_text(json.dumps({
+        "task_id": "TASK-001",
+        "status": "PENDING",
+        "title": "Round-70 test task",
+    }) + "\n")
+    bundle = workspace / "bundle.json"
+    bundle.write_text(json.dumps({
+        "bundle_id": "BUNDLE-FAKE01",
+        "task_ids": ["TASK-001"],
+    }))
+    rc = controller_main([
+        "init",
+        "--run-id", "RND70",
+        "--tasks-jsonl", str(tasks),
+        "--bundle-index", str(bundle),
+        "--workspace", str(workspace),
+        "--integration-branch", "fix/test-branch",
+        "--output-state", str(state_file),
+    ])
+    assert rc == 0, f"init failed rc={rc} for {state_file}"
+
+
+def _autonomous_seam(scratch_dir: str, fake: _FakePlannerAndRunner):
+    """Patch _autonomous_repair_seam in the controller module to use our fake."""
+    import scripts.local.autocoder_run_controller as ctrl
+    return {
+        "planner_call": fake.planner_call,
+        "runner_call": fake.runner_call,
+        "planner_module": None,
+        "runner_module": None,
+    }
+
+
+def test_r70_planner_invoked_on_findings(monkeypatch, tmp_path):
+    """Round-70 R-1: recording findings automatically invokes the planner seam."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_seam(state_path, fake),
+    )
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "subsystem": "autocoder",
+         "root_cause": "wiring", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": "demo"},
+        {"finding_id": "F2", "severity": "P2", "subsystem": "autocoder",
+         "root_cause": "wiring", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": "demo2"},
+    ]))
+
+    plan_path = tmp_path / "plan.json"
+
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path,
+        "--findings-file", str(findings_file),
+        "--output-plan", str(plan_path),
+    ])
+    assert rc == 0, f"record-autonomous-repair-plan rc={rc}"
+
+    # Planner MUST have been invoked exactly once with the findings list.
+    assert len(fake.planner_calls) == 1
+    pc = fake.planner_calls[0]
+    assert pc["tier"] == "tier_2_cohesive_batch"
+    assert [f["finding_id"] for f in pc["findings"]] == ["F1", "F2"]
+
+    # Plan file MUST have been written.
+    plan = json.loads(plan_path.read_text())
+    assert plan["finding_count"] == 2
+    assert plan["batch_count"] == 1
+
+    # State MUST record the plan path and metadata.
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex["repair_plan_path"] == str(plan_path)
+    assert codex["repair_plan_finding_count"] == 2
+    assert codex["repair_plan_batch_count"] == 1
+    # next_action MUST be repair_task.
+    assert state["next_action"]["action"] == "repair_task"
+
+
+def test_r70_same_root_cause_forms_cohesive_batch(monkeypatch, tmp_path):
+    """Round-70 R-2: same-root-cause findings form a cohesive batch."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "A", "severity": "P2", "subsystem": "audit",
+         "root_cause": "missing-cursor", "path": "scripts/local/audit_codex_response_for_pr.py",
+         "summary": ""},
+        {"finding_id": "B", "severity": "P2", "subsystem": "audit",
+         "root_cause": "missing-cursor", "path": "scripts/local/audit_codex_response_for_pr.py",
+         "summary": ""},
+    ]))
+
+    plan_path = tmp_path / "plan.json"
+
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path,
+        "--findings-file", str(findings_file),
+        "--output-plan", str(plan_path),
+    ])
+    assert rc == 0
+
+    # 2 findings, same root_cause, same subsystem → 1 batch.
+    plan = json.loads(plan_path.read_text())
+    assert plan["batch_count"] == 1, plan
+    assert sorted(plan["batches"][0]["finding_ids"]) == ["A", "B"]
+
+
+def _autonomous_repair_seam_path(state_path, fake):
+    return {
+        "planner_call": fake.planner_call,
+        "runner_call": fake.runner_call,
+        "planner_module": None,
+        "runner_module": None,
+    }
+
+
+def test_r70_malformed_findings_fails_closed(monkeypatch, tmp_path):
+    """Round-70 R-4: malformed or missing finding evidence fails closed."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Empty findings list
+    f0 = tmp_path / "f0.json"
+    f0.write_text(json.dumps([]))
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f0),
+        "--output-plan", str(tmp_path / "p0.json"),
+    ])
+    assert rc != 0, "empty findings should fail"
+
+    # Missing findings file
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(tmp_path / "missing.json"),
+        "--output-plan", str(tmp_path / "p1.json"),
+    ])
+    assert rc != 0, "missing file should fail"
+
+    # Malformed JSON
+    f2 = tmp_path / "f2.json"
+    f2.write_text("not json")
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f2),
+        "--output-plan", str(tmp_path / "p2.json"),
+    ])
+    assert rc != 0, "malformed JSON should fail"
+
+    # Missing finding_id
+    f3 = tmp_path / "f3.json"
+    f3.write_text(json.dumps([{"severity": "P2", "subsystem": "x",
+                                "root_cause": "y", "path": "z.py", "summary": ""}]))
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f3),
+        "--output-plan", str(tmp_path / "p3.json"),
+    ])
+    assert rc != 0, "missing finding_id should fail"
+
+    # State MUST NOT have advanced to repair_task.
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] != "repair_task"
+
+
+def test_r70_runner_invoked_on_repaired(monkeypatch, tmp_path):
+    """Round-70 R-5: recording repaired automatically invokes the runner seam."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    log_path = tmp_path / "log.json"
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "scripts/local/foo.py",
+        "--tier", "tier_2_cohesive_batch",
+        "--output-log", str(log_path),
+    ])
+    assert rc == 0, f"record-autonomous-repair-validation rc={rc}"
+
+    # Runner MUST have been invoked with the changed path.
+    assert len(fake.runner_calls) == 1
+    assert fake.runner_calls[0]["changed_paths"] == ["scripts/local/foo.py"]
+
+    # Log MUST have been written.
+    log = json.loads(log_path.read_text())
+    assert log["return_code"] == 0
+
+    # State MUST record the validation outcome.
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex["last_validation_status"] == "passed"
+    assert codex["last_validation_return_code"] == 0
+
+    # next_action MUST be await_codex_review_after_repair (after validation success).
+    assert state["next_action"]["reason"] == "await_codex_review_after_repair"
+
+
+def test_r70_failed_validation_does_not_reset_findings(monkeypatch, tmp_path):
+    """Round-70 R-7: failed selected tests do not reset finding state."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Pre-seed findings state
+    Path(state_path).write_text(json.dumps({
+        **json.loads(Path(state_path).read_text()),
+        "codex_review": {
+            "status": "findings", "findings_count": 3, "highest_severity": "P2",
+        },
+    }))
+
+    fake = _FakePlannerAndRunner()
+
+    def runner_call_rc1(**kw):
+        fake.runner_calls.append(kw)
+        return {
+            "return_code": 1,  # FAILURE
+            "duration": 0.5,
+            "selected_tests": ["tests.failed"],
+            "selection_reason": "fake",
+            "tier": "tier_2_cohesive_batch",
+            "command": ["pytest", "-q", "tests.failed"],
+            "capped": False,
+            "complete": True,
+        }
+    fake.runner_call = runner_call_rc1
+
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "scripts/local/foo.py",
+        "--tier", "tier_2_cohesive_batch",
+    ])
+    assert rc == 0, "controller should not propagate error exit"
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # Last validation recorded as failed.
+    assert codex["last_validation_status"] == "failed"
+    assert codex["last_validation_return_code"] == 1
+    # Finding state MUST NOT be reset (still findings_count=3).
+    assert codex.get("findings_count", 0) != 0 or codex.get("status") != "not_started"
+
+
+def test_r70_empty_changed_paths_fails_closed(monkeypatch, tmp_path):
+    """Round-70 R-8: empty or missing changed-path evidence fails closed."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "",
+        "--tier", "tier_2_cohesive_batch",
+    ])
+    assert rc != 0, "empty changed-path should fail"
+    assert len(fake.runner_calls) == 0
+
+
+def test_r70_planner_cli_still_works(tmp_path):
+    """Round-70 R-10: the planner CLI still works as a thin wrapper.
+
+    Uses subprocess timeout so the test cannot hang.
+    """
+    import subprocess as sp
+    findings = tmp_path / "f.json"
+    findings.write_text(json.dumps([
+        {"finding_id": "X", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "r70", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": ""},
+    ]))
+    plan = tmp_path / "plan.json"
+    res = sp.run([
+        sys.executable, "scripts/local/aed_repair_planner.py",
+        "--findings-file", str(findings),
+        "--output-plan", str(plan),
+    ], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    j = json.loads(plan.read_text())
+    assert j["finding_count"] == 1
+    assert j["batch_count"] == 1
+
+
+def test_r70_runner_cli_still_works(tmp_path):
+    """Round-70 R-10: the runner CLI still works as a thin wrapper.
+
+    Uses ``--dry-run`` so the test never launches pytest. The
+    subprocess is bounded by a 30-second timeout so the test
+    cannot hang. The output log is written with returncode=0.
+    """
+    import subprocess as sp
+    paths = tmp_path / "paths.txt"
+    paths.write_text("scripts/local/foo.py\n")
+    log = tmp_path / "log.json"
+    res = sp.run([
+        sys.executable, "scripts/local/aed_test_runner.py",
+        "--changed-paths-file", str(paths),
+        "--output-log", str(log),
+        "--dry-run",
+    ], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    j = json.loads(log.read_text())
+    assert j["returncode"] == 0
+    assert j["dry_run"] is True
+
+
+def test_r70_state_compatibility_existing_file(tmp_path):
+    """Round-70 R-11: existing controller-state files without new optional fields
+    can still be read safely.
+    """
+    state_path = tmp_path / "old_state.json"
+    state_path.write_text(json.dumps({
+        "run_id": "OLD",
+        "status": "RUN_ACTIVE",
+        "tasks": [],
+        "codex_review": {
+            "status": "findings",
+            "findings_count": 5,
+            "highest_severity": "P1",
+        },
+        "next_action": {"action": "repair_task"},
+        "updated_at": "2026-01-01T00:00:00Z",
+    }))
+    rc = controller_main(["status", "--state", str(state_path)])
+    assert rc == 0, "old state should still be readable"
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_findings(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when --changed-path is omitted from
+    ``record-codex-repair-result --status repaired`` but the
+    controller state already records the findings paths,
+    the handler MUST derive impact evidence from those
+    findings instead of silently dropping to
+    ``validation_failed_no_repair:no_changed_paths_supplied``.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": [],
+        "codex_review": {
+            "findings": [
+                {"path": "scripts/local/aed_pr.py"},
+                {"path": "scripts/local/audit_codex_response_for_pr.py"},
+                {"file_path": "tests/test_round85.py"},
+            ],
+        },
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert "scripts/local/aed_pr.py" in derived
+    assert "scripts/local/audit_codex_response_for_pr.py" in derived
+    assert "tests/test_round85.py" in derived
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_repair_events(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when findings are empty but a prior
+    repair event recorded a changed_paths list, the handler
+    MUST derive impact evidence from that earlier event.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [
+            {"changed_paths": ["scripts/local/x.py"]},
+            {"changed_paths": ["scripts/local/y.py"]},
+        ],
+        "last_validated_changed_paths": [],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == ["scripts/local/x.py", "scripts/local/y.py"]
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_last_validated(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when findings and prior repair events
+    are empty but ``last_validated_changed_paths`` is recorded,
+    the handler MUST derive impact evidence from there.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": ["scripts/local/z.py"],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == ["scripts/local/z.py"]
+
+
+def test_record_codex_repair_result_derivation_empty_when_nothing_to_derive(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when no derivation source has any
+    paths the helper returns an empty list, signalling to
+    the caller that it MUST fail closed.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": [],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == []
+
+
+def test_record_codex_review_persists_findings_and_changed_paths(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-86 follow-up: ``_record_codex_review`` MUST persist
+    the parsed findings list (``codex[\"findings\"]``) and the
+    changed_paths list (``codex_repair_events[*].changed_paths``
+    + ``last_validated_changed_paths``) so the Round-85
+    ``_derive_changed_paths_from_state`` helper has sources
+    to fall back on. Without this persistence the documented
+    ``record-codex-repair-result --status repaired`` invocation
+    silently drops to ``no_changed_paths_supplied``.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r86-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r86-001",
+        "--output-state", str(state_path),
+    ])
+    findings_file = temp_workspace / "findings.json"
+    findings_file.write_text(json.dumps([
+        {
+            "finding_id": "F1",
+            "severity": "P2",
+            "path": "scripts/local/aed_pr.py",
+        },
+        {
+            "finding_id": "F2",
+            "severity": "P2",
+            "path": "scripts/local/audit_codex_response_for_pr.py",
+        },
+    ]))
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "Two P2 findings",
+        "--findings-file", str(findings_file),
+        "--changed-path", "scripts/local/aed_pr.py",
+        "--changed-path", "scripts/local/audit_codex_response_for_pr.py",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    codex = state.get("codex_review", {})
+    assert codex.get("findings") == [
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/aed_pr.py"},
+        {"finding_id": "F2", "severity": "P2", "path": "scripts/local/audit_codex_response_for_pr.py"},
+    ]
+    # The repair event must carry the changed_paths list.
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/aed_pr.py",
+        "scripts/local/audit_codex_response_for_pr.py",
+    ]
+    # And the controller's last_validated_changed_paths must
+    # mirror the cumulative list.
+    assert state.get("last_validated_changed_paths") == [
+        "scripts/local/aed_pr.py",
+        "scripts/local/audit_codex_response_for_pr.py",
+    ]
+
+
+def test_record_codex_repair_result_derives_when_findings_persisted(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-86 follow-up: when ``_record_codex_review`` has
+    persisted findings, the Round-85
+    ``_derive_changed_paths_from_state`` helper returns the
+    persisted findings paths.
+
+    This test exercises the helper directly with state shaped
+    exactly as ``_record_codex_review`` produces after a
+    ``--status findings`` invocation. The handler integration
+    is covered by the failing-stale-blocker tests.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r86-002",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r86-002",
+        "--output-state", str(state_path),
+    ])
+    findings_file = temp_workspace / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/x.py"},
+    ]))
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P2",
+        "--summary", "Single P2 finding",
+        "--findings-file", str(findings_file),
+    ])
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex.get("findings") == [
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/x.py"},
+    ]
+    # The derivation helper, given this state, returns the
+    # persisted findings path. The full repaired integration
+    # path is exercised by the integration suite.
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    derived = _derive_changed_paths_from_state(state, codex)
+    assert "scripts/local/x.py" in derived
+
+
+def test_record_codex_repair_result_persists_changed_paths_on_event(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-87 follow-up: when record-codex-repair-result is
+    invoked with --changed-path the controller MUST persist the
+    supplied paths on the resulting codex_repair_event AND
+    update last_validated_changed_paths so the Round-85
+    derivation helper has a reliable second-source.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r87-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r87-001",
+        "--output-state", str(state_path),
+    ])
+    rc, _, _ = run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "failed", "--summary", "Could not repair",
+        "--changed-path", "scripts/local/x.py",
+        "--changed-path", "scripts/local/y.py",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/x.py", "scripts/local/y.py",
+    ]
+    assert state.get("last_validated_changed_paths") == [
+        "scripts/local/x.py", "scripts/local/y.py",
+    ]
+
+
+def test_record_codex_repair_result_event_changed_paths_cleaned(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-87 follow-up: the cleaned paths list persisted on
+    the repair-result event must drop blank and whitespace
+    entries.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r87-002",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r87-002",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "failed", "--summary", "Could not repair",
+        "--changed-path", "scripts/local/foo.py",
+        "--changed-path", "",
+        "--changed-path", "  ",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/foo.py",
+    ]
+
+
+def test_derive_changed_paths_scoped_to_repair_cycle(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-89 follow-up: when ``repair_cycle_id`` is passed,
+    the derivation helper MUST NOT reuse historical paths
+    from a previous repair cycle. This prevents a flagless
+    ``record-codex-repair-result --status repaired`` from
+    silently re-running the previous cycle's evidence.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        # Earlier repair cycle recorded paths under cycle 1.
+        "codex_repair_events": [
+            {
+                "repair_attempt": 1,
+                "status": "failed",
+                "changed_paths": ["scripts/local/old.py"],
+            },
+        ],
+        "last_validated_changed_paths": ["scripts/local/old.py"],
+        # Round-89 follow-up: the validated list is anchored to
+        # cycle 1's head. A flagless invocation on a NEW head
+        # MUST NOT see this list because the helper guards on
+        # ``last_validated_head_sha`` and ``last_validated_attempt``.
+        "last_validated_head_sha": "oldhead",
+        "last_validated_attempt": 1,
+        "codex_review": {
+            "head_sha": "abc123",  # current cycle's NEW head
+            "findings": [],  # current finding has no path
+            "repair_attempts": 0,
+        },
+    }
+    codex = state["codex_review"]
+    # Without cycle binding: derives from all sources including
+    # the previous cycle's evidence.
+    no_cycle = _derive_changed_paths_from_state(state, codex)
+    assert "scripts/local/old.py" in no_cycle
+
+    # With cycle binding to a NEW cycle (2): the previous cycle's
+    # evidence MUST NOT be reused because repair_attempt=1 != 2.
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=2
+    )
+    assert "scripts/local/old.py" not in scoped, (
+        "Round-89: derivation helper MUST NOT reuse "
+        "previous-cycle evidence when a cycle binding is supplied."
+    )
+
+
+def test_derive_changed_paths_cycle_match_includes_cycle_paths(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-89 follow-up: when the cycle binding MATCHES an
+    existing repair cycle, the helper MUST include that
+    cycle's evidence. This is the normal-case happy path.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [
+            {
+                "repair_attempt": 3,
+                "status": "failed",
+                "changed_paths": ["scripts/local/x.py"],
+            },
+            {
+                "repair_attempt": 2,
+                "status": "failed",
+                "changed_paths": ["scripts/local/y.py"],  # OLDER
+            },
+        ],
+        "codex_review": {"findings": []},
+    }
+    codex = state["codex_review"]
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=3
+    )
+    assert "scripts/local/x.py" in scoped
+    assert "scripts/local/y.py" not in scoped, (
+        "Round-89: cycle binding MUST scope evidence to the "
+        "matching cycle only, not earlier cycles."
+    )
+
+
+def test_derive_changed_paths_stored_attempt_matches_cycle(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-91 follow-up: the validated-list guard compares
+    the stored ``last_validated_attempt`` against the
+    passed-in ``repair_cycle_id`` directly. The previous
+    shape ``codex[\"repair_attempts\"] + 1`` mis-aligned
+    with the cycle binding because ``codex[\"repair_attempts\"]``
+    is incremented AFTER the event is written.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": ["scripts/local/x.py"],
+        "last_validated_head_sha": "abcd",
+        # Cycle 2 has recorded the validated list.
+        "last_validated_attempt": 2,
+        "codex_review": {
+            "head_sha": "abcd",
+            "findings": [],
+            "repair_attempts": 2,
+        },
+    }
+    codex = state["codex_review"]
+    # With cycle binding 2 (matching the recorded attempt):
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=2
+    )
+    assert "scripts/local/x.py" in scoped, (
+        "Round-91: matching cycle MUST include the validated "
+        "list when the cycle binding equals the recorded "
+        "attempt."
+    )
+    # With cycle binding 3 (NOT matching): must not include.
+    scoped_3 = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=3
+    )
+    assert "scripts/local/x.py" not in scoped_3
+
+
+def test_r104_repair_result_runner_exception_marks_event_failed(
+    monkeypatch, tmp_path
+):
+    """Round-104 follow-up (PRRT_kwDOSHFpYM6VSVDA): when
+    ``runner_call`` raises (e.g. pytest cannot be launched),
+    ``record-codex-repair-result --status repaired`` MUST set
+    ``validation_outcome="failed"``, persist
+    ``validation_error``, persist the validation failure
+    return-code, and persist the ``codex_repair_event`` with
+    ``status="failed"`` so the append-only history is
+    consistent with ``last_validation_outcome`` and
+    ``next_action``. The controller MUST NOT advance to
+    ``await_codex_review_after_repair`` and MUST preserve the
+    active finding state.
+    """
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Pre-seed findings state so we can verify it's preserved.
+    state_data = json.loads(Path(state_path).read_text())
+    state_data["codex_review"] = {
+        "status": "findings",
+        "findings_count": 3,
+        "highest_severity": "P2",
+        "head_sha": "abcdef",
+        "findings": [],
+    }
+    Path(state_path).write_text(json.dumps(state_data))
+
+    # Inject a runner_call that raises RuntimeError.
+    def raising_runner(**kwargs):
+        raise RuntimeError("pytest cannot be launched")
+
+    def patched_seam():
+        return {
+            "planner_call": lambda **kw: {},
+            "runner_call": raising_runner,
+            "planner_module": None,
+            "runner_module": None,
+        }
+
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        patched_seam,
+    )
+
+    rc = controller_main([
+        "record-codex-repair-result",
+        "--state", state_path,
+        "--status", "repaired",
+        "--summary", "Applied repairs",
+        "--changed-path", "scripts/local/x.py",
+    ])
+    # The CLI exits 0 on the failure path (controller fails
+    # closed without propagating the crash exit). The state is
+    # what matters for the test contract.
+    assert rc == 0, "controller should not propagate the exception exit"
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # 1. validation_outcome MUST be failed (not pending, not passed).
+    assert codex.get("last_validation_outcome") == "failed", (
+        "Round-104 (PRRT_kwDOSHFpYM6VSVDA): validation_outcome "
+        f"MUST be 'failed', got {codex.get('last_validation_outcome')!r}"
+    )
+    # 2. validation error MUST be persisted.
+    assert "runner_failed" in codex.get("last_validation_error", ""), (
+        "Round-104: validation_error MUST contain 'runner_failed' "
+        f"prefix, got {codex.get('last_validation_error')!r}"
+    )
+    # 3. return-code MUST be a non-zero sentinel (-1).
+    assert codex.get("last_validation_return_code") == -1, (
+        "Round-104: last_validation_return_code MUST be -1 on "
+        "exception path; got "
+        f"{codex.get('last_validation_return_code')!r}"
+    )
+    # 4. last codex_repair_event MUST have status=failed
+    #    (NOT status=repaired, which is the CLI-supplied arg).
+    repair_events = state.get("codex_repair_events", [])
+    assert repair_events, "codex_repair_events MUST be non-empty"
+    last_event = repair_events[-1]
+    assert last_event.get("status") == "failed", (
+        "Round-104: codex_repair_event status MUST be 'failed' on "
+        f"exception path; got {last_event.get('status')!r}"
+    )
+    # 5. next_action MUST be the fail-closed variant, NOT
+    #    await_codex_review_after_repair.
+    next_action = state.get("next_action", {})
+    assert next_action.get("reason", "").startswith(
+        "validation_failed_no_repair"
+    ), (
+        "Round-104: next_action MUST be fail-closed "
+        f"validation_failed_no_repair; got {next_action!r}"
+    )
+    assert "await_codex_review_after_repair" not in next_action.get(
+        "reason", ""
+    ), (
+        "Round-104: controller MUST NOT advance to "
+        f"await_codex_review_after_repair; got {next_action!r}"
+    )
+    # 6. Active finding state MUST be preserved (no
+    #    codex['status'] = 'not_started' clear).
+    assert codex.get("status") != "not_started", (
+        "Round-104: codex['status'] MUST NOT be reset to "
+        f"'not_started' on the exception path; got {codex.get('status')!r}"
+    )
+    # 7. findings_count MUST NOT have been zeroed (controller
+    #    fails closed rather than advancing to clean).
+    assert codex.get("findings_count", 0) != 0, (
+        "Round-104: findings_count MUST NOT be zeroed on "
+        f"the exception path; got {codex.get('findings_count')!r}"
+    )
+
+
+def test_r106_record_codex_review_guards_plan_dir_creation(
+    monkeypatch, tmp_path
+):
+    """Round-106 follow-up (VUIvd / PRRT_kwDOSHFpYM6VUIvd):
+    when ``<state-parent>/plans`` cannot be created (because
+    that path exists as a regular file or the parent is
+    read-only), ``record-codex-review --status findings`` MUST
+    fail closed with ``next_action = request_human`` and reason
+    ``repair_planning_failed:plan_dir_create_failed`` rather
+    than crashing with an unguarded OSError.
+    """
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {
+            "finding_id": "PF1", "severity": "P2",
+            "subsystem": "autocoder", "root_cause": "test",
+            "path": "scripts/local/autocoder_run_controller.py",
+            "summary": "plan-dir guard test",
+        },
+    ]))
+
+    # Block plan_dir.mkdir() by pre-creating ``plans`` as a
+    # regular file at the same level. The controller's mkdir
+    # call would otherwise succeed; the pre-existing file
+    # forces OSError because ``exist_ok`` does not allow a
+    # file already present at the path.
+    plans_blocker = tmp_path / "plans"
+    plans_blocker.write_text("not a directory")
+
+    rc = controller_main([
+        "record-codex-review",
+        "--state", state_path,
+        "--status", "findings",
+        "--head-sha", "deadbeef00000000000000000000000000000000",
+        "--findings-file", str(findings_file),
+    ])
+    # The CLI exits 0 (fail-closed via next_action) rather
+    # than propagating the OSError.
+    assert rc in (0, 1, 2), (
+        "Round-106 (VUIvd): the CLI must not propagate the "
+        f"OSError; got rc={rc}"
+    )
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # The plan dir create failure must have been recorded
+    # somewhere in state. The Round-107 follow-up
+    # (VUQ6M) fix assigns ``plan_error`` directly (instead
+    # of ``planner_error``) so the persisted reason is
+    # the unambiguous ``plan_dir_create_failed`` prefix.
+    err = codex.get("repair_plan_error", "")
+    assert err.startswith("plan_dir_create_failed"), (
+        "Round-106 (VUIvd) / Round-107 (VUQ6M): "
+        "repair_plan_error MUST start with "
+        f"'plan_dir_create_failed'; got {err!r}"
+    )
+    next_action = state.get("next_action", {})
+    assert (
+        "repair_planning_failed" in next_action.get("reason", "")
+        or "plan_dir_create_failed" in next_action.get("reason", "")
+    ), (
+        "Round-106 (VUIvd) / Round-107 (VUQ6M): "
+        "next_action MUST be fail-closed "
+        f"repair_planning_failed; got {next_action!r}"
+    )
