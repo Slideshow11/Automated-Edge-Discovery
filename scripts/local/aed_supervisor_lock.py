@@ -201,27 +201,25 @@ def _state_file_live(state_path: Optional[str], owner_run_id: Optional[str],
 def assess_liveness(lock: dict) -> LivenessEvidence:
     """Determine whether the lock's owner lease is still alive.
 
-    Lease-based liveness (P1 fix: keep the lock owner alive for the
-    full controller run by basing liveness on the state file, NOT on
-    a short-lived bootstrap PID).
+    Lease-based liveness: state file mtime + run_id evidence is
+    the PRIMARY signal. Process-based evidence is a fallback for
+    the rare case where the bootstrap subprocess is still running
+    but the state file is missing/stale.
 
-    Aliveness requires:
-      - state_path exists and is readable.
-      - state_path's mtime is within max_age_seconds of now.
-      - state_path's run_identity.run_id matches lock's owner_run_id.
-
-    Falls back to process-based evidence if state_path is missing
-    (transitional) AND falls back to fail-closed if both are
-    missing.
-
-    If neither check can be made, return is_indeterminate=True
-    so callers can fail closed.
+    Round-4/5 fix: when the state file is fresh and the run_id
+    matches, the lease is alive EVEN IF the bootstrap PID has
+    exited. The original contract tied liveness to PID existence,
+    which caused the lock to be classified as stale whenever the
+    controller's bootstrap subprocess finished — even though the
+    controller run was still active and writing to the state
+    file. The PID is a transient bootstrap handle, not a run-life
+    signal.
     """
     max_age_seconds = int(lock.get("max_age_seconds", DEFAULT_MAX_AGE_SECONDS))
     owner_run_id = lock.get("owner_run_id")
     state_path = lock.get("owner_state_path")
 
-    # Lease-based check.
+    # Primary: lease check.
     state_alive, state_indeterminate, state_reason = _state_file_live(
         state_path, owner_run_id, max_age_seconds
     )
@@ -244,8 +242,10 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
             ctime_match=False,
         )
 
-    # State evidence says stale. Confirm with process-based evidence
-    # to ensure we're not just seeing a transient state-file gap.
+    # State says stale. Use process-based evidence as a fallback
+    # only when the state file's lease check definitively says
+    # STALE (not INDETERMINATE). This handles transient state-file
+    # gaps where the bootstrap process is still alive.
     pid = lock.get("owner_pid")
     if isinstance(pid, int) and pid > 0 and _pid_exists(pid):
         actual_evidence = capture_process_start_evidence(pid=pid)
@@ -277,10 +277,6 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
         )
 
         if stat_match or ctime_match:
-            # PID alive + start evidence matches: the original
-            # bootstrap process is still running, even though the
-            # state file looks stale. Treat as alive (transient
-            # state-file gap).
             return LivenessEvidence(
                 is_alive=True,
                 is_indeterminate=False,

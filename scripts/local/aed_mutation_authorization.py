@@ -365,6 +365,16 @@ def record_result(
             "actual_target_sha": actual_target_sha,
             "error_detail": error_detail,
         }
+        # P2 fix (round 5): validate secrets in new_result BEFORE
+        # _rewrite_record persists the secret-bearing payload to disk.
+        # _rewrite_record also calls assert_no_secrets but only AFTER
+        # the file is on disk; moving the check earlier means the
+        # caller never sees durable secret leakage even if the file
+        # write succeeds.
+        try:
+            assert_no_secrets(new_result, context="mutation_result")
+        except ValueError as e:
+            raise ValueError(f"secret_in_result:{e}") from e
         if existing_result is None:
             # First result. Persist the updated authorization record
             # (with result populated) atomically and append a result

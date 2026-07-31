@@ -586,7 +586,7 @@ def _init(args: argparse.Namespace) -> None:
             owner_host=host_identity,
             owner_pid=owner_pid,
             owner_start_evidence=owner_start_evidence,
-            owner_state_path=out_path,
+            owner_state_path=str(Path(out_path).resolve()),
             base_dir=lock_base,
         )
         if not lock_outcome.ok:
@@ -636,17 +636,41 @@ def _init(args: argparse.Namespace) -> None:
         run_identity["lock_dir"] = str(Path(lock_dir_persisted).resolve())
 
     state["run_identity"] = run_identity
-    _save_state(state, out_path)
+    # P1 fix (round 5): wrap state and receipt writes in cleanup
+    # so that if a write fails (e.g. disk full), the newly
+    # acquired supervisor lock is released. Otherwise the
+    # controller exits leaving an orphan lock whose state path is
+    # missing or unwritable, blocking the scope until manual
+    # cleanup. On failure, exit before reporting success.
+    lock_to_release_on_failure = lock_outcome
+    try:
+        _save_state(state, out_path)
+        receipt_json_path, receipt_md_path = _launch_receipt.emit(
+            Path(args.workspace),
+            run_identity=run_identity,
+            state_path=out_path,
+            lock_path=lock_path_str,
+            pending_action=str(state["next_action"]["action"]),
+            current_phase=str(state["overall_status"]),
+            merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
+        )
+    except Exception:
+        # Release the lock we just acquired so the scope is not
+        # permanently blocked by an orphan lease.
+        if lock_to_release_on_failure is not None and scope is not None:
+            try:
+                _supervisor_lock.release(
+                    scope=scope,
+                    owner_run_id=args.run_id,
+                    base_dir=lock_base,
+                )
+            except Exception:
+                pass
+        raise
 
-    receipt_json_path, receipt_md_path = _launch_receipt.emit(
-        Path(args.workspace),
-        run_identity=run_identity,
-        state_path=out_path,
-        lock_path=lock_path_str,
-        pending_action=str(state["next_action"]["action"]),
-        current_phase=str(state["overall_status"]),
-        merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
-    )
+    # Past this point, the lock is intentionally held for the
+    # run's lifetime. Release on failure is no longer needed.
+    lock_to_release_on_failure = None
 
     print(f"Initialized run controller state: {out_path}")
     print(f"  run_id:       {args.run_id}")
@@ -2235,14 +2259,32 @@ def _finalize_run(args: argparse.Namespace) -> None:
         lock_base = None
         if rid.get("lock_dir"):
             lock_base = Path(rid["lock_dir"])
-        try:
-            _supervisor_lock.release(
-                scope=scope,
-                owner_run_id=state.get("run_id", "unknown"),
-                base_dir=lock_base,
+        # P1 fix (round 5): retry release if the sentinel is briefly
+        # held by another process. Without this, finalization can
+        # report success while the lock remains, blocking the next
+        # run for up to seven days.
+        released = False
+        for attempt in range(5):
+            try:
+                released = _supervisor_lock.release(
+                    scope=scope,
+                    owner_run_id=state.get("run_id", "unknown"),
+                    base_dir=lock_base,
+                )
+                if released:
+                    break
+            except Exception:
+                pass
+            import time as _time
+            _time.sleep(0.05)
+        if not released:
+            print(
+                "ERROR: refusing to finalize: failed to release "
+                "supervisor lock after 5 attempts; lock may be "
+                "orphaned. Manual recovery required.",
+                file=sys.stderr,
             )
-        except Exception:
-            pass
+            sys.exit(13)
 
     print(f"Run finalized: {state.get('run_id', 'unknown')}")
     print(f"  final status: RUN_COMPLETE")
@@ -2857,7 +2899,7 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         recovered_by_host=host_identity,
         recovered_by_pid=proc_evidence["pid"],
         recovered_by_start_evidence=proc_evidence,
-        recovered_by_state_path=args.state,
+        recovered_by_state_path=str(Path(args.state).resolve()),
         staleness_evidence=args.staleness_evidence,
         base_dir=_resolve_lock_base(args, Path(args.workspace)),
     )
