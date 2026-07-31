@@ -201,28 +201,20 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
         rejected).
 
     The duplicate scan and append are serialized with an exclusive
-    sentinel file so that two concurrent executors cannot both
-    succeed in authorizing the same scope.
+    sentinel file (fcntl.flock, OS-managed release-on-close) so that
+    two concurrent executors cannot both succeed in authorizing the
+    same scope, AND so a crashed executor's sentinel is auto-released
+    by the kernel.
     """
+    from scripts.local.aed_supervisor_lock import (
+        _acquire_sentinel_fd,
+        _release_sentinel_fd,
+    )
+
     path = mutations_path(workspace)
     sentinel_path = path.with_suffix(path.suffix + ".auth-sentinel")
 
-    # Acquire an exclusive sentinel. The first caller to reach the
-    # O_EXCL open wins; subsequent callers see FileExistsError and
-    # back off briefly. We retry the sentinel acquisition briefly to
-    # handle the case where another caller holds it momentarily.
-    sentinel_fd = None
-    for _ in range(20):
-        try:
-            sentinel_fd = os.open(
-                str(sentinel_path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                0o600,
-            )
-            break
-        except FileExistsError:
-            import time as _time
-            _time.sleep(0.05)
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
     if sentinel_fd is None:
         return AuthorizationOutcome(
             ok=False,
@@ -289,14 +281,7 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
         _append_record(workspace, record)
         return AuthorizationOutcome(ok=True, mutation_id=mutation_id, record=record)
     finally:
-        try:
-            os.close(sentinel_fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(sentinel_path)
-        except OSError:
-            pass
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def record_result(
@@ -317,84 +302,104 @@ def record_result(
       - ValueError if the result is not a terminal status, the
         mutation was never authorized, or a duplicate non-identical
         result is replayed.
+
+    All journal operations are serialized with the same OS-managed
+    sentinel file used by `authorize` so a concurrent `authorize`
+    and `record_result` cannot race, AND so a crashed caller is
+    auto-released by the kernel.
     """
+    from scripts.local.aed_supervisor_lock import (
+        _acquire_sentinel_fd,
+        _release_sentinel_fd,
+    )
+
     if status not in TERMINAL_RESULTS:
         raise ValueError(f"non_terminal_status:{status}")
 
-    records = _read_all_records(workspace)
-    target: Optional[dict] = None
-    target_idx: Optional[int] = None
-    for i, rec in enumerate(records):
-        # Skip journal entries that are not the authorization record.
-        if rec.get("kind") in ("result", "result_replay_idempotent"):
-            continue
-        if rec.get("mutation_id") == mutation_id:
-            target = rec
-            target_idx = i
-            break
-    if target is None:
-        raise KeyError(f"unknown_mutation_id:{mutation_id}")
+    path = mutations_path(workspace)
+    sentinel_path = path.with_suffix(path.suffix + ".auth-sentinel")
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    if sentinel_fd is None:
+        raise RuntimeError("mutation_journal_lock_busy")
 
-    # Determine the existing result from the on-disk authorization
-    # record. The authorization record may have been updated by
-    # prior results, so we re-read the latest state.
-    existing_result = target.get("result")
-    # If the on-disk record's result is None, look for an appended
-    # result line matching this mutation_id (this happens when the
-    # previous call appended the result line but didn't mutate the
-    # on-disk record).
-    if existing_result is None:
-        for rec in records:
-            if rec.get("kind") == "result" and rec.get("mutation_id") == mutation_id:
-                existing_result = rec.get("result")
+    try:
+
+        records = _read_all_records(workspace)
+        target: Optional[dict] = None
+        target_idx: Optional[int] = None
+        for i, rec in enumerate(records):
+            # Skip journal entries that are not the authorization record.
+            if rec.get("kind") in ("result", "result_replay_idempotent"):
+                continue
+            if rec.get("mutation_id") == mutation_id:
+                target = rec
+                target_idx = i
                 break
+        if target is None:
+            raise KeyError(f"unknown_mutation_id:{mutation_id}")
 
-    if target.get("authorization_status") != AUTHORIZED:
+        # Determine the existing result from the on-disk authorization
+        # record. The authorization record may have been updated by
+        # prior results, so we re-read the latest state.
+        existing_result = target.get("result")
+        # If the on-disk record's result is None, look for an appended
+        # result line matching this mutation_id (this happens when the
+        # previous call appended the result line but didn't mutate the
+        # on-disk record).
+        if existing_result is None:
+            for rec in records:
+                if rec.get("kind") == "result" and rec.get("mutation_id") == mutation_id:
+                    existing_result = rec.get("result")
+                    break
+
+        if target.get("authorization_status") != AUTHORIZED:
+            raise ValueError(
+                f"mutation_not_authorized:{target.get('authorization_status')}"
+            )
+
+        new_result = {
+            "status": status,
+            "recorded_at": _utcnow(),
+            "evidence": evidence,
+            "actual_main_sha": actual_main_sha,
+            "actual_target_sha": actual_target_sha,
+            "error_detail": error_detail,
+        }
+        if existing_result is None:
+            # First result. Persist the updated authorization record
+            # (with result populated) atomically and append a result
+            # journal entry for traceability.
+            target["result"] = new_result
+            _rewrite_record(workspace, target)
+            result_record = {
+                "kind": "result",
+                "mutation_id": mutation_id,
+                "run_id": target["run_id"],
+                "result": new_result,
+                "recorded_at": _utcnow(),
+            }
+            _append_record(workspace, result_record)
+            return target
+
+        # Already has a result. Either idempotent replay or fail-closed.
+        if _results_equal(existing_result, new_result):
+            # Exact idempotent replay. Append a replay audit line.
+            replay_record = {
+                "kind": "result_replay_idempotent",
+                "mutation_id": mutation_id,
+                "run_id": target["run_id"],
+                "result": new_result,
+                "recorded_at": _utcnow(),
+            }
+            _append_record(workspace, replay_record)
+            target["result"] = existing_result
+            return target
+
         raise ValueError(
-            f"mutation_not_authorized:{target.get('authorization_status')}"
+            f"duplicate_non_identical_result:existing={existing_result};new={new_result}"
         )
-
-    new_result = {
-        "status": status,
-        "recorded_at": _utcnow(),
-        "evidence": evidence,
-        "actual_main_sha": actual_main_sha,
-        "actual_target_sha": actual_target_sha,
-        "error_detail": error_detail,
-    }
-    if existing_result is None:
-        # First result. Persist the updated authorization record
-        # (with result populated) atomically and append a result
-        # journal entry for traceability.
-        target["result"] = new_result
-        _rewrite_record(workspace, target)
-        result_record = {
-            "kind": "result",
-            "mutation_id": mutation_id,
-            "run_id": target["run_id"],
-            "result": new_result,
-            "recorded_at": _utcnow(),
-        }
-        _append_record(workspace, result_record)
-        return target
-
-    # Already has a result. Either idempotent replay or fail-closed.
-    if _results_equal(existing_result, new_result):
-        # Exact idempotent replay. Append a replay audit line.
-        replay_record = {
-            "kind": "result_replay_idempotent",
-            "mutation_id": mutation_id,
-            "run_id": target["run_id"],
-            "result": new_result,
-            "recorded_at": _utcnow(),
-        }
-        _append_record(workspace, replay_record)
-        target["result"] = existing_result
-        return target
-
-    raise ValueError(
-        f"duplicate_non_identical_result:existing={existing_result};new={new_result}"
-    )
+    finally:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def _results_equal(a: dict, b: dict) -> bool:

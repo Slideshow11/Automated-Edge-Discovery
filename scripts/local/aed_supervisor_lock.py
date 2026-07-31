@@ -5,25 +5,25 @@ aed_supervisor_lock.py
 Host-local exclusive supervisor lock for an autocoder run.
 
 Goals:
-  - Atomically create a lock file at a scope (repository + PR number,
+  - Atomically create a lease file at a scope (repository + PR number,
     or repository + mutation target).
-  - Reject a second live lock for the same scope with a clear
+  - Reject a second live lease for the same scope with a clear
     "conflicting run" error that records the existing run identity.
-  - Distinguish an active lock from a stale lock using EVIDENCE rather
-    than PID existence alone:
-      1) PID exists AND its /proc/<pid>/stat start_time matches the
-         recorded start_time, OR
-      2) PID exists AND its /proc/<pid> ctime matches the recorded
-         ctime within a small tolerance.
-    If neither check can be made (non-Linux, proc unreadable), return
-    INDETERMINATE and FAIL CLOSED.
-  - Allow bounded stale-lock recovery via a dedicated method that
-    records WHO reclaimed the lock, the EVIDENCE used to declare the
-    lock stale, and the PREVIOUS run identity. Two workers attempting
-    stale recovery simultaneously must not both succeed.
-  - Preserve an audit record after lock release.
+  - Distinguish an active lease from a stale lease using EVIDENCE
+    rather than process liveness alone:
+      1) The state file (CONTROLLER_STATE.json) at the run's
+         workspace still exists AND
+      2) Its mtime is within max_age_seconds of now AND
+      3) Its run_identity.run_id matches the lock's owner_run_id.
+    If the state file is missing or unreadable, return INDETERMINATE
+    and FAIL CLOSED.
+  - Allow bounded stale-lease recovery via a dedicated method that
+    records WHO reclaimed the lease, the EVIDENCE used to declare
+    the lease stale, and the PREVIOUS run identity. Two workers
+    attempting stale recovery simultaneously must not both succeed.
+  - Preserve an audit record after lease release.
 
-Lock file format (JSON):
+Lease file format (JSON):
     {
       "lock_version": 1,
       "scope_key": "<str>",
@@ -31,10 +31,13 @@ Lock file format (JSON):
                 "mutation_target": "..."|None},
       "owner_run_id": "<str>",
       "owner_host": {"hostname": "...", ...},
-      "owner_pid": <int>,
-      "owner_start_evidence": {...},     # capture_process_start_evidence()
+      "owner_pid": <int>,                    # initial bootstrap PID (informational)
+      "owner_state_path": "<path>",          # CONTROLLER_STATE.json path
+      "owner_start_evidence": {...},         # capture_process_start_evidence()
       "created_at": "<iso8601>",
-      "max_age_seconds": <int>,          # bounded staleness claim
+      "last_renewed_at": "<iso8601>",
+      "max_age_seconds": <int>,              # bounded staleness claim
+      "lock_version_chain": <int>,           # CAS version chain
       "recovery_history": [
           {"recovered_at": "<iso>", "recovered_by_run_id": "<str>",
            "recovered_by_host": {...}, "previous_owner": {...},
@@ -148,84 +151,222 @@ def _ctime_within_tolerance(actual_ns: Optional[int], expected_ns: Optional[int]
     return abs(int(actual_ns) - int(expected_ns)) <= tolerance_ns
 
 
-def assess_liveness(lock: dict) -> LivenessEvidence:
+def _parse_iso8601(ts: Optional[str]) -> Optional[float]:
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+        s = ts.rstrip("Z")
+        return datetime.fromisoformat(s).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _state_file_live(state_path: Optional[str], owner_run_id: Optional[str],
+                     max_age_seconds: int) -> tuple[bool, bool, str]:
+    """Check whether the run's state file is alive within max_age_seconds.
+
+    Returns (is_alive, is_indeterminate, reason).
+
+    Aliveness evidence:
+      1) state_path exists and is readable.
+      2) state_path's mtime is within max_age_seconds of now.
+      3) state_path's run_identity.run_id matches owner_run_id.
+
+    If state_path is None, return (False, False, "no_state_path")
+    so the caller falls through to process-based evidence.
     """
-    Determine whether the lock's owner is still alive.
+    if not state_path:
+        return False, False, "no_state_path"
+    p = Path(state_path)
+    try:
+        st = p.stat()
+    except (FileNotFoundError, OSError):
+        return False, True, "state_path_missing"
+    now = datetime.now().timestamp()
+    if (now - st.st_mtime) > max_age_seconds:
+        return False, False, f"state_mtime_stale_age={int(now - st.st_mtime)}s"
+    if owner_run_id:
+        try:
+            with open(p) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return False, True, "state_unreadable"
+        rid = state.get("run_identity") or {}
+        if rid.get("run_id") != owner_run_id:
+            return False, False, "state_run_id_mismatch"
+    return True, False, "ok"
 
-    Evidence required (ALL):
-      - PID exists (signal 0 doesn't raise ProcessLookupError)
-      - PID's /proc/<pid>/stat start_time matches recorded start_time,
-        OR PID's /proc ctime matches recorded ctime within tolerance.
 
-    If /proc is unreadable for any reason, return is_indeterminate=True
+def assess_liveness(lock: dict) -> LivenessEvidence:
+    """Determine whether the lock's owner lease is still alive.
+
+    Lease-based liveness (P1 fix: keep the lock owner alive for the
+    full controller run by basing liveness on the state file, NOT on
+    a short-lived bootstrap PID).
+
+    Aliveness requires:
+      - state_path exists and is readable.
+      - state_path's mtime is within max_age_seconds of now.
+      - state_path's run_identity.run_id matches lock's owner_run_id.
+
+    Falls back to process-based evidence if state_path is missing
+    (transitional) AND falls back to fail-closed if both are
+    missing.
+
+    If neither check can be made, return is_indeterminate=True
     so callers can fail closed.
     """
-    pid = lock.get("owner_pid")
-    if not isinstance(pid, int) or pid <= 0:
+    max_age_seconds = int(lock.get("max_age_seconds", DEFAULT_MAX_AGE_SECONDS))
+    owner_run_id = lock.get("owner_run_id")
+    state_path = lock.get("owner_state_path")
+
+    # Lease-based check.
+    state_alive, state_indeterminate, state_reason = _state_file_live(
+        state_path, owner_run_id, max_age_seconds
+    )
+    if state_alive:
         return LivenessEvidence(
-            is_alive=False,
+            is_alive=True,
             is_indeterminate=False,
-            reason="missing_or_invalid_pid",
-            pid_exists=False,
-            stat_start_time_match=False,
-            ctime_match=False,
+            reason=f"lease_alive:{state_reason}",
+            pid_exists=True,
+            stat_start_time_match=True,
+            ctime_match=True,
         )
-
-    pid_exists = _pid_exists(pid)
-
-    # Read /proc/<pid>/stat start_time and ctime from live process.
-    if not pid_exists:
-        return LivenessEvidence(
-            is_alive=False,
-            is_indeterminate=False,
-            reason="pid_does_not_exist",
-            pid_exists=False,
-            stat_start_time_match=False,
-            ctime_match=False,
-        )
-
-    # PID exists. Now check process-start evidence.
-    actual_evidence = capture_process_start_evidence(pid=pid)
-    if actual_evidence is None or actual_evidence["source"] != "linux_proc":
-        # We can't read /proc — fail closed.
+    if state_indeterminate:
         return LivenessEvidence(
             is_alive=False,
             is_indeterminate=True,
-            reason=f"proc_unreadable_for_pid_{pid}",
-            pid_exists=True,
+            reason=f"indeterminate:{state_reason}",
+            pid_exists=False,
             stat_start_time_match=False,
             ctime_match=False,
         )
 
-    recorded_evidence = lock.get("owner_start_evidence", {}) or {}
-    if recorded_evidence is None:
-        recorded_evidence = {}
+    # State evidence says stale. Confirm with process-based evidence
+    # to ensure we're not just seeing a transient state-file gap.
+    pid = lock.get("owner_pid")
+    if isinstance(pid, int) and pid > 0 and _pid_exists(pid):
+        actual_evidence = capture_process_start_evidence(pid=pid)
+        if actual_evidence is None or actual_evidence["source"] != "linux_proc":
+            return LivenessEvidence(
+                is_alive=False,
+                is_indeterminate=False,
+                reason=f"state_stale:pid_alive_but_proc_unreadable:{state_reason}",
+                pid_exists=True,
+                stat_start_time_match=False,
+                ctime_match=False,
+            )
+        recorded_evidence = lock.get("owner_start_evidence", {}) or {}
+        if recorded_evidence is None:
+            recorded_evidence = {}
 
-    stat_match = False
-    if (
-        recorded_evidence.get("stat_start_time") is not None
-        and actual_evidence.get("stat_start_time") is not None
-    ):
-        stat_match = int(recorded_evidence["stat_start_time"]) == int(
-            actual_evidence["stat_start_time"]
+        stat_match = False
+        if (
+            recorded_evidence.get("stat_start_time") is not None
+            and actual_evidence.get("stat_start_time") is not None
+        ):
+            stat_match = int(recorded_evidence["stat_start_time"]) == int(
+                actual_evidence["stat_start_time"]
+            )
+
+        ctime_match = _ctime_within_tolerance(
+            actual_evidence.get("ctime_ns"),
+            recorded_evidence.get("ctime_ns"),
         )
 
-    ctime_match = _ctime_within_tolerance(
-        actual_evidence.get("ctime_ns"),
-        recorded_evidence.get("ctime_ns"),
-    )
+        if stat_match or ctime_match:
+            # PID alive + start evidence matches: the original
+            # bootstrap process is still running, even though the
+            # state file looks stale. Treat as alive (transient
+            # state-file gap).
+            return LivenessEvidence(
+                is_alive=True,
+                is_indeterminate=False,
+                reason="lease_alive_via_pid_evidence",
+                pid_exists=True,
+                stat_start_time_match=stat_match,
+                ctime_match=ctime_match,
+            )
 
-    is_alive = bool(stat_match or ctime_match)
-    reason = "ok" if is_alive else "start_evidence_mismatch_pid_reuse"
-
+    # Stale.
     return LivenessEvidence(
-        is_alive=is_alive,
+        is_alive=False,
         is_indeterminate=False,
-        reason=reason,
-        pid_exists=True,
-        stat_start_time_match=stat_match,
-        ctime_match=ctime_match,
+        reason=f"stale:{state_reason}",
+        pid_exists=False,
+        stat_start_time_match=False,
+        ctime_match=False,
     )
+
+
+def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optional[int]:
+    """Acquire an exclusive sentinel file descriptor with OS-managed
+    release-on-close semantics.
+
+    Uses fcntl.flock with LOCK_EX|LOCK_NB so the sentinel is held by
+    the kernel and released automatically when the process exits
+    (or the file descriptor is closed). This survives crashes that
+    leave the file on disk but releases the kernel lock.
+
+    Returns the file descriptor on success, or None on timeout.
+    """
+    import fcntl
+    try:
+        fd = os.open(
+            str(sentinel_path),
+            os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC,
+            0o600,
+        )
+    except FileExistsError:
+        # The sentinel file exists from a prior process; try to open
+        # it for write (without O_EXCL) and flock it. If flock fails
+        # with EWOULDBLOCK, another live process holds it.
+        try:
+            fd = os.open(
+                str(sentinel_path),
+                os.O_WRONLY | os.O_CLOEXEC,
+            )
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    # We just created the sentinel. Lock it.
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        try:
+            os.unlink(sentinel_path)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:
+    """Release the sentinel file descriptor and remove the file."""
+    import fcntl
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(sentinel_path)
+    except OSError:
+        pass
 
 
 def try_acquire(
@@ -235,6 +376,7 @@ def try_acquire(
     owner_host: dict,
     owner_pid: int,
     owner_start_evidence: dict,
+    owner_state_path: Optional[str] = None,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     base_dir: Optional[Path] = None,
 ) -> LockOutcome:
@@ -244,10 +386,10 @@ def try_acquire(
     On success: writes a fresh lock file and returns ok=True.
     On conflict: returns ok=False with the existing owner and a clear reason.
 
-    The "freshness" check distinguishes the live case (PID exists AND
-    evidence matches) from the stale case (no PID, or PID reused).
-    Indeterminate liveness FAILS CLOSED (returns ok=False with
-    indeterminate=True and reason="indeterminate_liveness").
+    The "freshness" check is lease-based (state file mtime + run_id
+    evidence) with a process-evidence fallback. Indeterminate
+    liveness FAILS CLOSED (returns ok=False with indeterminate=True
+    and reason="indeterminate_liveness").
     """
     scope_key = build_scope_key(
         repository=scope["repository"],
@@ -257,15 +399,19 @@ def try_acquire(
     path = lock_path_for(scope_key, base_dir=base_dir)
 
     # Build the candidate lock payload.
+    now_iso = _utcnow()
     payload = {
         "lock_version": LOCK_VERSION,
+        "lock_version_chain": 1,
         "scope_key": scope_key,
         "scope": scope,
         "owner_run_id": owner_run_id,
         "owner_host": owner_host,
         "owner_pid": owner_pid,
+        "owner_state_path": owner_state_path,
         "owner_start_evidence": owner_start_evidence,
-        "created_at": _utcnow(),
+        "created_at": now_iso,
+        "last_renewed_at": now_iso,
         "max_age_seconds": int(max_age_seconds),
         "recovery_history": [],
     }
@@ -384,18 +530,14 @@ def recover_stale(
             reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
         )
 
-    # Strict CAS: acquire an exclusive sentinel file lock. The
-    # first contender to acquire the sentinel wins the recovery
-    # race. Subsequent contenders see FileExistsError.
-    try:
-        sentinel_fd = os.open(
-            str(sentinel_path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-            0o600,
-        )
-    except FileExistsError:
-        # Another worker is already performing recovery. Re-read the
-        # lock to report the current owner.
+    # Strict CAS: acquire an exclusive sentinel file lock using
+    # fcntl.flock so the sentinel self-releases on process death.
+    # The first contender to acquire the sentinel wins the
+    # recovery race. Subsequent contenders see EWOULDBLOCK.
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path)
+    if sentinel_fd is None:
+        # Another worker is already performing recovery. Re-read
+        # the lock to report the current owner.
         current = _read_lock(path)
         return LockOutcome(
             ok=False, path=path, owner=current,
@@ -418,6 +560,7 @@ def recover_stale(
             )
 
         observed_version = existing2.get("lock_version_chain", 0) + 1
+        now_iso = _utcnow()
         new_payload = {
             "lock_version": LOCK_VERSION,
             "lock_version_chain": observed_version,
@@ -426,8 +569,10 @@ def recover_stale(
             "owner_run_id": recovered_by_run_id,
             "owner_host": recovered_by_host,
             "owner_pid": recovered_by_pid,
+            "owner_state_path": existing2.get("owner_state_path"),
             "owner_start_evidence": recovered_by_start_evidence,
-            "created_at": _utcnow(),
+            "created_at": now_iso,
+            "last_renewed_at": now_iso,
             "max_age_seconds": int(max_age_seconds),
             "observed_predecessor_owner_run_id": existing2.get("owner_run_id"),
             "observed_predecessor_version": existing2.get("lock_version_chain", 0),
@@ -465,14 +610,7 @@ def recover_stale(
             reason=f"recovered_from:{existing2.get('owner_run_id')}",
         )
     finally:
-        try:
-            os.close(sentinel_fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(sentinel_path)
-        except OSError:
-            pass
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) -> bool:

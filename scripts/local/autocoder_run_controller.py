@@ -581,6 +581,7 @@ def _init(args: argparse.Namespace) -> None:
             owner_host=host_identity,
             owner_pid=owner_pid,
             owner_start_evidence=owner_start_evidence,
+            owner_state_path=out_path,
             base_dir=lock_base,
         )
         if not lock_outcome.ok:
@@ -614,6 +615,14 @@ def _init(args: argparse.Namespace) -> None:
         pending_action=str(state["next_action"]["action"]),
         merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
     )
+    # Round-120 P1 fix (round 2): persist mutation_target in the run
+    # identity so _state_mutation_target returns the value used to
+    # acquire the lock. capture_run_identity doesn't accept
+    # mutation_target because it's not always present, so we set it
+    # explicitly here.
+    mutation_target_arg = getattr(args, "mutation_target", None)
+    if mutation_target_arg:
+        run_identity["mutation_target"] = mutation_target_arg
     # Overlay host/proc evidence (already captured by capture_run_identity).
     run_identity["host"] = host_identity
     run_identity["process"] = proc_evidence
@@ -2621,6 +2630,18 @@ def _state_mutation_target(state: dict) -> Optional[str]:
 
 def _authorize_mutation(args: argparse.Namespace) -> None:
     state = _load_state(args.state)
+    # Round-120 P2 fix: validate that the caller's --workspace
+    # matches the workspace recorded in the state file. A path
+    # mix-up could authorize a mutation to a journal the
+    # finalization gate never sees.
+    state_workspace = state.get("workspace")
+    if state_workspace and str(Path(args.workspace).resolve()) != str(Path(state_workspace).resolve()):
+        print(
+            f"ERROR: workspace mismatch: --workspace={args.workspace} "
+            f"does not match state.workspace={state_workspace}",
+            file=sys.stderr,
+        )
+        sys.exit(9)
     repository = _state_repository(state) or args.workspace
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),

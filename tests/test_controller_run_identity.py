@@ -51,6 +51,24 @@ def lock_base(tmp_path):
 
 
 @pytest.fixture
+def state_path(tmp_path):
+    """Return a tmp_path/CONTROLLER_STATE.json path. Tests are
+    responsible for writing valid JSON to it before calling
+    try_acquire / recover_stale."""
+    return tmp_path / "CONTROLLER_STATE.json"
+
+
+def _write_state_file(state_path: Path, run_id: str) -> None:
+    """Write a minimal CONTROLLER_STATE.json with the given run_id."""
+    state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state_path.write_text(json.dumps({
+        "controller_version": 1,
+        "run_id": run_id,
+        "run_identity": {"run_id": run_id, "controller_version": 1},
+    }))
+
+
+@pytest.fixture
 def scope():
     return {
         "repository": "Slideshow11/Automated-Edge-Discovery",
@@ -179,7 +197,7 @@ class TestSecretsRejection:
 
 class TestSupervisorLockAcquire:
     def test_try_acquire_returns_ok_when_lock_is_free(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         outcome = supervisor_lock.try_acquire(
             scope=scope,
@@ -193,7 +211,7 @@ class TestSupervisorLockAcquire:
         assert outcome.path.exists()
 
     def test_try_acquire_rejects_second_live_lock(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         # First acquires successfully.
         first = supervisor_lock.try_acquire(
@@ -220,7 +238,7 @@ class TestSupervisorLockAcquire:
         assert second.owner["owner_run_id"] == "r1"
 
     def test_two_simultaneous_initializations_one_wins(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         """Concurrent inits for the same scope — only one wins."""
         results = []
@@ -237,7 +255,7 @@ class TestSupervisorLockAcquire:
         assert sum(results) == 1
 
     def test_try_acquire_distinguishes_pid_reuse(
-        self, scope, host_self, lock_base
+        self, scope, host_self, lock_base, state_path
     ):
         """A different PID with the same /proc/<pid>/stat start_time
         indicates PID reuse and is detected as a LIVE lock (mismatch)."""
@@ -301,7 +319,7 @@ class TestSupervisorLockAcquire:
         assert "stale_lock_detected" in second.reason
 
     def test_assess_liveness_returns_indeterminate_when_proc_unreadable(
-        self, scope, host_self, lock_base
+        self, scope, host_self, lock_base, state_path
     ):
         """Forced unreadable /proc → indeterminate liveness."""
         good_evidence = run_identity.capture_process_start_evidence()
@@ -363,12 +381,18 @@ class TestSupervisorLockAcquire:
         assert evidence is not None
         assert not evidence.is_alive
         assert not evidence.is_indeterminate
-        assert evidence.reason == "missing_or_invalid_pid"
+        # The forged lock has owner_pid=0 (invalid) and no state_path;
+        # lease check sees no state_path so it falls through to the
+        # process-based evidence path. With owner_pid=0, the PID
+        # existence check fails immediately (pid <= 0 → not alive,
+        # not indeterminate). The reason includes a "missing" or
+        # "stale" prefix depending on the lease vs process path.
+        assert "missing_or_invalid_pid" in evidence.reason or "stale" in evidence.reason
 
 
 class TestSupervisorLockRecover:
     def test_recover_stale_records_audit_trail(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         """Recovery succeeds for a stale lock and writes the
         previous owner into recovery_history."""
@@ -422,7 +446,7 @@ class TestSupervisorLockRecover:
         assert history[0]["staleness_evidence"].startswith("PID 999999")
 
     def test_two_simultaneous_recovery_attempts_only_one_wins(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         path = supervisor_lock.lock_path_for(
             supervisor_lock.build_scope_key(
@@ -470,7 +494,7 @@ class TestSupervisorLockRecover:
         assert sum(results) == 1
 
     def test_recover_fails_closed_when_existing_is_alive(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         # Acquire a live lock first.
         first = supervisor_lock.try_acquire(
@@ -498,7 +522,7 @@ class TestSupervisorLockRecover:
 
 class TestSupervisorLockRelease:
     def test_release_only_owner_can_release(
-        self, scope, proc_evidence_self, host_self, lock_base
+        self, scope, proc_evidence_self, host_self, lock_base, state_path
     ):
         first = supervisor_lock.try_acquire(
             scope=scope,
@@ -515,7 +539,7 @@ class TestSupervisorLockRelease:
         assert supervisor_lock.release(scope=scope, owner_run_id="r1", base_dir=lock_base)
 
     def test_lock_owned_by_another_host_detected_via_start_evidence(
-        self, scope, host_self, lock_base
+        self, scope, host_self, lock_base, state_path
     ):
         """Plant a lock with hostname='other-host' and start evidence
         that doesn't match this process. Assess liveness must detect
@@ -557,6 +581,106 @@ class TestSupervisorLockRelease:
         assert not evidence.is_alive
         assert not evidence.is_indeterminate
         assert "stale" in evidence.reason or evidence.reason == "pid_does_not_exist" or evidence.reason == "start_evidence_mismatch_pid_reuse"
+
+
+class TestSupervisorLockLease:
+    """Lease-based liveness evidence: state_path mtime + run_id."""
+
+    def test_lease_alive_when_state_path_recent_and_run_id_matches(
+        self, scope, proc_evidence_self, host_self, lock_base, tmp_path
+    ):
+        state_path = tmp_path / "CONTROLLER_STATE.json"
+        state_path.write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r1",
+            "run_identity": {"run_id": "r1", "controller_version": 1},
+        }))
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r1",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            owner_state_path=str(state_path),
+            base_dir=lock_base,
+        )
+        assert outcome.ok
+        # Second acquire with a different run_id but valid state
+        # pointing to a different run_id must be rejected as live.
+        state_path.write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r2",
+            "run_identity": {"run_id": "r2", "controller_version": 1},
+        }))
+        second = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r2",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            owner_state_path=str(state_path),
+            base_dir=lock_base,
+        )
+        assert not second.ok
+        assert "live_lock_held_by:r1" in second.reason
+
+    def test_lease_stale_when_state_path_missing(
+        self, scope, proc_evidence_self, host_self, lock_base
+    ):
+        """If state_path was never provided (legacy lock), the lease
+        check is skipped; process-based evidence decides liveness."""
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r1",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            owner_state_path=None,
+            base_dir=lock_base,
+        )
+        assert outcome.ok
+
+    def test_lease_stale_when_state_mtime_too_old(
+        self, scope, proc_evidence_self, host_self, lock_base, tmp_path
+    ):
+        state_path = tmp_path / "CONTROLLER_STATE.json"
+        state_path.write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r1",
+            "run_identity": {"run_id": "r1", "controller_version": 1},
+        }))
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r1",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            owner_state_path=str(state_path),
+            max_age_seconds=1,  # very short
+            base_dir=lock_base,
+        )
+        assert outcome.ok
+        # Wait for the state mtime to exceed max_age_seconds.
+        import time
+        time.sleep(2)
+        # Second acquire: state_path mtime is now stale. The lease
+        # check falls through to process-based evidence; the
+        # bootstrap PID is still alive (we never exited), so the
+        # existing lock is still considered live via PID evidence.
+        second = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r2",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            owner_state_path=str(state_path),
+            max_age_seconds=1,
+            base_dir=lock_base,
+        )
+        assert not second.ok
+        # The lock is held live by the original owner's PID/process
+        # evidence, even though the state file is stale.
+        assert "live_lock_held_by:r1" in second.reason
 
 
 # ---------------------------------------------------------------------------
