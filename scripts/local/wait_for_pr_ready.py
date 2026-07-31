@@ -25,11 +25,16 @@ Usage (one-shot mode — --once):
         --output-json /tmp/aed_runs/pr336_wait/status.json \
         --output-md /tmp/aed_runs/pr336_wait/status.md
 
-When --once is supplied, the waiter performs a single complete readiness
-evaluation (one gh pr checks pass, one review-comment gate run, one PMG
-compare if requested, one final_gate_status run if requested) and writes
-the same JSON and Markdown reports as the polling mode. It then exits
-without sleeping, polling, or starting another evaluation cycle.
+When --once is supplied, the waiter disables CI polling and time.sleep
+between evaluation cycles. It performs exactly one gh pr checks evaluation
+and proceeds through the remaining gates once, writing the same JSON and
+Markdown reports as polling mode, then exits.
+
+--once does NOT bound wall-clock time on the single pass: gh_run and
+run_external_script have no subprocess timeouts, and main() may make
+additional gh calls (PR state, head re-check, base branch, branch
+protection) plus any configured gate subprocess invocations.
+
 timeout-minutes and poll-seconds are ignored under --once.
 
 Exit codes:
@@ -1031,9 +1036,13 @@ def main() -> int:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Perform exactly one complete readiness evaluation and exit. "
+        help="Disable CI polling and time.sleep between evaluation cycles. "
+             "Performs exactly one gh pr checks evaluation and proceeds "
+             "through the remaining gates once, then exits. "
              "timeout-minutes and poll-seconds are ignored. "
-             "Produces the same JSON and Markdown reports as polling mode.",
+             "Produces the same JSON and Markdown reports as polling mode. "
+             "Does NOT bound wall-clock time on the single pass — "
+             "gh_run and run_external_script have no subprocess timeouts.",
     )
     parser.add_argument("--require-review-comments-clean", action="store_true", help="Run review-comment gate after CI green")
     parser.add_argument("--require-pmg", action="store_true", help="Run PMG compare")

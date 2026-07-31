@@ -43,18 +43,28 @@ python3 scripts/local/wait_for_pr_ready.py \
   --output-md /tmp/aed_runs/pr335_wait/status.md
 ```
 
-When `--once` is supplied, the waiter performs exactly one complete readiness
-evaluation (one `gh pr checks` pass, one review-comment gate run, one PMG
-compare if requested, one `final_gate_status` run if requested) and writes the
-same JSON and Markdown reports as polling mode. It then exits without
-sleeping, polling, or starting another evaluation cycle.
+When `--once` is supplied, the waiter disables CI polling and `time.sleep`
+between evaluation cycles. It performs exactly one CI checks evaluation
+(one `gh pr checks` call) and proceeds through the remaining gates once,
+writing the same JSON and Markdown reports as polling mode, then exits.
 
-`timeout-minutes` and `poll-seconds` are ignored under `--once` — the
-evaluation is bounded by a single `gh pr checks` network round-trip.
+`timeout-minutes` and `poll-seconds` are ignored under `--once`.
 
-The `once_mode` field is written into the JSON report (`true`/`false`) and
-into the Markdown Summary section so operators can confirm which mode was used
-without re-reading the invocation.
+Note: `--once` does **not** promise that the evaluation is bounded by a
+single network round-trip. `main()` always calls `get_pr_state()` before
+`poll_ci_checks_once()`, and an all-green result triggers additional
+calls for head SHA re-check, base branch, and branch protection, plus
+any configured gate subprocess invocations (`check_pr_review_comments.py`,
+`check_persistent_mutation_guard.py`, `final_gate_status.py`,
+`verify_final_head_merge_command.py`). Neither `gh_run()` nor
+`run_external_script()` sets a subprocess timeout, so any of these calls
+can in principle block for as long as the underlying process takes. What
+`--once` guarantees is the absence of polling and sleep between cycles —
+not a wall-clock bound on the single pass.
+
+The `once_mode` field is written into the JSON report (`true`/`false`)
+and into the Markdown Summary section so operators can confirm which mode
+was used without re-reading the invocation.
 
 CI outcome mapping under `--once`:
 
@@ -64,8 +74,8 @@ CI outcome mapping under `--once`:
 | Any required check `pending`/`queued`/`in_progress` (or absent from list) | `HOLD_CI_PENDING` |
 | Any required check `failure`/`cancelled`/`skipped`/`timed_out` | `HOLD_CI_FAILED` |
 
-`HOLD_TIMEOUT` is never produced under `--once` because there is no deadline
-pressure on a single-pass evaluation.
+`HOLD_TIMEOUT` is never produced under `--once` because there is no
+deadline pressure on a single-pass evaluation.
 
 ## Arguments
 
