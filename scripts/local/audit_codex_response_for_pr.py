@@ -1058,7 +1058,6 @@ def _fetch_review_inline_comments_with_pr(
 # inline first-page-only GraphQL query.
 # ---------------------------------------------------------------------------
 
-
 def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, timeout: int) -> dict:
     """Round-70 PHASE 3-P2: follow nested ``comments(after: <cursor>)`` for every
     thread whose initial comments(first:50) returned
@@ -1068,6 +1067,7 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
     builders expect (Round-69 ``comments`` key).
 
     Returns::
+
       {
         "complete": bool,
         "pages": int,
@@ -1079,8 +1079,21 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
     Fail closed on:
       - missing or non-importable helper;
       - any thread fetch returning ok=False;
-      - safety cap exceeded while following nested cursors;
+      - per-thread safety cap exceeded while following nested cursors;
+      - aggregate pages exceeding the operator cap across all threads;
       - paginate_nested_comments returning complete=False.
+
+    Round-106 follow-up (VUIvY / PRRT_kwDOSHFpYM6VUIvY): the
+    previous implementation passed the full ``safety_cap`` to
+    each per-thread call and only accumulated ``pages_total``
+    without checking it. 31 threads with one additional page
+    each returned ``complete=True`` while carrying
+    ``thread_count × safety_cap`` comments. The fix enforces a
+    separate AGGREGATE pages bound equal to ``safety_cap`` so
+    the audit's runtime and memory bound cannot be defeated by
+    splitting the inventory across many threads. When the
+    aggregate ``pages_total`` crosses the cap, the helper
+    breaks early and returns ``capped=True, complete=False``.
     """
     try:
         from scripts.local._shared_pagination import paginate_nested_comments
@@ -1131,6 +1144,19 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
             initial_cursor=nested_cursor,
         )
         pages_total += int(result.get("pages", 0) or 0)
+        # Round-106 follow-up (VUIvY): bound the aggregate
+        # pagination across all threads. A failure loop
+        # with cap-crossing must surface as capped=True,
+        # complete=False rather than the per-thread-only
+        # ``safety_cap`` semantics.
+        if pages_total >= safety_cap:
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": True,
+                "error": "aggregate_pages_cap_exceeded",
+                "fetched_comments_by_thread_id": fetched,
+            }
         if not result.get("complete"):
             return {
                 "complete": False,

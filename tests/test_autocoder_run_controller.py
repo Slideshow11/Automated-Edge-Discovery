@@ -2717,3 +2717,77 @@ def test_r104_repair_result_runner_exception_marks_event_failed(
         "Round-104: findings_count MUST NOT be zeroed on "
         f"the exception path; got {codex.get('findings_count')!r}"
     )
+
+
+def test_r106_record_codex_review_guards_plan_dir_creation(
+    monkeypatch, tmp_path
+):
+    """Round-106 follow-up (VUIvd / PRRT_kwDOSHFpYM6VUIvd):
+    when ``<state-parent>/plans`` cannot be created (because
+    that path exists as a regular file or the parent is
+    read-only), ``record-codex-review --status findings`` MUST
+    fail closed with ``next_action = request_human`` and reason
+    ``repair_planning_failed:plan_dir_create_failed`` rather
+    than crashing with an unguarded OSError.
+    """
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {
+            "finding_id": "PF1", "severity": "P2",
+            "subsystem": "autocoder", "root_cause": "test",
+            "path": "scripts/local/autocoder_run_controller.py",
+            "summary": "plan-dir guard test",
+        },
+    ]))
+
+    # Block plan_dir.mkdir() by pre-creating ``plans`` as a
+    # regular file at the same level. The controller's mkdir
+    # call would otherwise succeed; the pre-existing file
+    # forces OSError because ``exist_ok`` does not allow a
+    # file already present at the path.
+    plans_blocker = tmp_path / "plans"
+    plans_blocker.write_text("not a directory")
+
+    rc = controller_main([
+        "record-codex-review",
+        "--state", state_path,
+        "--status", "findings",
+        "--head-sha", "deadbeef00000000000000000000000000000000",
+        "--findings-file", str(findings_file),
+    ])
+    # The CLI exits 0 (fail-closed via next_action) rather
+    # than propagating the OSError.
+    assert rc in (0, 1, 2), (
+        "Round-106 (VUIvd): the CLI must not propagate the "
+        f"OSError; got rc={rc}"
+    )
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # The plan dir create failure must have been recorded
+    # somewhere in state. The fail-closed outer branch sets
+    # ``codex['repair_plan_error']`` to either the mkdir
+    # error (``plan_dir_create_failed``) or the planner
+    # rejection (``planner_failed:plan_dir_unavailable``)
+    # depending on which write attempt the controller reached.
+    # Either signal is acceptable evidence of fail-closed.
+    err = codex.get("repair_plan_error", "")
+    assert (
+        err.startswith("plan_dir_create_failed")
+        or "plan_dir_unavailable" in err
+    ), (
+        "Round-106 (VUIvd): repair_plan_error MUST record "
+        f"the plan-dir failure; got {err!r}"
+    )
+    next_action = state.get("next_action", {})
+    assert (
+        "repair_planning_failed" in next_action.get("reason", "")
+        or "plan_dir_create_failed" in next_action.get("reason", "")
+        or "plan_dir_unavailable" in next_action.get("reason", "")
+    ), (
+        "Round-106 (VUIvd): next_action MUST be fail-closed "
+        f"repair_planning_failed; got {next_action!r}"
+    )

@@ -991,11 +991,45 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                                     Path(str(args.state)).parent
                                     / "plans"
                                 )
-                                plan_dir.mkdir(parents=True, exist_ok=True)
-                                plan_path = (
-                                    plan_dir
-                                    / f"repair-plan-{int(time.time())}.json"
-                                )
+                                # Round-106 follow-up (VUIvd /
+                                # PRRT_kwDOSHFpYM6VUIvd): when
+                                # ``<state-parent>/plans`` cannot
+                                # be created — because that path
+                                # already exists as a regular
+                                # file or the directory is
+                                # read-only — this unguarded
+                                # ``mkdir`` raises before the
+                                # planner and persistence
+                                # handlers run. The Round-101
+                                # guard on the
+                                # ``<state.parent>/validations``
+                                # path was applied only to
+                                # ``record-codex-repair-result``;
+                                # the equivalent for plans was
+                                # missing. The fix wraps
+                                # ``plan_dir.mkdir`` in
+                                # try/except and routes the
+                                # failure through the same
+                                # ``repair_planning_failed``
+                                # transition path so the
+                                # controller fails closed with
+                                # ``next_action = request_human``
+                                # instead of crashing.
+                                try:
+                                    plan_dir.mkdir(
+                                        parents=True, exist_ok=True
+                                    )
+                                except OSError as exc:
+                                    planner_error = (
+                                        f"plan_dir_create_failed:"
+                                        f"{type(exc).__name__}"
+                                    )
+                                    plan_path = None
+                                else:
+                                    plan_path = (
+                                        plan_dir
+                                        / f"repair-plan-{int(time.time())}.json"
+                                    )
                                 try:
                                     plan = seam["planner_call"](
                                         findings=findings_data,
@@ -1009,32 +1043,46 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                                         f"{type(exc).__name__}"
                                     )
                                 else:
-                                    try:
-                                        with open(plan_path, "w") as _pfh:
-                                            json.dump(plan, _pfh, indent=2)
-                                    except OSError as exc:
+                                    # Round-106 follow-up (VUIvd):
+                                    # the planner-side mkdir
+                                    # failure already set
+                                    # ``plan_path = None`` and
+                                    # ``planner_error``. Skip the
+                                    # open() block when there's
+                                    # no path to write to; the
+                                    # outer plan_error handler
+                                    # below catches both kinds.
+                                    if plan_path is None:
                                         plan_error = (
-                                            f"plan_persist_failed:"
-                                            f"{type(exc).__name__}"
+                                            f"planner_failed:plan_dir_unavailable"
                                         )
                                     else:
-                                        plan_persisted = True
-                                        codex[
-                                            "repair_plan_path"
-                                        ] = str(plan_path)
-                                        codex[
-                                            "repair_plan_generated_at"
-                                        ] = _utcnow()
-                                        codex[
-                                            "repair_plan_finding_count"
-                                        ] = plan.get(
-                                            "finding_count", 0
-                                        )
-                                        codex[
-                                            "repair_plan_batch_count"
-                                        ] = plan.get(
-                                            "batch_count", 0
-                                        )
+                                        try:
+                                            with open(plan_path, "w") as _pfh:
+                                                json.dump(plan, _pfh, indent=2)
+                                        except OSError as exc:
+                                            plan_error = (
+                                                f"plan_persist_failed:"
+                                                f"{type(exc).__name__}"
+                                            )
+                                        else:
+                                            plan_persisted = True
+                                            codex[
+                                                "repair_plan_path"
+                                            ] = str(plan_path)
+                                            codex[
+                                                "repair_plan_generated_at"
+                                            ] = _utcnow()
+                                            codex[
+                                                "repair_plan_finding_count"
+                                            ] = plan.get(
+                                                "finding_count", 0
+                                            )
+                                            codex[
+                                                "repair_plan_batch_count"
+                                            ] = plan.get(
+                                                "batch_count", 0
+                                            )
 
             if plan_error:
                 # Fail closed: do NOT silently advance to

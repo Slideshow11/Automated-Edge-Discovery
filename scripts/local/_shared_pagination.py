@@ -742,19 +742,34 @@ query($threadId: ID!, $first: Int!, $after: String) {
             # terminal page returns ``complete=True,
             # capped=False``. Apply the same cap-aware
             # truncation the other paginators use.
+            #
+            # Round-106 follow-up (VUIvZ): the previous
+            # implementation unconditionally set
+            # ``capped=True`` whenever ``len(nodes) >=
+            # safety_cap`` at any iteration, even when the
+            # final page brought ``nodes`` to exactly the cap
+            # and reported ``hasNextPage=False``. A terminal
+            # page that exactly fills the cap is COMPLETE; the
+            # audit must NOT mark it incomplete and must NOT
+            # record a ``safety_cap_reached`` error. The fix:
+            # inspect ``has_next`` (computed from the
+            # ``pageInfo`` block below) after the in-loop
+            # truncation and only flag ``capped=True`` when
+            # another page remains to be read.
             if len(nodes) >= safety_cap:
                 # Already at the cap. The ``page_nodes`` loop
                 # above is a no-op, so we skip directly to
                 # the cap-break below.
                 break
-            nodes.append(n)
-            if len(nodes) >= safety_cap:
-                # Cap reached exactly on this iteration.
-                # The next page would over-cap; mark
-                # ``capped=True`` and break immediately.
-                capped = True
-                error = "safety_cap_reached"
+            # If accepting this record would cross the cap
+            # above ``safety_cap``, truncate to the cap and
+            # break. Only mark capped if has_next is true on
+            # the page; a terminal page that exactly fills
+            # the cap is a complete bounded inventory.
+            if len(nodes) + 1 > safety_cap:
+                # Would over-cap; abort.
                 break
+            nodes.append(n)
 
         page_info = comments_obj.get("pageInfo") or {}
         if not isinstance(page_info, dict):
@@ -766,6 +781,18 @@ query($threadId: ID!, $first: Int!, $after: String) {
                 "error": "malformed_pageInfo",
             }
         has_next = bool(page_info.get("hasNextPage", False))
+        # Round-106 follow-up (VUIvZ): if this terminal page
+        # brought the inventory to exactly ``safety_cap``
+        # records but ``has_next`` is False, the inventory
+        # is a complete bounded paginator result. The
+        # ``complete=True`` final return must NOT depend on a
+        # ``safety_cap_reached`` error.
+        if (
+            len(nodes) >= safety_cap
+            and not has_next
+        ):
+            # Cap exactly filled; record is COMPLETE.
+            pass
         next_cursor = page_info.get("endCursor")
         if has_next:
             if not isinstance(next_cursor, str) or not next_cursor:
@@ -788,6 +815,18 @@ query($threadId: ID!, $first: Int!, $after: String) {
                 }
             last_cursor = next_cursor
             cursor = next_cursor
+            # Round-106 follow-up (VUIvZ): when this page
+            # brought the inventory to exactly ``safety_cap``
+            # records and ``has_next`` is True, more records
+            # exist beyond the cap and the inventory MUST be
+            # reported as ``capped=True, complete=False``.
+            # The previous shape only detected this when
+            # `nodes.append(n)` brought the count above the
+            # cap; a page that filled the cap exactly was
+            # treated as a complete terminal page.
+            if len(nodes) >= safety_cap:
+                capped = True
+                error = "safety_cap_reached"
         else:
             has_next = False
         pages += 1

@@ -11200,3 +11200,61 @@ def test_final_fallback_malformed_non_string_author_does_not_crash(
     # The audit must not be an error status.
     assert pkt["status"] != mod.STATUS_ERROR_TOOL_FAILURE
     assert pkt["status"] != mod.STATUS_ERROR_INVALID_ARGS
+
+
+def test_r106_audit_nested_cap_aggregate(monkeypatch):
+    """Round-106 follow-up (VUIvY / PRRT_kwDOSHFpYM6VUIvY): the
+    audit's nested-pagination follower accepts an inventory
+    split across N threads. The per-thread cap is honored,
+    but the AGGREGATE cap must ALSO fail closed once the sum
+    of pages across threads crosses the operator's bound;
+    otherwise 31 threads with one extra page each return
+    complete=True with up to 31 × safety_cap comments.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _follow_nested_cursor_for_threads,
+    )
+
+    # 31 threads each with a single 1-page nested inventory.
+    thread_nodes = []
+    for i in range(31):
+        thread_nodes.append({
+            "id": f"PRRT_t{i}",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                "nodes": [{"databaseId": 1000 + i}],
+            },
+        })
+    safety_cap = 30
+
+    # Patch the paginator at the source (the audit imports
+    # it from ``scripts.local._shared_pagination`` inside
+    # the function). Monkey-patch the shared module's name.
+    import scripts.local._shared_pagination as pg_mod
+    def fake_paginate(*args, **kwargs):
+        return {
+            "nodes": [{"databaseId": kwargs.get("thread_id", "")}],
+            "pages": 1,  # one page per thread
+            "capped": False,
+            "complete": True,
+        }
+    monkeypatch.setattr(pg_mod, "paginate_nested_comments", fake_paginate)
+    res = _follow_nested_cursor_for_threads(
+        thread_nodes, safety_cap=safety_cap, timeout=30
+    )
+
+    assert res["complete"] is False, (
+        "Round-106 (VUIvY): aggregate pages_total beyond the "
+        "cap MUST surface as complete=False; got "
+        f"complete={res.get('complete')!r}"
+    )
+    assert res["capped"] is True, (
+        "Round-106 (VUIvY): aggregate cross MUST mark "
+        f"capped=True; got capped={res.get('capped')!r}"
+    )
+    assert "aggregate_pages_cap" in res.get("error", "") or (
+        res.get("pages", 0) >= safety_cap
+    ), (
+        "Round-106 (VUIvY): the aggregate cap must be "
+        f"reflected in pages or error; got {res!r}"
+    )

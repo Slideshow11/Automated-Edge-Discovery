@@ -4138,3 +4138,151 @@ def test_r104_classifier_template_with_inline_finding_is_finding():
         "Round-104: a formal review with the finding body MUST "
         f"classify as FINDING. Got {verdict_with_inline!r}"
     )
+
+
+def test_r106_pagination_terminal_page_exact_cap_is_complete():
+    """Round-106 follow-up (VUIvZ): a terminal page that
+    brings the inventory to exactly ``safety_cap`` records and
+    reports ``hasNextPage=False`` is a COMPLETE bounded
+    paginator result. The previous shape flagged any
+    ``len(nodes) >= safety_cap`` as ``capped=True,
+    safety_cap_reached`` regardless of whether the page was
+    terminal.
+    """
+    import json as _json
+    import urllib.request as ur
+    import subprocess as sp
+    from scripts.local import _shared_pagination as pg
+
+    # Mock that returns 3 terminal records, hasNextPage=False,
+    # endCursor empty. With safety_cap=3 this MUST be a complete
+    # bounded paginator result.
+    class FakeResp:
+        def __init__(self):
+            self.payload = _json.dumps({
+                "data": {
+                    "x": {
+                        "nodes": [
+                            {"id": "T1"}, {"id": "T2"}, {"id": "T3"},
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": False,
+                            "endCursor": "",
+                        },
+                    }
+                }
+            }).encode()
+        def read(self):
+            return self.payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(req, timeout=None):
+        return FakeResp()
+
+    def fake_check_output(cmd, *a, **kw):
+        return "fake-token\n"
+
+    original_urlopen = ur.urlopen
+    original_check = sp.check_output
+    ur.urlopen = fake_urlopen
+    sp.check_output = fake_check_output
+    try:
+        res = pg.paginate_graphql_connection(
+            owner="x", name="y", pr_number=1,
+            query="dummy",
+            path=("data", "x"),
+            page_size=10,
+            safety_cap=3,
+        )
+    finally:
+        ur.urlopen = original_urlopen
+        sp.check_output = original_check
+    assert res["complete"] is True, (
+        "Round-106 (VUIvZ): a terminal page that exactly fills "
+        "the cap MUST be reported as complete=True; got "
+        f"{res.get('complete')!r}, error={res.get('error')!r}"
+    )
+    assert res["capped"] is False, (
+        "Round-106 (VUIvZ): a complete bounded inventory MUST "
+        f"have capped=False; got {res.get('capped')!r}"
+    )
+    assert len(res["nodes"]) <= 3, (
+        "Round-106 (VUIvZ): inventory must not exceed cap; "
+        f"got {len(res['nodes'])} records with safety_cap=3"
+    )
+    assert res.get("error") is None, (
+        "Round-106 (VUIvZ): a complete bounded inventory MUST "
+        f"have error=None; got {res.get('error')!r}"
+    )
+
+
+def test_r106_pagination_terminal_page_with_more_pages_is_capped():
+    """Round-106 follow-up (VUIvZ complement): a terminal-style
+    page that brings the inventory to exactly ``safety_cap``
+    records but ``hasNextPage=True`` MUST be reported as
+    ``capped=True, complete=False``. The ``safety_cap_reached``
+    error documents that the cap was crossed and additional
+    records exist beyond the cap.
+    """
+    import json as _json
+    import urllib.request as ur
+    import subprocess as sp
+    from scripts.local import _shared_pagination as pg
+
+    class FakeResp:
+        def __init__(self):
+            self.payload = _json.dumps({
+                "data": {
+                    "x": {
+                        "nodes": [
+                            {"id": f"T{i}"} for i in range(10)
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": True,
+                            "endCursor": "c1",
+                        },
+                    }
+                }
+            }).encode()
+        def read(self):
+            return self.payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(req, timeout=None):
+        return FakeResp()
+
+    def fake_check_output(cmd, *a, **kw):
+        return "fake-token\n"
+
+    original_urlopen = ur.urlopen
+    original_check = sp.check_output
+    ur.urlopen = fake_urlopen
+    sp.check_output = fake_check_output
+    try:
+        res = pg.paginate_graphql_connection(
+            owner="x", name="y", pr_number=1,
+            query="dummy",
+            path=("data", "x"),
+            page_size=10,
+            safety_cap=5,
+        )
+    finally:
+        ur.urlopen = original_urlopen
+        sp.check_output = original_check
+    assert res["complete"] is False, (
+        "Round-106: when a page brings records to exactly the "
+        "cap and another page remains, complete MUST be False."
+    )
+    assert res["capped"] is True, (
+        "Round-106: capped MUST be True when the cap exactly "
+        "filled and hasNextPage=True."
+    )
+    assert len(res["nodes"]) <= 5, (
+        f"Round-106: inventory must not exceed cap; got {len(res['nodes'])}."
+    )
