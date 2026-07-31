@@ -102,6 +102,22 @@ def build_scope_key(*, repository: str, target_pr_number: Optional[int] = None,
     return f"repo:{repository}|run"
 
 
+def _lock_filename_for_scope_key(scope_key: str) -> str:
+    """Compute a collision-free lock filename for a scope key.
+
+    Round-6 P2 fix: simple character replacement (`/`, `:`, `|`
+    → `_`) is not injective. Two valid scope keys such as
+    `repo:a/b|target:feature_x` and `repo:a_b|target:feature|x`
+    both mapped to the same filename, causing unrelated
+    controllers to conflict. Use a SHA-256 hash of the canonical
+    scope key as the lock filename. A hash-based filename is
+    lossless and collision-free for any practical scope.
+    """
+    import hashlib
+    digest = hashlib.sha256(scope_key.encode("utf-8")).hexdigest()
+    return f"{digest}.lock.json"
+
+
 def default_lock_dir(repository: str) -> Path:
     """Default lock directory under $XDG_RUNTIME_DIR or ~/.aed/locks."""
     base = os.environ.get("AED_LOCK_DIR")
@@ -114,11 +130,10 @@ def default_lock_dir(repository: str) -> Path:
 
 
 def lock_path_for(scope_key: str, base_dir: Optional[Path] = None) -> Path:
-    """Safe filename derived from scope_key."""
-    safe = scope_key.replace("/", "_").replace(":", "_").replace("|", "_")
+    """Safe filename derived from scope_key (collision-free via SHA-256)."""
     base = Path(base_dir) if base_dir else default_lock_dir(repository="")
     base.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return base / f"{safe}.lock.json"
+    return base / _lock_filename_for_scope_key(scope_key)
 
 
 def _read_lock(path: Path) -> Optional[dict]:

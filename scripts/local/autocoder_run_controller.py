@@ -655,17 +655,33 @@ def _init(args: argparse.Namespace) -> None:
             merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
         )
     except Exception:
-        # Release the lock we just acquired so the scope is not
-        # permanently blocked by an orphan lease.
+        # P1 fix (round 6): confirm the cleanup release actually
+        # released the lock. release() can return False when the
+        # recovery sentinel is briefly held by another worker;
+        # retry up to 5 times before declaring an orphan lease
+        # and exiting with a non-zero code.
         if lock_to_release_on_failure is not None and scope is not None:
-            try:
-                _supervisor_lock.release(
-                    scope=scope,
-                    owner_run_id=args.run_id,
-                    base_dir=lock_base,
+            released = False
+            for attempt in range(5):
+                try:
+                    released = _supervisor_lock.release(
+                        scope=scope,
+                        owner_run_id=args.run_id,
+                        base_dir=lock_base,
+                    )
+                    if released:
+                        break
+                except Exception:
+                    pass
+                import time as _time
+                _time.sleep(0.05)
+            if not released:
+                print(
+                    "ERROR: init failed and could not release the "
+                    "supervisor lock; the lock may be orphaned. "
+                    "Manual recovery required.",
+                    file=sys.stderr,
                 )
-            except Exception:
-                pass
         raise
 
     # Past this point, the lock is intentionally held for the
@@ -2779,7 +2795,24 @@ def _authorize_mutation(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(12)
-    repository = _state_repository(state) or args.workspace
+    # Round-120 P1 fix (round 6): canonicalize the repository
+    # used in the authorization record. When the state has no
+    # repository, two lexically different --workspace paths
+    # (e.g. /tmp/ws vs /tmp/../tmp/ws) would produce different
+    # duplicate keys, allowing two calls to authorize the same
+    # mutation. Use the state.workspace value, which is
+    # canonicalized at init time.
+    state_workspace_for_repo = state.get("workspace")
+    if rid.get("repository"):
+        repository = rid["repository"]
+    elif state_workspace_for_repo:
+        # Canonical path → the state workspace is the implicit
+        # "repository" scope. This matches the existing fallback
+        # below, but the value is now the canonical absolute path
+        # recorded at init.
+        repository = str(Path(state_workspace_for_repo).resolve())
+    else:
+        repository = args.workspace
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),
         repository=repository,
@@ -2831,9 +2864,20 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
 
 
 def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
+    """Resolve the lock base directory for inspect-lock and
+    recover-stale-lock. The CLI --lock-dir flag is the primary
+    override. When absent, fall back to the lock directory
+    persisted in run_identity.lock_dir (set by init) so that
+    later commands find the same directory the init used.
+    Finally, fall back to None which the supervisor lock
+    module treats as the host-wide default."""
     lock_dir_arg = getattr(args, "lock_dir", None)
     if lock_dir_arg:
         return Path(lock_dir_arg)
+    state = _load_state(getattr(args, "state", ""))
+    rid = state.get("run_identity") or {}
+    if rid.get("lock_dir"):
+        return Path(rid["lock_dir"])
     return None
 
 

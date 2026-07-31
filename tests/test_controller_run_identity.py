@@ -1346,7 +1346,7 @@ class TestControllerStaleLockRecovery:
         # The lock file lives in the host-wide default lock dir
         # (overridden by AED_LOCK_DIR in this test's fixture).
         lock_dir = isolated_lock_dir
-        lock_path = lock_dir / f"{scope_key.replace('/', '_').replace(':', '_').replace('|', '_')}.lock.json"
+        lock_path = lock_dir / supervisor_lock._lock_filename_for_scope_key(scope_key)
         planted = {
             "lock_version": 1,
             "scope_key": scope_key,
