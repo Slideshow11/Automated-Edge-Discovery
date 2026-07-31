@@ -623,14 +623,17 @@ def _evaluate_ci_once(
     raw = result.stdout.strip()
     if not raw:
         # No JSON output from gh: this is a real tool failure (not "checks failed").
-        # For exit 8 (pending) and exit 0 (clean) we shouldn't reach here with empty stdout,
-        # but if we do, treat it as ERROR_TOOLING so the caller sees a structured report.
-        if result.returncode == 0:
-            # Empty stdout + exit 0 means no checks are configured at all — treat as
-            # an empty check list and let the classification path below decide.
-            checks: List[Dict] = []
-        else:
-            return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"gh pr checks returned no JSON (exit {result.returncode}): {result.stderr.strip()}"}, f"empty stdout, exit code {result.returncode}"
+        # Per the documented contract used in scripts/local/aed_pr.py (lines 671-678),
+        # empty stdout is treated as a transport / cancellation / auth failure
+        # regardless of exit code — even when exit 0 happens with no payload, the
+        # authoritative answer (zero checks present) must be JSON `[]`, not empty.
+        # Treating empty stdout as an empty check list would let invocation
+        # failures present as ordinary pending CI under --once.
+        return STATUS_ERROR_TOOLING, {
+            "checks": [],
+            "polled_at": datetime.now(timezone.utc).isoformat(),
+            "error": f"gh pr checks returned no JSON (exit {result.returncode}): {result.stderr.strip()}",
+        }, f"empty stdout, exit code {result.returncode}"
     else:
         try:
             checks = json.loads(raw)

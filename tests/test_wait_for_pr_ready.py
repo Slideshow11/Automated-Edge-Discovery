@@ -3662,3 +3662,67 @@ class TestOnceMode:
             f"Expected HOLD_CI_FAILED with gh exit 1; got {data['status']}: "
             f"{data.get('error_detail')}"
         )
+
+    def test_default_mode_treats_empty_stdout_as_error_tooling(self, output_dir, output_json):
+        """Regression test: empty stdout from gh pr checks must be ERROR_TOOLING,
+        not HOLD_CI_PENDING.
+
+        Per scripts/local/aed_pr.py lines 671-678, empty stdout is the
+        authoritative signature of a transport/cancellation/auth failure. A
+        genuine "no checks configured" response is JSON `[]`, not empty
+        stdout. The waiter must reject empty stdout under both default mode
+        and --once.
+        """
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0  # gh exit 0 but empty stdout — auth failure or transport issue
+            m.stdout = ""
+            m.stderr = "HTTP 401: Bad credentials"
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                # Explicitly leave stdout empty to model transport failure
+                pass
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_ERROR_TOOLING, (
+            f"Empty stdout must be ERROR_TOOLING (not HOLD_CI_PENDING); "
+            f"got {data['status']}: {data.get('error_detail')}"
+        )
+        assert "empty stdout" in data.get("error_detail", "").lower(), (
+            f"error_detail must mention empty stdout; got {data.get('error_detail')}"
+        )
