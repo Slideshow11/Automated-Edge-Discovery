@@ -1394,50 +1394,71 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             # previous shape raised OSError directly, leaving
             # ``state`` unsaved and the operator without an
             # actionable failure record.
+            #
+            # Round-102 follow-up (VRxoP): clearing
+            # ``cleaned_paths`` to empty was insufficient —
+            # the unconditional ``runner_call`` below would
+            # still execute with an empty path list and
+            # undefined ``validation_log_path``, producing a
+            # spurious ``validation_outcome=passed``. The fix
+            # flips a ``skip_runner`` flag so the runner
+            # block is fully bypassed on a directory-creation
+            # failure, and ``validation_log_path`` is left
+            # empty (no artifact exists).
+            skip_runner = False
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
                 validation_error = f"validation_log_dir_error: {type(exc).__name__}: {exc}"
-                cleaned_paths = []  # bail out below
+                skip_runner = True
+                validation_log_path = ""
             else:
                 validation_log_path = str(
                     log_dir / f"validation-{int(time.time())}.json"
                 )
-            seam = _autonomous_repair_seam()
-            try:
-                result = seam["runner_call"](
-                    changed_paths=cleaned_paths,
-                    tier="tier_2_cohesive_batch",
-                    final_candidate=False,
-                    log_path=validation_log_path,
-                )
-            except Exception as exc:
-                validation_error = (
-                    f"runner_failed:{type(exc).__name__}"
-                )
-            else:
-                # Round-71 PHASE 3-P1-B: the production facade
-                # ``run_selected_tests`` returns canonical keys
-                # ``returncode`` / ``duration_seconds`` / ``selected``.
-                # Older alias keys ``return_code`` / ``duration`` /
-                # ``selected_tests`` are read only as backward-compat
-                # fallbacks; the canonical value always wins.
-                def _canonical_int(keys, default=-1):
-                    for k in keys:
-                        v = result.get(k)
-                        if v is not None:
-                            try:
-                                return int(v)
-                            except (TypeError, ValueError):
-                                pass
-                    return default
-                validation_return_code = _canonical_int(
-                    ("returncode", "return_code"), -1
-                )
-                if validation_return_code == 0:
-                    validation_outcome = "passed"
+            if not skip_runner:
+                seam = _autonomous_repair_seam()
+                try:
+                    result = seam["runner_call"](
+                        changed_paths=cleaned_paths,
+                        tier="tier_2_cohesive_batch",
+                        final_candidate=False,
+                        log_path=validation_log_path,
+                    )
+                except Exception as exc:
+                    validation_error = (
+                        f"runner_failed:{type(exc).__name__}"
+                    )
                 else:
-                    validation_outcome = "failed"
+                    # Round-71 PHASE 3-P1-B: the production facade
+                    # ``run_selected_tests`` returns canonical keys
+                    # ``returncode`` / ``duration_seconds`` / ``selected``.
+                    # Older alias keys ``return_code`` / ``duration`` /
+                    # ``selected_tests`` are read only as backward-compat
+                    # fallbacks; the canonical value always wins.
+                    def _canonical_int(keys, default=-1):
+                        for k in keys:
+                            v = result.get(k)
+                            if v is not None:
+                                try:
+                                    return int(v)
+                                except (TypeError, ValueError):
+                                    pass
+                        return default
+                    validation_return_code = _canonical_int(
+                        ("returncode", "return_code"), -1
+                    )
+                    if validation_return_code == 0:
+                        validation_outcome = "passed"
+                    else:
+                        validation_outcome = "failed"
+            else:
+                # Skip path: the runner was not invoked. Mark
+                # the validation as failed so the controller
+                # fails closed rather than claiming a passing
+                # validation without an evidence artifact.
+                validation_outcome = "failed"
+                validation_return_code = -1
 
         codex["last_validation_outcome"] = validation_outcome
         codex["last_validation_log_path"] = validation_log_path
