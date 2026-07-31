@@ -11258,3 +11258,117 @@ def test_r106_audit_nested_cap_aggregate(monkeypatch):
         "Round-106 (VUIvY): the aggregate cap must be "
         f"reflected in pages or error; got {res!r}"
     )
+
+
+def test_r109_audit_nested_fetch_uses_remaining_budget(monkeypatch):
+    """Round-109 follow-up (VUkNY): the audit must hand the
+    next ``paginate_nested_comments`` call the REMAINING
+    aggregate budget, not the full per-thread cap. With 29
+    pages used and a cap of 30, the next call could otherwise
+    fetch another 30 pages before the post-fetch check reports
+    59. The fix passes ``remaining_budget = safety_cap -
+    pages_total`` as the per-call ``safety_cap``.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _follow_nested_cursor_for_threads,
+    )
+    import scripts.local._shared_pagination as pg_mod
+
+    thread_nodes = [
+        {
+            "id": "PRRT_t0",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+                "nodes": [{"databaseId": 100}],
+            },
+        },
+        {
+            "id": "PRRT_t1",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+                "nodes": [{"databaseId": 200}],
+            },
+        },
+    ]
+    safety_cap = 30
+
+    calls = []
+
+    def fake_paginate(*args, **kwargs):
+        calls.append(kwargs)
+        idx = len(calls) - 1
+        # First call simulates 29 pages already consumed
+        # within the per-thread budget; the audit must use
+        # pages_total += 29 here, and on the second call must
+        # pass safety_cap = 30 - 29 = 1 (the remaining budget).
+        # The paginator honors the per-call safety_cap of 1.
+        if idx == 0:
+            return {
+                "nodes": [{"databaseId": 100}],
+                "pages": 29,
+                "capped": False,
+                "complete": True,
+            }
+        if idx == 1:
+            assert kwargs.get("safety_cap") == 1, (
+                "Round-109 (VUkNY): second paginate call MUST "
+                "receive remaining_budget=1, got "
+                f"{kwargs.get('safety_cap')}"
+            )
+            return {
+                "nodes": [{"databaseId": 200}],
+                "pages": 1,  # 29 + 1 = 30, equals cap
+                "capped": False,
+                "complete": True,
+            }
+        # Third call: pre-fetch check has short-circuited
+        # because pages_total=30 >= safety_cap=30.
+        raise AssertionError(
+            "Round-109: third paginate call should not happen; "
+            "the pre-fetch check should short-circuit when the "
+            "remaining_budget is exhausted."
+        )
+
+    monkeypatch.setattr(pg_mod, "paginate_nested_comments", fake_paginate)
+
+    # Patch the THIRD thread to force a third call (which
+    # the audit MUST short-circuit). Actually, with only two
+    # threads and 29+1=30 pages, the next iteration is short-
+    # circuited by the pre-fetch check at pages_total >= cap.
+
+    # Add a third thread to trigger the pre-fetch.
+    thread_nodes.append({
+        "id": "PRRT_t2",
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "c0"},
+            "nodes": [{"databaseId": 300}],
+        },
+    })
+
+    res = _follow_nested_cursor_for_threads(
+        thread_nodes, safety_cap=safety_cap, timeout=30
+    )
+
+    assert len(calls) == 2, (
+        f"Round-109: only the first two paginate calls should "
+        f"run; got {len(calls)} calls"
+    )
+    assert calls[1]["safety_cap"] == 1, (
+        f"Round-109: second paginate call MUST receive "
+        f"remaining_budget=1; got {calls[1].get('safety_cap')}"
+    )
+    assert res["complete"] is False, (
+        "Round-109 (VUkNY): the third thread MUST be "
+        f"fail-closed; got complete={res.get('complete')!r}"
+    )
+    assert res["capped"] is True, (
+        "Round-109: capped MUST be True on cap-exhausted third "
+        f"thread; got capped={res.get('capped')!r}"
+    )
+    assert res.get("error") == "aggregate_pages_cap_exceeded", (
+        "Round-109: error MUST be "
+        f"aggregate_pages_cap_exceeded; got {res.get('error')!r}"
+    )
+    assert res.get("pages") == 30, (
+        f"Round-109: total pages should be 30; got {res.get('pages')}"
+    )
