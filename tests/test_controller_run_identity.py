@@ -682,6 +682,101 @@ class TestSupervisorLockLease:
         # evidence, even though the state file is stale.
         assert "live_lock_held_by:r1" in second.reason
 
+    def test_recovered_lease_bound_to_recovering_state(
+        self, scope, proc_evidence_self, host_self, lock_base, tmp_path
+    ):
+        """recover_stale must store the recovering run's state
+        path, not the predecessor's state path."""
+        # Plant a stale lock with a fake predecessor state path.
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        # Create the predecessor state path with a DIFFERENT run_id
+        # so the lease check sees run_id_mismatch (stale, not live).
+        predecessor_state_path = str(tmp_path / "predecessor.json")
+        Path(predecessor_state_path).write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r-not-the-lock-owner",
+            "run_identity": {"run_id": "r-not-the-lock-owner", "controller_version": 1},
+        }))
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-old",
+            "owner_host": host_self,
+            "owner_pid": 999999,
+            "owner_state_path": predecessor_state_path,
+            "owner_start_evidence": {
+                "pid": 999999,
+                "stat_start_time": 1,
+                "stat_start_time_text": "1",
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 1,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+
+        # Recover with a different (recovering) state path.
+        recovering_state_path = str(tmp_path / "recovering.json")
+        Path(recovering_state_path).write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r-new",
+            "run_identity": {"run_id": "r-new", "controller_version": 1},
+        }))
+        outcome = supervisor_lock.recover_stale(
+            scope=scope,
+            recovered_by_run_id="r-new",
+            recovered_by_host=host_self,
+            recovered_by_pid=proc_evidence_self["pid"],
+            recovered_by_start_evidence=proc_evidence_self,
+            recovered_by_state_path=recovering_state_path,
+            staleness_evidence="PID 999999 dead",
+            base_dir=lock_base,
+        )
+        assert outcome.ok
+        # The recovered lock's owner_state_path must be the
+        # recovering run's path, NOT the predecessor's.
+        assert outcome.owner is not None
+        assert outcome.owner["owner_state_path"] == recovering_state_path
+        assert outcome.owner["owner_state_path"] != predecessor_state_path
+
+
+class TestSentinelInodeStability:
+    """The sentinel file must remain on disk after release; only the
+    flock is released. This prevents a race window where removing
+    the inode lets another worker create a new sentinel at the same
+    path."""
+
+    def test_sentinel_persists_after_release(
+        self, tmp_path
+    ):
+        sentinel_path = tmp_path / "test-sentinel"
+        # Acquire sentinel via the helper.
+        fd = supervisor_lock._acquire_sentinel_fd(sentinel_path, max_attempts=5)
+        assert fd is not None
+        assert sentinel_path.exists()
+        # Release sentinel — file must NOT be unlinked.
+        supervisor_lock._release_sentinel_fd(fd, sentinel_path)
+        assert sentinel_path.exists(), (
+            "sentinel file was unlinked after release; this creates a "
+            "race window where another worker can re-create the sentinel"
+        )
+        # A second acquire of the same sentinel must succeed
+        # (because the file is still there with no flock held).
+        fd2 = supervisor_lock._acquire_sentinel_fd(sentinel_path, max_attempts=5)
+        assert fd2 is not None
+        supervisor_lock._release_sentinel_fd(fd2, sentinel_path)
+
 
 # ---------------------------------------------------------------------------
 # Mutation authorization tests
@@ -1293,3 +1388,81 @@ class TestControllerStaleLockRecovery:
         assert len(payload["recovery_history"]) == 1
         assert payload["recovery_history"][0]["previous_owner_run_id"] == "r-old"
         assert payload["recovery_history"][0]["staleness_evidence"].startswith("PID 999999")
+
+    def test_init_does_not_write_state_when_lock_acquisition_fails(
+        self, tmp_path, isolated_lock_dir
+    ):
+        """If lock acquisition fails, init must NOT leave a
+        CONTROLLER_STATE.json on disk. A competitor must not be able
+        to read a half-initialized state."""
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace1 = tmp_path / "ws1"
+        workspace2 = tmp_path / "ws2"
+        # First init acquires the lock.
+        rc1, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-fail-A",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace1),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "417",
+            "--current-main-sha", "e4ef774",
+        ])
+        assert rc1 == 0
+        # Confirm state file was written.
+        assert (workspace1 / "CONTROLLER_STATE.json").exists()
+        # Second init must fail AND must not leave a state file.
+        rc2, _, err2 = run_controller([
+            "init",
+            "--run-id", "aed-fail-B",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace2),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "417",
+        ])
+        assert rc2 == 2
+        assert not (workspace2 / "CONTROLLER_STATE.json").exists(), (
+            "state file was written despite lock acquisition failure"
+        )
+        assert not (workspace2 / "LAUNCH_RECEIPT.json").exists()
+
+    def test_authorize_rejected_after_run_finalized(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # Inline init helper to avoid pulling in another class.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-mut-life-finalized",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "418",
+            "--current-main-sha", "e4ef774",
+            "--starting-target-sha", "c973fa6c",
+        ])
+        assert rc == 0
+        # Finalize the run.
+        rc, _, _ = run_controller([
+            "finalize-run",
+            "--state", str(workspace / "CONTROLLER_STATE.json"),
+        ])
+        assert rc == 0
+        # Now authorize-mutation must be rejected.
+        rc, _, err = run_controller([
+            "authorize-mutation",
+            "--state", str(workspace / "CONTROLLER_STATE.json"),
+            "--workspace", str(workspace),
+            "--mutation-type", "squash_merge",
+            "--expected-main-sha", "e4ef774",
+            "--expected-target-sha", "c973fa6c",
+            "--pending-action", "merge",
+        ])
+        assert rc == 10
+        assert "not active" in err.lower() or "RUN_COMPLETE" in err

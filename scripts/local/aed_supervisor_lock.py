@@ -351,7 +351,10 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
 
 
 def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:
-    """Release the sentinel file descriptor and remove the file."""
+    """Release the sentinel file descriptor. The sentinel file is
+    left on disk so the next contender can flock it without race
+    windows. The file is removed only by the test cleanup, never
+    on the lock-release path."""
     import fcntl
     if fd is None:
         return
@@ -363,10 +366,11 @@ def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:
         os.close(fd)
     except OSError:
         pass
-    try:
-        os.unlink(sentinel_path)
-    except OSError:
-        pass
+    # Do NOT unlink the sentinel file: removing the inode creates a
+    # race window where another contender could create a new sentinel
+    # at the same path. The sentinel file is a stable inode for the
+    # lifetime of the controller run; it is removed only by `unlink`
+    # in tests or by the user.
 
 
 def try_acquire(
@@ -477,6 +481,7 @@ def recover_stale(
     recovered_by_host: dict,
     recovered_by_pid: int,
     recovered_by_start_evidence: dict,
+    recovered_by_state_path: Optional[str] = None,
     staleness_evidence: str,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     base_dir: Optional[Path] = None,
@@ -489,17 +494,20 @@ def recover_stale(
       1. Reading the existing lock (atomically observes the version).
       2. Verifying staleness.
       3. Acquire an exclusive sentinel file lock for the scope's
-         path (O_EXCL on a sibling sentinel). The first contender
-         wins.
+         path using fcntl.flock. The first contender wins; subsequent
+         contenders see EWOULDBLOCK.
       4. Re-read the lock inside the sentinel to detect a winner.
       5. Atomically rename tmp → target. If the lock file already
          contains a different version chain, we abort and release
          the sentinel.
-      6. Release the sentinel.
+      6. Release the sentinel (the sentinel file itself is kept on
+         disk; see _release_sentinel_fd).
 
     On success: returns ok=True, owner=<new owner>, and writes the
-    previous owner into recovery_history.
-    On failure: returns ok=False with the current owner.
+    previous owner into recovery_history. The recovered lease is
+    bound to `recovered_by_state_path` (the recovering run's own
+    state file), NOT to the predecessor's state path — otherwise the
+    newly recovered lease would be immediately stale.
     """
     scope_key = build_scope_key(
         repository=scope["repository"],
@@ -569,7 +577,7 @@ def recover_stale(
             "owner_run_id": recovered_by_run_id,
             "owner_host": recovered_by_host,
             "owner_pid": recovered_by_pid,
-            "owner_state_path": existing2.get("owner_state_path"),
+            "owner_state_path": recovered_by_state_path,
             "owner_start_evidence": recovered_by_start_evidence,
             "created_at": now_iso,
             "last_renewed_at": now_iso,

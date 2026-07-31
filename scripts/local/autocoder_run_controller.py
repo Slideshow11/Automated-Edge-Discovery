@@ -539,7 +539,12 @@ def _init(args: argparse.Namespace) -> None:
     # created_at on the state, which is used as a last-write timestamp).
     state["run_identity"] = None  # filled in below after lock acquisition
 
-    _save_state(state, out_path)
+    # Round-120 P1 fix (round 3): do NOT persist the runnable state
+    # before acquiring the lock. We build the full state in memory,
+    # attempt lock acquisition, and only _save_state after the
+    # lock has been acquired. If lock acquisition fails, we exit
+    # without ever writing CONTROLLER_STATE.json so a competing
+    # run cannot see a half-initialized state.
 
     # Round-120: acquire a host-local supervisor lock scoped to
     # (repository, target_pr_number) when provided. The lock is
@@ -2642,6 +2647,19 @@ def _authorize_mutation(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(9)
+    # Round-120 P1 fix (round 3): reject authorization after
+    # finalization. A finalized run has no live lease; permitting
+    # mutation authorization here would let an external executor
+    # perform a mutation with no active lock.
+    overall_status = state.get("overall_status")
+    if overall_status and overall_status != "RUN_ACTIVE":
+        print(
+            f"ERROR: cannot authorize mutation: run is not active "
+            f"(overall_status={overall_status}). The run must be "
+            f"in RUN_ACTIVE state to authorize mutations.",
+            file=sys.stderr,
+        )
+        sys.exit(10)
     repository = _state_repository(state) or args.workspace
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),
@@ -2762,6 +2780,7 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         recovered_by_host=host_identity,
         recovered_by_pid=proc_evidence["pid"],
         recovered_by_start_evidence=proc_evidence,
+        recovered_by_state_path=args.state,
         staleness_evidence=args.staleness_evidence,
         base_dir=_resolve_lock_base(args, Path(args.workspace)),
     )
