@@ -1136,6 +1136,27 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
                 ),
                 "fetched_comments_by_thread_id": fetched,
             }
+        # Round-108 follow-up (VUasS): the previous
+        # check ran AFTER ``paginate_nested_comments``
+        # had already executed. When prior threads
+        # consumed exactly ``safety_cap`` pages and this
+        # thread had ``nested_has_next=True``, the
+        # paginator would execute once more before
+        # detecting overflow, exceeding the operator's
+        # runtime bound by nearly another full
+        # per-thread safety_cap. The fix is a PRE-FETCH
+        # budget check: if ``pages_total`` already
+        # equals ``safety_cap``, this thread would push
+        # the aggregate past the cap, so we fail closed
+        # without invoking the paginator.
+        if pages_total >= safety_cap:
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": True,
+                "error": "aggregate_pages_cap_exceeded",
+                "fetched_comments_by_thread_id": fetched,
+            }
         result = paginate_nested_comments(
             tid,
             page_size=100,
@@ -1153,6 +1174,11 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
         # inventory. The fix uses strict ``>``: a 31st
         # page triggers ``aggregate_pages_cap_exceeded``,
         # while 30 one-page results with cap=30 stay complete.
+        # Round-108 follow-up: the post-fetch check is
+        # defensive and rarely fires (the pre-fetch budget
+        # check above stops the next call). It guards
+        # against a paginator returning ``pages > 0`` when
+        # ``pages_total`` was already at the cap.
         if pages_total > safety_cap:
             return {
                 "complete": False,

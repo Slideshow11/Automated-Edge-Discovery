@@ -761,22 +761,31 @@ query($threadId: ID!, $first: Int!, $after: String) {
             # the ``overshoot`` flag whenever a page
             # contained records we could not append because
             # the cap was already full.
+            # Round-107 follow-up (VUQ6C) reset: the loop
+            # appends records up to the cap and tracks
+            # whether a record was omitted. The
+            # `len(nodes) >= safety_cap` check AFTER an
+            # append was breaking the loop as soon as the
+            # cap was reached, hiding the records the
+            # page carried beyond the cap. The loop now
+            # MUST keep reading the page so the post-loop
+            # cap inspection can distinguish the
+            # ``cap exactly filled on a terminal page``
+            # case from the ``cap reached on a terminal
+            # page with records omitted`` case.
             if len(nodes) >= safety_cap:
-                # Already at the cap; do not append this
-                # record. If the loop terminates now with
-                # has_next=False, the post-loop cap inspection
-                # below uses ``overshoot`` to flag the inventory
-                # as ``capped=True, complete=False`` because
-                # records were omitted.
+                # Cap is already full. Drop THIS record
+                # and any subsequent records on this page
+                # by setting ``overshoot`` and breaking.
                 overshoot = True
                 break
             nodes.append(n)
-            if len(nodes) >= safety_cap:
-                # Cap reached exactly. The post-loop cap
-                # inspection below applies the right rule
-                # (terminal page exact-cap ⇒ complete;
-                # non-terminal ⇒ capped).
-                break
+            # Do NOT break when len(nodes) just reached the
+            # cap; we must keep reading the page to learn
+            # whether the page carried records beyond the
+            # cap (which would be the ``overshoot`` case).
+            # The post-loop cap inspection handles the
+            # exact-cap and over-cap distinctions.
 
         page_info = comments_obj.get("pageInfo") or {}
         if not isinstance(page_info, dict):

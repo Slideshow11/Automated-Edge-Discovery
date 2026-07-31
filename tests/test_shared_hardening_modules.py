@@ -4411,3 +4411,74 @@ def test_r107_pagination_terminal_over_cap_is_capped():
         "Round-107 (VUQ6C): inventory truncated to cap=5; "
         f"got {len(res['nodes'])} records"
     )
+
+
+def test_r108_paginate_nested_comments_terminal_over_cap(monkeypatch):
+    """Round-108 follow-up (VUasI): ``paginate_nested_comments`` —
+    not ``paginate_graphql_connection`` — MUST truncate a
+    terminal page whose unique-record count exceeds the
+    remaining capacity. The Round-107 test exercised the
+    general connection paginator; this test exercises the
+    nested-comments paginator specifically. 10 terminal
+    records with safety_cap=5 must yield exactly 5 records
+    and capped=True.
+    """
+    from scripts.local._shared_pagination import (
+        paginate_nested_comments,
+    )
+
+    terminal_page = {
+        "data": {
+            "node": {
+                "__typename": "PullRequestReviewThread",
+                "comments": {
+                    "nodes": [
+                        {"databaseId": 1000 + i, "body": f"c{i}"}
+                        for i in range(10)
+                    ],
+                    "pageInfo": {
+                        "hasNextPage": False,
+                        "endCursor": None,
+                    },
+                },
+            }
+        }
+    }
+    fake_run = _FakeRun([terminal_page])
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    # Patch the imported subprocess reference inside the
+    # shared module so the paginator's ``subprocess.run``
+    # resolves to our queue.
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    res = paginate_nested_comments(
+        "PRRT_t0",
+        page_size=10,
+        safety_cap=5,
+        owner="x",
+        name="y",
+        pr_number=1,
+        initial_cursor="c0",
+        timeout=30,
+    )
+
+    assert res["capped"] is True, (
+        "Round-108 (VUasI): paginate_nested_comments must "
+        "truncate a terminal 10-record page with cap=5 and "
+        f"return capped=True; got {res!r}"
+    )
+    assert res["complete"] is False, (
+        "Round-108 (VUasI): truncated terminal page must be "
+        f"complete=False; got complete={res.get('complete')!r}"
+    )
+    assert len(res["nodes"]) == 5, (
+        "Round-108 (VUasI): inventory truncated to cap=5; "
+        f"got {len(res['nodes'])} records"
+    )
+    assert res.get("error") == "aggregate_pages_cap_exceeded", (
+        "Round-108 (VUasI): error code MUST be "
+        f"aggregate_pages_cap_exceeded; got {res.get('error')!r}"
+    )
