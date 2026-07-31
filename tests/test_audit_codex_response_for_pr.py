@@ -11300,8 +11300,11 @@ def test_r109_audit_nested_fetch_uses_remaining_budget(monkeypatch):
         # First call simulates 29 pages already consumed
         # within the per-thread budget; the audit must use
         # pages_total += 29 here, and on the second call must
-        # pass safety_cap = 30 - 29 = 1 (the remaining budget).
-        # The paginator honors the per-call safety_cap of 1.
+        # pass pages_cap = 30 - 29 = 1 (the remaining
+        # budget) as a SEPARATE pages_cap argument while
+        # keeping the original safety_cap=30 for items.
+        # Round-110 follow-up (VUtWh) introduced this
+        # separation.
         if idx == 0:
             return {
                 "nodes": [{"databaseId": 100}],
@@ -11310,10 +11313,15 @@ def test_r109_audit_nested_fetch_uses_remaining_budget(monkeypatch):
                 "complete": True,
             }
         if idx == 1:
-            assert kwargs.get("safety_cap") == 1, (
-                "Round-109 (VUkNY): second paginate call MUST "
-                "receive remaining_budget=1, got "
-                f"{kwargs.get('safety_cap')}"
+            assert kwargs.get("pages_cap") == 1, (
+                "Round-109 (VUkNY): second paginate call "
+                "MUST receive pages_cap=remaining_budget=1; "
+                f"got {kwargs.get('pages_cap')}"
+            )
+            assert kwargs.get("safety_cap") == 30, (
+                "Round-110 (VUtWh): safety_cap continues to "
+                "be the ITEMS cap, separate from pages_cap; "
+                f"got safety_cap={kwargs.get('safety_cap')}"
             )
             return {
                 "nodes": [{"databaseId": 200}],
@@ -11353,9 +11361,13 @@ def test_r109_audit_nested_fetch_uses_remaining_budget(monkeypatch):
         f"Round-109: only the first two paginate calls should "
         f"run; got {len(calls)} calls"
     )
-    assert calls[1]["safety_cap"] == 1, (
+    assert calls[1]["pages_cap"] == 1, (
         f"Round-109: second paginate call MUST receive "
-        f"remaining_budget=1; got {calls[1].get('safety_cap')}"
+        f"remaining_budget=1 via pages_cap; got {calls[1].get('pages_cap')}"
+    )
+    assert calls[1]["safety_cap"] == 30, (
+        f"Round-110: second paginate call MUST keep the original "
+        f"safety_cap=30; got {calls[1].get('safety_cap')}"
     )
     assert res["complete"] is False, (
         "Round-109 (VUkNY): the third thread MUST be "

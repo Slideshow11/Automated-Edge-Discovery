@@ -525,6 +525,7 @@ def paginate_nested_comments(
     *,
     page_size: int = 100,
     safety_cap: int = DEFAULT_SAFETY_CAP,
+    pages_cap: Optional[int] = None,
     owner: str = "",
     name: str = "",
     timeout: int = 30,
@@ -556,8 +557,21 @@ def paginate_nested_comments(
       - hasNextPage=true without endCursor
       - repeated cursor across iterations (defensive loop check)
       - safety_cap reached
+      - pages_cap reached (Round-110 follow-up VUtWh)
       - subprocess timeout / non-zero exit
       - malformed JSON
+
+    Round-110 follow-up (VUtWh): the previous shape reused
+    ``safety_cap`` for both the items cap
+    (``len(nodes) >= safety_cap``) and the pages cap
+    (``pages >= safety_cap``). When the audit
+    audit_short_circuited over a partial page-budget
+    pass-through, the reduced safety_cap also shrank
+    the items limit and a 2-comment terminal page was
+    truncated at 1 item even though the fetch used
+    exactly the permitted 30th page. The fix introduces a
+    separate ``pages_cap`` argument that bounds only the
+    page count. ``safety_cap`` continues to bound items.
     """
     if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
         return {
@@ -600,9 +614,18 @@ def paginate_nested_comments(
     overshoot = False
 
     while has_next:
-        if pages >= safety_cap:
+        # Round-110 follow-up (VUtWh): the loop previously
+        # reused ``safety_cap`` as the pages cap; the audit
+        # now passes a distinct ``pages_cap`` via the new
+        # optional argument. ``pages_cap`` bounds ONLY the
+        # page count, while ``safety_cap`` continues to
+        # bound the items count.
+        effective_pages_cap = (
+            pages_cap if pages_cap is not None else safety_cap
+        )
+        if pages >= effective_pages_cap:
             capped = True
-            error = "safety_cap_exhausted"
+            error = "pages_cap_exhausted"
             break
 
         query = """\

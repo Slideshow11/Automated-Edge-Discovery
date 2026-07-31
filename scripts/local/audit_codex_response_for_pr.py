@@ -1157,23 +1157,22 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
                 "error": "aggregate_pages_cap_exceeded",
                 "fetched_comments_by_thread_id": fetched,
             }
-        # Round-109 follow-up (VUkNY): even when
-        # ``pages_total < safety_cap``, the previous
+        # Round-109 follow-up (VUkNY): the previous
         # call granted the next ``paginate_nested_comments``
         # the full per-thread ``safety_cap`` rather than
-        # the REMAINING budget. With 29 pages used and a
-        # cap of 30, the next call could fetch another 30
-        # pages before the post-fetch check reports 59.
-        # The fix computes the remaining budget and
-        # passes it as the per-call ``safety_cap`` so the
-        # paginator fails closed the moment it crosses
-        # the remaining budget without overshooting the
-        # operator's overall bound.
+        # the REMAINING aggregate budget. The fix passes
+        # the REMAINING page-budget as a separate
+        # ``pages_cap`` argument while preserving the
+        # original per-thread item-cap. Round-110 follow-up
+        # (VUtWh) separated the two caps: ``safety_cap``
+        # still bounds the items count, while
+        # ``pages_cap`` bounds only the page count.
         remaining_budget = safety_cap - pages_total
         result = paginate_nested_comments(
             tid,
             page_size=100,
-            safety_cap=remaining_budget,
+            safety_cap=safety_cap,
+            pages_cap=remaining_budget,
             timeout=timeout,
             initial_cursor=nested_cursor,
         )
