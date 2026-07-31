@@ -2603,3 +2603,117 @@ def test_derive_changed_paths_stored_attempt_matches_cycle(
         state, codex, repair_cycle_id=3
     )
     assert "scripts/local/x.py" not in scoped_3
+
+
+def test_r104_repair_result_runner_exception_marks_event_failed(
+    monkeypatch, tmp_path
+):
+    """Round-104 follow-up (PRRT_kwDOSHFpYM6VSVDA): when
+    ``runner_call`` raises (e.g. pytest cannot be launched),
+    ``record-codex-repair-result --status repaired`` MUST set
+    ``validation_outcome="failed"``, persist
+    ``validation_error``, persist the validation failure
+    return-code, and persist the ``codex_repair_event`` with
+    ``status="failed"`` so the append-only history is
+    consistent with ``last_validation_outcome`` and
+    ``next_action``. The controller MUST NOT advance to
+    ``await_codex_review_after_repair`` and MUST preserve the
+    active finding state.
+    """
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Pre-seed findings state so we can verify it's preserved.
+    state_data = json.loads(Path(state_path).read_text())
+    state_data["codex_review"] = {
+        "status": "findings",
+        "findings_count": 3,
+        "highest_severity": "P2",
+        "head_sha": "abcdef",
+        "findings": [],
+    }
+    Path(state_path).write_text(json.dumps(state_data))
+
+    # Inject a runner_call that raises RuntimeError.
+    def raising_runner(**kwargs):
+        raise RuntimeError("pytest cannot be launched")
+
+    def patched_seam():
+        return {
+            "planner_call": lambda **kw: {},
+            "runner_call": raising_runner,
+            "planner_module": None,
+            "runner_module": None,
+        }
+
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        patched_seam,
+    )
+
+    rc = controller_main([
+        "record-codex-repair-result",
+        "--state", state_path,
+        "--status", "repaired",
+        "--summary", "Applied repairs",
+        "--changed-path", "scripts/local/x.py",
+    ])
+    # The CLI exits 0 on the failure path (controller fails
+    # closed without propagating the crash exit). The state is
+    # what matters for the test contract.
+    assert rc == 0, "controller should not propagate the exception exit"
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # 1. validation_outcome MUST be failed (not pending, not passed).
+    assert codex.get("last_validation_outcome") == "failed", (
+        "Round-104 (PRRT_kwDOSHFpYM6VSVDA): validation_outcome "
+        f"MUST be 'failed', got {codex.get('last_validation_outcome')!r}"
+    )
+    # 2. validation error MUST be persisted.
+    assert "runner_failed" in codex.get("last_validation_error", ""), (
+        "Round-104: validation_error MUST contain 'runner_failed' "
+        f"prefix, got {codex.get('last_validation_error')!r}"
+    )
+    # 3. return-code MUST be a non-zero sentinel (-1).
+    assert codex.get("last_validation_return_code") == -1, (
+        "Round-104: last_validation_return_code MUST be -1 on "
+        "exception path; got "
+        f"{codex.get('last_validation_return_code')!r}"
+    )
+    # 4. last codex_repair_event MUST have status=failed
+    #    (NOT status=repaired, which is the CLI-supplied arg).
+    repair_events = state.get("codex_repair_events", [])
+    assert repair_events, "codex_repair_events MUST be non-empty"
+    last_event = repair_events[-1]
+    assert last_event.get("status") == "failed", (
+        "Round-104: codex_repair_event status MUST be 'failed' on "
+        f"exception path; got {last_event.get('status')!r}"
+    )
+    # 5. next_action MUST be the fail-closed variant, NOT
+    #    await_codex_review_after_repair.
+    next_action = state.get("next_action", {})
+    assert next_action.get("reason", "").startswith(
+        "validation_failed_no_repair"
+    ), (
+        "Round-104: next_action MUST be fail-closed "
+        f"validation_failed_no_repair; got {next_action!r}"
+    )
+    assert "await_codex_review_after_repair" not in next_action.get(
+        "reason", ""
+    ), (
+        "Round-104: controller MUST NOT advance to "
+        f"await_codex_review_after_repair; got {next_action!r}"
+    )
+    # 6. Active finding state MUST be preserved (no
+    #    codex['status'] = 'not_started' clear).
+    assert codex.get("status") != "not_started", (
+        "Round-104: codex['status'] MUST NOT be reset to "
+        f"'not_started' on the exception path; got {codex.get('status')!r}"
+    )
+    # 7. findings_count MUST NOT have been zeroed (controller
+    #    fails closed rather than advancing to clean).
+    assert codex.get("findings_count", 0) != 0, (
+        "Round-104: findings_count MUST NOT be zeroed on "
+        f"the exception path; got {codex.get('findings_count')!r}"
+    )

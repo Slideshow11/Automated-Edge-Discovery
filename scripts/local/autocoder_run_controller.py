@@ -1439,6 +1439,26 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
                     validation_error = (
                         f"runner_failed:{type(exc).__name__}"
                     )
+                    # Round-104 follow-up (PRRT_kwDOSHFpYM6VSVDA):
+                    # when ``runner_call`` raises (e.g. pytest
+                    # cannot be launched), the previous handler
+                    # set only ``validation_error`` and left
+                    # ``validation_outcome`` as ``"pending"``.
+                    # The Round-103 follow-up guard
+                    # (``if validation_outcome in ("passed",
+                    # "failed")``) then SKIPPED the status
+                    # correction and persisted a
+                    # ``codex_repair_event`` with
+                    # ``status="repaired"`` even though
+                    # ``next_action`` reports
+                    # ``validation_failed_no_repair:runner_failed``.
+                    # The fix sets the exception outcome to
+                    # ``"failed"`` and a non-zero return code so
+                    # the append-only history remains
+                    # consistent with ``last_validation_outcome``
+                    # and ``next_action``.
+                    validation_outcome = "failed"
+                    validation_return_code = -1
                 else:
                     # Round-71 PHASE 3-P1-B: the production facade
                     # ``run_selected_tests`` returns canonical keys

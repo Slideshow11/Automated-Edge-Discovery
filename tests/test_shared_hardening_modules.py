@@ -4035,3 +4035,106 @@ def test_r100_pagination_helper_does_not_mutate_local_capped():
         "Round-100 (VQNdu): the caller MUST flip its local "
         "capped boolean when the helper returns True."
     )
+
+
+def test_r104_classifier_template_with_inline_finding_is_finding():
+    """Round-104 follow-up: a formal Codex review with the
+    generic template body (no inline finding badge in the body
+    itself) MUST be classified as FINDING when the inline
+    comment surface contains a P1 or P2 badge. The previous
+    classifier only scanned the body and would have classified
+    the template as ``CLEAN_PASS`` even though the inline
+    comment list contained a real finding.
+    """
+    # The classifier is the production facade wrapper around
+    # ``classify_codex_response``. Import both for direct
+    # comparison.
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    from scripts.local._production_facade import (
+        classify_codex_response_with_invocation,
+    )
+
+    # Generic Codex template body (no inline badge) — the
+    # observed shape of auto-triggered reviews that summarize
+    # their inline findings without repeating them in the body.
+    template_body = (
+        "### \U0001f4a1 Codex Review\n\n"
+        "Here are some automated review suggestions for this "
+        "pull request.\n\n"
+        "**Reviewed commit:** `79973fabba0e0401ea149e8cdc01f99d25bce20b`\n"
+    )
+
+    # Formal review with the template body, anchored to the
+    # exact head via the canonical commitId field.
+    formal_review = {
+        "user": {"login": "chatgpt-codex-connector"},
+        "body": template_body,
+        "submitted_at": "2026-07-31T00:58:34Z",
+        "commit_id": "79973fabba0e0401ea149e8cdc01f99d25bce20b",
+    }
+
+    # The classifier is the production facade wrapper around
+    # ``classify_codex_response``. Import both for direct
+    # comparison.
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    from scripts.local._production_facade import (
+        classify_codex_response_with_invocation,
+    )
+
+    # The shared classifier must classify the formal review
+    # body as CLEAN_PASS on its own (the template contains no
+    # inline finding badge). The caller-supplied
+    # ``_inline_finding_observed=True`` is the contract for
+    # the production facade: a formal review whose complete
+    # inline comment surface contains a finding is never
+    # classified as CLEAN_PASS regardless of the template body.
+    verdict_template_only = classify_codex_response(
+        kind="review",
+        candidate=formal_review,
+        head="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+        expected_head_sha="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+    )
+    assert verdict_template_only == "CLEAN_PASS", (
+        "Round-104: the shared classifier body-only scan MUST "
+        "classify the template body as CLEAN_PASS; the "
+        "finding must be detected at the call site via the "
+        "complete inline comment inventory."
+    )
+
+    # The production facade wrapper records an invocation. Use
+    # it directly; it delegates to the same shared classifier.
+    verdict_facade_clean = classify_codex_response_with_invocation(
+        kind="review",
+        candidate=formal_review,
+        head="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+        expected_head_sha="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+    )
+    assert verdict_facade_clean == "CLEAN_PASS", (
+        "Round-104: the production facade with the template "
+        f"body MUST also return CLEAN_PASS. Got {verdict_facade_clean!r}"
+    )
+
+    # Sanity: a review with a body that DOES carry the inline
+    # finding badge is classified as FINDING.
+    finding_body = (
+        "**<sub><sub>![P2 Badge]..."
+        "</sub></sub>  Mark runner exceptions as failed validation**"
+    )
+    review_with_inline = {
+        **formal_review,
+        "body": finding_body,
+    }
+    verdict_with_inline = classify_codex_response_with_invocation(
+        kind="review",
+        candidate=review_with_inline,
+        head="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+        expected_head_sha="79973fabba0e0401ea149e8cdc01f99d25bce20b",
+    )
+    assert verdict_with_inline == "FINDING", (
+        "Round-104: a formal review with the finding body MUST "
+        f"classify as FINDING. Got {verdict_with_inline!r}"
+    )
