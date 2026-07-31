@@ -32,13 +32,59 @@ python3 scripts/local/wait_for_pr_ready.py \
   --output-md /tmp/aed_runs/pr335_wait/status.md
 ```
 
+### One-shot mode (--once)
+
+```bash
+python3 scripts/local/wait_for_pr_ready.py \
+  --pr-number 335 \
+  --once \
+  --require-final-gates \
+  --output-json /tmp/aed_runs/pr335_wait/status.json \
+  --output-md /tmp/aed_runs/pr335_wait/status.md
+```
+
+When `--once` is supplied, the waiter disables CI polling and `time.sleep`
+between evaluation cycles. It performs exactly one CI checks evaluation
+(one `gh pr checks` call) and proceeds through the remaining gates once,
+writing the same JSON and Markdown reports as polling mode, then exits.
+
+`timeout-minutes` and `poll-seconds` are ignored under `--once`.
+
+Note: `--once` does **not** promise that the evaluation is bounded by a
+single network round-trip. `main()` always calls `get_pr_state()` before
+`poll_ci_checks_once()`, and an all-green result triggers additional
+calls for head SHA re-check, base branch, and branch protection, plus
+any configured gate subprocess invocations (`check_pr_review_comments.py`,
+`check_persistent_mutation_guard.py`, `final_gate_status.py`,
+`verify_final_head_merge_command.py`). Neither `gh_run()` nor
+`run_external_script()` sets a subprocess timeout, so any of these calls
+can in principle block for as long as the underlying process takes. What
+`--once` guarantees is the absence of polling and sleep between cycles —
+not a wall-clock bound on the single pass.
+
+The `once_mode` field is written into the JSON report (`true`/`false`)
+and into the Markdown Summary section so operators can confirm which mode
+was used without re-reading the invocation.
+
+CI outcome mapping under `--once`:
+
+| CI state on the single pass | Report status |
+|---|---|
+| All required checks `success` | `READY_FOR_FINAL_GATES` (proceeds to gates), or `READY_TO_MERGE_CANDIDATE` if no gates configured |
+| Any required check `pending`/`queued`/`in_progress` (or absent from list) | `HOLD_CI_PENDING` |
+| Any required check `failure`/`cancelled`/`skipped`/`timed_out` | `HOLD_CI_FAILED` |
+
+`HOLD_TIMEOUT` is never produced under `--once` because there is no
+deadline pressure on a single-pass evaluation.
+
 ## Arguments
 
 | Argument | Required | Default | Description |
 |---|---|---|---|
 | `--pr-number` | Yes | — | PR number to poll |
-| `--timeout-minutes` | No | 30 | Max wait time before HOLD_TIMEOUT |
-| `--poll-seconds` | No | 30 | Seconds between CI status polls |
+| `--timeout-minutes` | No | 30 | Max wait time before HOLD_TIMEOUT (ignored under `--once`) |
+| `--poll-seconds` | No | 30 | Seconds between CI status polls (ignored under `--once`) |
+| `--once` | No | False | Perform exactly one complete readiness evaluation and exit |
 | `--require-review-comments-clean` | No | False | Run check_pr_review_comments.py after CI green |
 | `--require-pmg` | No | False | Run PMG compare |
 | `--require-final-gates` | No | False | Run final_gate_status.py |
@@ -99,6 +145,23 @@ even if the overall CI would otherwise green-light the PR:
   `ERROR_TOOLING` with detail logged
 
 The `pending` state is not a failure — it triggers another poll cycle.
+
+`gh pr checks` exit code semantics (see https://cli.github.com/manual/gh_help_exit-codes):
+
+- `0` — all checks passed (or mixed with successes)
+- `1` — at least one required check has a terminal non-success state. JSON output
+  is still valid and must be parsed so the classifier reports `HOLD_CI_FAILED`
+  with the actual failed-check names (rather than `ERROR_TOOLING`).
+- `8` — at least one required check is pending. JSON output is still valid and
+  must be parsed so the pending-check list is reported.
+- Anything else (2, 4, 127, etc.) — genuine invocation failure → `ERROR_TOOLING`.
+- Empty stdout with any exit code — transport / cancellation / auth failure →
+  `ERROR_TOOLING` (a genuine zero-checks response is JSON `[]`, not empty).
+- Malformed JSON — genuine invocation failure → `ERROR_TOOLING`.
+
+This matches the acceptance contract used in `scripts/local/aed_pr.py` (lines
+671–678) so the waiter and the AED CLI surface classify `gh pr checks`
+results identically.
 
 Default required checks for this repository:
 - `test (3.11)` or `test` (any Python version)

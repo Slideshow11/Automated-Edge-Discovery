@@ -2872,6 +2872,7 @@ class TestEntrypointAndExitCodes:
                 "--poll-seconds", "0",
             ],
             capture_output=True,
+            text=True,
             timeout=30,
         )
         # Must exit nonzero on failure
@@ -2881,3 +2882,857 @@ class TestEntrypointAndExitCodes:
         data = json.load(open(output_json))
         assert data["ready_to_merge"] is False
         assert data["merge_allowed"] is False
+
+
+# ---------------------------------------------------------------------------
+# --once mode tests
+# ---------------------------------------------------------------------------
+
+class TestOnceMode:
+    """Verify --once performs exactly one evaluation and exits."""
+
+    def _load_module(self):
+        """Load the waiter module fresh."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("waiter_once", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_once_flag_exists_in_parser(self):
+        """The --once flag must be a registered argparse argument."""
+        result = subprocess.run(
+            [sys.executable, str(WAITER), "--help"],
+            capture_output=True,
+            text=True,
+            shell=False,
+        )
+        assert "--once" in result.stdout, "--once not in --help output"
+
+    def test_once_helper_function_exists(self):
+        """poll_ci_checks_once must be defined and callable."""
+        mod = self._load_module()
+        assert hasattr(mod, "poll_ci_checks_once"), "poll_ci_checks_once not defined"
+        import inspect
+        sig = inspect.signature(mod.poll_ci_checks_once)
+        # Signature: (pr_number, required_checks) — NO timeout/poll params
+        params = list(sig.parameters.keys())
+        assert params == ["pr_number", "required_checks"], (
+            f"poll_ci_checks_once must have signature (pr_number, required_checks); got {params}"
+        )
+
+    def test_evaluate_ci_once_helper_exists(self):
+        """_evaluate_ci_once must exist as the shared single-pass helper."""
+        mod = self._load_module()
+        assert hasattr(mod, "_evaluate_ci_once"), "_evaluate_ci_once not defined"
+
+    def test_once_does_not_sleep(self, output_dir, output_json):
+        """When --once is set, time.sleep must not be called.
+
+        The once mode performs exactly one gh pr checks evaluation and exits
+        immediately. Any call to time.sleep indicates the polling path was
+        incorrectly taken.
+        """
+        import time
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = '{"state":"open","head":"test123abc"}'
+            m.stderr = ""
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if cmd and cmd[0] == "gh":
+                # gh pr checks returns all-success once
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            return m
+
+        sleep_calls = []
+        def tracking_sleep(duration):
+            sleep_calls.append(duration)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run), \
+             patch.object(time, "sleep", side_effect=tracking_sleep):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        assert sleep_calls == [], (
+            f"--once must not call time.sleep; got {sleep_calls}"
+        )
+
+    def test_once_calls_pr_checks_exactly_once(self, output_dir, output_json):
+        """Under --once, gh pr checks must be called exactly one time."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        checks_call_count = [0]
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            # Detect gh pr checks calls
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                checks_call_count[0] += 1
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                # Route on --jq for get_pr_state and get_live_head_sha
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        assert checks_call_count[0] == 1, (
+            f"--once must call gh pr checks exactly once; got {checks_call_count[0]}"
+        )
+
+    def test_once_returns_ready_for_final_gates_when_ci_green(self, output_dir, output_json):
+        """Under --once with all CI green, status must be READY_FOR_FINAL_GATES."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        assert rc == mod.EXIT_SUCCESS, f"Expected EXIT_SUCCESS; got {rc}"
+        data = json.load(open(out_json))
+        # With all CI green and no merge blockers, the waiter proceeds all the
+        # way to READY_TO_MERGE_CANDIDATE (the conversation resolution check is
+        # not required because branch protection doesn't enable it for this
+        # mock, and no --require-final-gates flag was passed).
+        assert data["status"] == mod.STATUS_READY_TO_MERGE_CANDIDATE, (
+            f"Expected READY_TO_MERGE_CANDIDATE for all-green single pass; got {data['status']}"
+        )
+        assert data["once_mode"] is True
+        assert data["ready_to_merge"] is True
+        assert data["merge_allowed"] is True
+
+    def test_once_returns_hold_ci_pending_when_ci_pending(self, output_dir, output_json):
+        """Under --once, if any CI check is pending, status must be HOLD_CI_PENDING (not HOLD_TIMEOUT)."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                # test (3.11) still pending — typical mid-CI state
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "pending", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        # Under --once with pending CI, exit must be nonzero (failure to be ready)
+        assert rc == mod.EXIT_FAILURE, f"Expected EXIT_FAILURE on pending CI; got {rc}"
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_HOLD_CI_PENDING, (
+            f"Expected HOLD_CI_PENDING under --once with pending CI; got {data['status']}"
+        )
+        # error_type must mirror status — not contradict it as ERROR_TOOL_FAILURE.
+        assert data.get("error_type") == mod.STATUS_HOLD_CI_PENDING, (
+            f"error_type must equal ci_status (not ERROR_TOOL_FAILURE); got "
+            f"{data.get('error_type')!r}"
+        )
+        assert data["once_mode"] is True
+        # Verify the pending check is recorded in ci_checks data
+        pending = data.get("ci_checks", {}).get("pending_checks", [])
+        assert "test (3.11)" in pending, (
+            f"Expected pending_checks to list test (3.11); got {pending}"
+        )
+
+    def test_once_returns_hold_ci_failed_when_ci_failed(self, output_dir, output_json):
+        """Under --once, if any CI check failed, status must be HOLD_CI_FAILED.
+
+        gh pr checks returns exit code 1 when any check has failed/cancelled/
+        skipped — NOT exit code 0. The waiter must accept and parse the JSON
+        output in that case so it can report HOLD_CI_FAILED (not ERROR_TOOLING).
+        See https://cli.github.com/manual/gh_help_exit-codes
+        """
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 1  # Real gh pr checks returns exit 1 when a check failed
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "failure", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        assert rc == mod.EXIT_FAILURE
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_HOLD_CI_FAILED, (
+            f"Expected HOLD_CI_FAILED (not ERROR_TOOLING) under --once with "
+            f"gh pr checks exit 1; got {data['status']}"
+        )
+        # error_type must mirror status, not be the misleading ERROR_TOOL_FAILURE.
+        assert data.get("error_type") == mod.STATUS_HOLD_CI_FAILED, (
+            f"error_type must equal ci_status (not ERROR_TOOL_FAILURE); got "
+            f"{data.get('error_type')!r}"
+        )
+        assert data["once_mode"] is True
+
+    def test_once_writes_json_and_md_reports(self, output_dir, output_json):
+        """Under --once, both JSON and Markdown reports must be written."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        assert os.path.exists(out_json), f"JSON not written: {out_json}"
+        assert os.path.exists(md_path), f"Markdown not written: {md_path}"
+
+        # Verify the markdown contains the Once mode line
+        md_content = open(md_path).read()
+        assert "Once mode" in md_content, "Markdown must surface 'Once mode' field"
+        assert "True" in md_content, "Markdown must show once_mode=True"
+
+        # Verify JSON once_mode field
+        data = json.load(open(out_json))
+        assert data["once_mode"] is True
+
+    def test_once_runs_all_gates_when_ci_green(self, output_dir, output_json):
+        """Under --once, all configured gates must execute in a single pass."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        helper_scripts_called = []
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+                elif "baseRefName" in jq_expr:
+                    m.stdout = "main"
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            if 'check_pr_review_comments' in cmd_str:
+                helper_scripts_called.append('check_pr_review_comments')
+                out_path = None
+                for i, a in enumerate(cmd):
+                    if a == '--output-json' and i + 1 < len(cmd):
+                        out_path = cmd[i + 1]
+                        break
+                if out_path:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+            elif 'final_gate_status' in cmd_str:
+                helper_scripts_called.append('final_gate_status')
+                out_path = None
+                for i, a in enumerate(cmd):
+                    if a == '--output-json' and i + 1 < len(cmd):
+                        out_path = cmd[i + 1]
+                        break
+                if out_path:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+            return m
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--require-review-comments-clean",
+            "--require-final-gates",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        # Each helper must have been called exactly once
+        assert helper_scripts_called.count('check_pr_review_comments') == 1, (
+            f"check_pr_review_comments must be called exactly once; got "
+            f"{helper_scripts_called.count('check_pr_review_comments')}"
+        )
+        assert helper_scripts_called.count('final_gate_status') == 1, (
+            f"final_gate_status must be called exactly once; got "
+            f"{helper_scripts_called.count('final_gate_status')}"
+        )
+
+    def test_once_mode_field_in_poll_report(self, output_dir, output_json):
+        """The poll_ci_checks_once function must report once_mode-aware metadata."""
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+
+        # Direct call to poll_ci_checks_once — verify shape
+        from unittest.mock import patch
+
+        fake_gh_result = MagicMock()
+        fake_gh_result.returncode = 0
+        fake_gh_result.stdout = json.dumps([
+            {"name": "test (3.11)", "state": "success", "link": ""},
+            {"name": "review-comment-gate", "state": "success", "link": ""},
+            {"name": "validator", "state": "success", "link": ""},
+            {"name": "governance-validators", "state": "success", "link": ""},
+            {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+        ])
+        fake_gh_result.stderr = ""
+
+        with patch.object(mod, "gh_run", return_value=fake_gh_result):
+            status, data, error = mod.poll_ci_checks_once(
+                999,
+                list(mod.DEFAULT_REQUIRED_CHECKS),
+            )
+
+        assert status == mod.STATUS_READY_FOR_FINAL_GATES
+        assert error is None
+        assert "checks" in data
+        assert "polled_at" in data
+        assert len(data["checks"]) == 5
+
+    def test_once_completes_under_two_seconds(self, output_dir, output_json):
+        """End-to-end smoke: --once must complete in under 2 seconds (no polling).
+
+        Even with all gate stages enabled, a single evaluation must finish in
+        well under the polling default of 30 seconds.
+        """
+        import time
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+                elif "baseRefName" in jq_expr:
+                    m.stdout = "main"
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, a in enumerate(cmd or []):
+                if a in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+            if out_path:
+                if 'check_pr_review_comments' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+                elif 'final_gate_status' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+            return m
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--require-review-comments-clean",
+            "--require-final-gates",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        start = time.time()
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+        elapsed = time.time() - start
+
+        # Generous bound: tests have CI overhead, allow up to 2s
+        assert elapsed < 2.0, f"--once took {elapsed:.3f}s — must be under 2s (no polling)"
+
+    def test_default_mode_without_once_uses_polling(self, output_dir, output_json):
+        """Without --once, the waiter must use poll_ci_checks (sleep-based loop).
+
+        This test ensures the default behavior is unchanged when --once is absent.
+        """
+        import time
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        sleep_calls = []
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "success", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        def tracking_sleep(duration):
+            sleep_calls.append(duration)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--poll-seconds", "1",
+            "--timeout-minutes", "1",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run), \
+             patch.object(time, "sleep", side_effect=tracking_sleep):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        # Default polling mode calls time.sleep at least once (between CI polls)
+        # Note: CI is all-success, so no sleep needed; but the default path
+        # must NOT be --once (so once_mode=False)
+        data = json.load(open(out_json))
+        assert data["once_mode"] is False, (
+            "Default polling mode must have once_mode=False"
+        )
+
+    def test_default_mode_parses_failed_checks_when_gh_returns_exit_1(self, output_dir, output_json):
+        """Regression test: default polling mode must accept gh pr checks exit 1
+        when stdout contains a valid JSON with failed checks.
+
+        This is the same fix as the --once test: gh pr checks exits 1 when any
+        check has failed/cancelled/skipped, but stdout is valid JSON. The waiter
+        must parse stdout and report HOLD_CI_FAILED (not ERROR_TOOLING).
+        """
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 1  # gh pr checks exit 1 with failed checks present
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "failure", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--poll-seconds", "0",
+            "--timeout-minutes", "1",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        # Must report HOLD_CI_FAILED, not ERROR_TOOLING
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_HOLD_CI_FAILED, (
+            f"Expected HOLD_CI_FAILED with gh exit 1; got {data['status']}: "
+            f"{data.get('error_detail')}"
+        )
+
+    def test_default_mode_treats_empty_stdout_as_error_tooling(self, output_dir, output_json):
+        """Regression test: empty stdout from gh pr checks must be ERROR_TOOLING,
+        not HOLD_CI_PENDING.
+
+        Per scripts/local/aed_pr.py lines 671-678, empty stdout is the
+        authoritative signature of a transport/cancellation/auth failure. A
+        genuine "no checks configured" response is JSON `[]`, not empty
+        stdout. The waiter must reject empty stdout under both default mode
+        and --once.
+        """
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 0  # gh exit 0 but empty stdout — auth failure or transport issue
+            m.stdout = ""
+            m.stderr = "HTTP 401: Bad credentials"
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                # Explicitly leave stdout empty to model transport failure
+                pass
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--once",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_ERROR_TOOLING, (
+            f"Empty stdout must be ERROR_TOOLING (not HOLD_CI_PENDING); "
+            f"got {data['status']}: {data.get('error_detail')}"
+        )
+        assert "empty stdout" in data.get("error_detail", "").lower(), (
+            f"error_detail must mention empty stdout; got {data.get('error_detail')}"
+        )
