@@ -1144,12 +1144,16 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
             initial_cursor=nested_cursor,
         )
         pages_total += int(result.get("pages", 0) or 0)
-        # Round-106 follow-up (VUIvY): bound the aggregate
-        # pagination across all threads. A failure loop
-        # with cap-crossing must surface as capped=True,
-        # complete=False rather than the per-thread-only
-        # ``safety_cap`` semantics.
-        if pages_total >= safety_cap:
+        # Round-107 follow-up (VUQ6I): the previous ``>=``
+        # comparison reported the inventory as capped when
+        # the aggregate pages count exactly equaled
+        # ``safety_cap``. By definition, ``thread_count``
+        # successful one-page threads consuming exactly
+        # ``safety_cap`` total pages IS a complete bounded
+        # inventory. The fix uses strict ``>``: a 31st
+        # page triggers ``aggregate_pages_cap_exceeded``,
+        # while 30 one-page results with cap=30 stay complete.
+        if pages_total > safety_cap:
             return {
                 "complete": False,
                 "pages": pages_total,

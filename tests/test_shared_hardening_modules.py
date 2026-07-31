@@ -4286,3 +4286,128 @@ def test_r106_pagination_terminal_page_with_more_pages_is_capped():
     assert len(res["nodes"]) <= 5, (
         f"Round-106: inventory must not exceed cap; got {len(res['nodes'])}."
     )
+
+
+def test_r107_pagination_aggregate_exact_cap_is_complete(monkeypatch):
+    """Round-107 follow-up (VUQ6I): the audit's aggregate
+    page count MUST use strict ``>`` so 30 threads with one
+    page each and ``safety_cap=30`` returns ``complete=True``.
+    The previous ``>=`` formulation reported the inventory
+    as capped when the aggregate exactly equaled the cap.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _follow_nested_cursor_for_threads,
+    )
+    import scripts.local._shared_pagination as pg_mod
+
+    # 30 threads each with a single 1-page nested inventory.
+    thread_nodes = []
+    for i in range(30):
+        thread_nodes.append({
+            "id": f"PRRT_t{i}",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                "nodes": [{"databaseId": 1000 + i}],
+            },
+        })
+    safety_cap = 30
+
+    def fake_paginate(*args, **kwargs):
+        return {
+            "nodes": [{"databaseId": kwargs.get("thread_id", "")}],
+            "pages": 1,
+            "capped": False,
+            "complete": True,
+        }
+
+    monkeypatch.setattr(pg_mod, "paginate_nested_comments", fake_paginate)
+    res = _follow_nested_cursor_for_threads(
+        thread_nodes, safety_cap=safety_cap, timeout=30
+    )
+
+    assert res["complete"] is True, (
+        "Round-107 (VUQ6I): 30 threads × 1 page with cap=30 "
+        "MUST be complete=True; got "
+        f"complete={res.get('complete')!r}, error={res.get('error')!r}"
+    )
+    assert res["capped"] is False, (
+        "Round-107 (VUQ6I): exactly-at-cap aggregate pages MUST "
+        f"be capped=False; got capped={res.get('capped')!r}"
+    )
+
+
+def test_r107_pagination_terminal_over_cap_is_capped():
+    """Round-107 follow-up (VUQ6C): a terminal nested-comments
+    page that contains MORE unique records than the remaining
+    capacity (e.g. 10 comments with ``safety_cap=5``) MUST
+    truncate to the cap and surface as ``capped=True``,
+    ``complete=False``. The previous ``if len + 1 > cap:
+    break`` shape silently dropped excess records on a
+    terminal page.
+    """
+    import json as _json
+    import urllib.request as ur
+    import subprocess as sp
+    from scripts.local import _shared_pagination as pg
+
+    # Mock returning 10 unique records on a single
+    # terminal page (hasNextPage=False). With
+    # safety_cap=5 the inventory must stop at 5 and report
+    # capped=True.
+    class FakeResp:
+        def __init__(self):
+            self.payload = _json.dumps({
+                "data": {
+                    "x": {
+                        "nodes": [
+                            {"id": f"T{i}", "databaseId": 1000 + i}
+                            for i in range(10)
+                        ],
+                        "pageInfo": {
+                            "hasNextPage": False,
+                            "endCursor": None,
+                        },
+                    }
+                }
+            }).encode()
+        def read(self):
+            return self.payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(req, timeout=None):
+        return FakeResp()
+
+    def fake_check_output(cmd, *a, **kw):
+        return "fake-token\n"
+
+    original_urlopen = ur.urlopen
+    original_check = sp.check_output
+    ur.urlopen = fake_urlopen
+    sp.check_output = fake_check_output
+    try:
+        res = pg.paginate_graphql_connection(
+            owner="x", name="y", pr_number=1,
+            query="dummy",
+            path=("data", "x"),
+            page_size=10,
+            safety_cap=5,
+        )
+    finally:
+        ur.urlopen = original_urlopen
+        sp.check_output = original_check
+    assert res["capped"] is True, (
+        "Round-107 (VUQ6C): a terminal page with 10 records "
+        "and cap=5 MUST truncate and report capped=True; got "
+        f"capped={res.get('capped')!r}, error={res.get('error')!r}"
+    )
+    assert res["complete"] is False, (
+        "Round-107 (VUQ6C): a truncated terminal page MUST be "
+        f"complete=False; got complete={res.get('complete')!r}"
+    )
+    assert len(res["nodes"]) == 5, (
+        "Round-107 (VUQ6C): inventory truncated to cap=5; "
+        f"got {len(res['nodes'])} records"
+    )

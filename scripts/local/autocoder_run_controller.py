@@ -939,6 +939,15 @@ def _record_codex_review(args: argparse.Namespace) -> None:
             findings_evidence_path = getattr(args, "findings_file", None) or ""
             plan_persisted = False
             plan_error = ""
+            # Round-107 follow-up (VUQ6M): initialize
+            # ``skip_plan = False`` so the planner-call branch
+            # below is gated by an explicit skip flag (set True
+            # when ``plan_dir.mkdir`` failed). This prevents
+            # the planner call from running AND overwriting
+            # ``plan_error`` with a downstream
+            # ``planner_failed:plan_dir_unavailable`` note when
+            # the user-visible reason is the mkdir failure.
+            skip_plan = False
             if not findings_evidence_path or not str(findings_evidence_path).strip():
                 plan_error = "findings_evidence_missing"
             else:
@@ -1020,41 +1029,53 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                                         parents=True, exist_ok=True
                                     )
                                 except OSError as exc:
-                                    planner_error = (
+                                    # Round-107 follow-up
+                                    # (VUQ6M): the previous
+                                    # shape assigned the mkdir
+                                    # failure to a new local
+                                    # ``planner_error`` and
+                                    # then went on to call
+                                    # ``seam["planner_call"]``
+                                    # which overwrote the
+                                    # failure category with
+                                    # ``planner_failed:plan_dir_unavailable``.
+                                    # The state transition below
+                                    # only inspects ``plan_error``,
+                                    # so the promised
+                                    # ``plan_dir_create_failed``
+                                    # reason was never persisted.
+                                    # The fix: assign
+                                    # ``plan_error`` directly,
+                                    # raise a non-exception flag
+                                    # (``skip_plan = True``),
+                                    # and short-circuit the
+                                    # planner call so the
+                                    # original failure category
+                                    # survives to the transition.
+                                    skip_plan = True
+                                    plan_error = (
                                         f"plan_dir_create_failed:"
                                         f"{type(exc).__name__}"
                                     )
                                     plan_path = None
                                 else:
+                                    skip_plan = False
                                     plan_path = (
                                         plan_dir
                                         / f"repair-plan-{int(time.time())}.json"
                                     )
-                                try:
-                                    plan = seam["planner_call"](
-                                        findings=findings_data,
-                                        changed_paths=[],
-                                        tier="tier_2_cohesive_batch",
-                                        final_candidate=False,
-                                    )
-                                except Exception as exc:
-                                    plan_error = (
-                                        f"planner_failed:"
-                                        f"{type(exc).__name__}"
-                                    )
-                                else:
-                                    # Round-106 follow-up (VUIvd):
-                                    # the planner-side mkdir
-                                    # failure already set
-                                    # ``plan_path = None`` and
-                                    # ``planner_error``. Skip the
-                                    # open() block when there's
-                                    # no path to write to; the
-                                    # outer plan_error handler
-                                    # below catches both kinds.
-                                    if plan_path is None:
+                                if not skip_plan:
+                                    try:
+                                        plan = seam["planner_call"](
+                                            findings=findings_data,
+                                            changed_paths=[],
+                                            tier="tier_2_cohesive_batch",
+                                            final_candidate=False,
+                                        )
+                                    except Exception as exc:
                                         plan_error = (
-                                            f"planner_failed:plan_dir_unavailable"
+                                            f"planner_failed:"
+                                            f"{type(exc).__name__}"
                                         )
                                     else:
                                         try:

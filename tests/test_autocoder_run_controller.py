@@ -2768,26 +2768,22 @@ def test_r106_record_codex_review_guards_plan_dir_creation(
     state = json.loads(Path(state_path).read_text())
     codex = state["codex_review"]
     # The plan dir create failure must have been recorded
-    # somewhere in state. The fail-closed outer branch sets
-    # ``codex['repair_plan_error']`` to either the mkdir
-    # error (``plan_dir_create_failed``) or the planner
-    # rejection (``planner_failed:plan_dir_unavailable``)
-    # depending on which write attempt the controller reached.
-    # Either signal is acceptable evidence of fail-closed.
+    # somewhere in state. The Round-107 follow-up
+    # (VUQ6M) fix assigns ``plan_error`` directly (instead
+    # of ``planner_error``) so the persisted reason is
+    # the unambiguous ``plan_dir_create_failed`` prefix.
     err = codex.get("repair_plan_error", "")
-    assert (
-        err.startswith("plan_dir_create_failed")
-        or "plan_dir_unavailable" in err
-    ), (
-        "Round-106 (VUIvd): repair_plan_error MUST record "
-        f"the plan-dir failure; got {err!r}"
+    assert err.startswith("plan_dir_create_failed"), (
+        "Round-106 (VUIvd) / Round-107 (VUQ6M): "
+        "repair_plan_error MUST start with "
+        f"'plan_dir_create_failed'; got {err!r}"
     )
     next_action = state.get("next_action", {})
     assert (
         "repair_planning_failed" in next_action.get("reason", "")
         or "plan_dir_create_failed" in next_action.get("reason", "")
-        or "plan_dir_unavailable" in next_action.get("reason", "")
     ), (
-        "Round-106 (VUIvd): next_action MUST be fail-closed "
+        "Round-106 (VUIvd) / Round-107 (VUQ6M): "
+        "next_action MUST be fail-closed "
         f"repair_planning_failed; got {next_action!r}"
     )

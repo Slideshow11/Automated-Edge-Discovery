@@ -591,6 +591,13 @@ def paginate_nested_comments(
     error: Optional[str] = None
     has_next = True
     last_cursor: Optional[str] = None
+    # Round-107 follow-up (VUQ6C): ``overshoot`` is set to
+    # True when a page carries records the cap could not
+    # accommodate. The post-loop cap inspection uses the
+    # flag to distinguish ``complete=True`` (terminal
+    # page exact-cap) from ``capped=True`` (terminal page
+    # contained records that the inventory could not carry).
+    overshoot = False
 
     while has_next:
         if pages >= safety_cap:
@@ -743,33 +750,33 @@ query($threadId: ID!, $first: Int!, $after: String) {
             # capped=False``. Apply the same cap-aware
             # truncation the other paginators use.
             #
-            # Round-106 follow-up (VUIvZ): the previous
-            # implementation unconditionally set
-            # ``capped=True`` whenever ``len(nodes) >=
-            # safety_cap`` at any iteration, even when the
-            # final page brought ``nodes`` to exactly the cap
-            # and reported ``hasNextPage=False``. A terminal
-            # page that exactly fills the cap is COMPLETE; the
-            # audit must NOT mark it incomplete and must NOT
-            # record a ``safety_cap_reached`` error. The fix:
-            # inspect ``has_next`` (computed from the
-            # ``pageInfo`` block below) after the in-loop
-            # truncation and only flag ``capped=True`` when
-            # another page remains to be read.
+            # Round-106 follow-up (VUIvZ): a terminal page
+            # that exactly fills the cap is COMPLETE; the
+            # audit must NOT mark it incomplete.
+            #
+            # Round-107 follow-up (VUQ6C): the previous
+            # ``if len(nodes) + 1 > safety_cap: break`` shape
+            # silently dropped excess comments on a terminal
+            # page and reported complete=True. The fix sets
+            # the ``overshoot`` flag whenever a page
+            # contained records we could not append because
+            # the cap was already full.
             if len(nodes) >= safety_cap:
-                # Already at the cap. The ``page_nodes`` loop
-                # above is a no-op, so we skip directly to
-                # the cap-break below.
-                break
-            # If accepting this record would cross the cap
-            # above ``safety_cap``, truncate to the cap and
-            # break. Only mark capped if has_next is true on
-            # the page; a terminal page that exactly fills
-            # the cap is a complete bounded inventory.
-            if len(nodes) + 1 > safety_cap:
-                # Would over-cap; abort.
+                # Already at the cap; do not append this
+                # record. If the loop terminates now with
+                # has_next=False, the post-loop cap inspection
+                # below uses ``overshoot`` to flag the inventory
+                # as ``capped=True, complete=False`` because
+                # records were omitted.
+                overshoot = True
                 break
             nodes.append(n)
+            if len(nodes) >= safety_cap:
+                # Cap reached exactly. The post-loop cap
+                # inspection below applies the right rule
+                # (terminal page exact-cap ⇒ complete;
+                # non-terminal ⇒ capped).
+                break
 
         page_info = comments_obj.get("pageInfo") or {}
         if not isinstance(page_info, dict):
@@ -781,6 +788,22 @@ query($threadId: ID!, $first: Int!, $after: String) {
                 "error": "malformed_pageInfo",
             }
         has_next = bool(page_info.get("hasNextPage", False))
+        # Round-107 follow-up (VUQ6C): a terminal page that
+        # carried extra records beyond the cap (the ``overshoot``
+        # branch fired above) MUST be reported as
+        # ``capped=True, complete=False`` even though
+        # ``has_next`` is False. The post-loop inspection
+        # below uses ``overshoot`` to distinguish that
+        # terminal-page-omitted case from the
+        # terminal-page-exact-cap case which stays COMPLETE.
+        if overshoot and not has_next:
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": True,
+                "error": "aggregate_pages_cap_exceeded",
+            }
         # Round-106 follow-up (VUIvZ): if this terminal page
         # brought the inventory to exactly ``safety_cap``
         # records but ``has_next`` is False, the inventory
@@ -815,15 +838,11 @@ query($threadId: ID!, $first: Int!, $after: String) {
                 }
             last_cursor = next_cursor
             cursor = next_cursor
-            # Round-106 follow-up (VUIvZ): when this page
+            # Round-107 follow-up (VUQ6C): when this page
             # brought the inventory to exactly ``safety_cap``
             # records and ``has_next`` is True, more records
             # exist beyond the cap and the inventory MUST be
             # reported as ``capped=True, complete=False``.
-            # The previous shape only detected this when
-            # `nodes.append(n)` brought the count above the
-            # cap; a page that filled the cap exactly was
-            # treated as a complete terminal page.
             if len(nodes) >= safety_cap:
                 capped = True
                 error = "safety_cap_reached"
