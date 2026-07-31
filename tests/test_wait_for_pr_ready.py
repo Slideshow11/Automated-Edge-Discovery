@@ -3177,6 +3177,11 @@ class TestOnceMode:
         assert data["status"] == mod.STATUS_HOLD_CI_PENDING, (
             f"Expected HOLD_CI_PENDING under --once with pending CI; got {data['status']}"
         )
+        # error_type must mirror status — not contradict it as ERROR_TOOL_FAILURE.
+        assert data.get("error_type") == mod.STATUS_HOLD_CI_PENDING, (
+            f"error_type must equal ci_status (not ERROR_TOOL_FAILURE); got "
+            f"{data.get('error_type')!r}"
+        )
         assert data["once_mode"] is True
         # Verify the pending check is recorded in ci_checks data
         pending = data.get("ci_checks", {}).get("pending_checks", [])
@@ -3247,6 +3252,11 @@ class TestOnceMode:
         assert data["status"] == mod.STATUS_HOLD_CI_FAILED, (
             f"Expected HOLD_CI_FAILED (not ERROR_TOOLING) under --once with "
             f"gh pr checks exit 1; got {data['status']}"
+        )
+        # error_type must mirror status, not be the misleading ERROR_TOOL_FAILURE.
+        assert data.get("error_type") == mod.STATUS_HOLD_CI_FAILED, (
+            f"error_type must equal ci_status (not ERROR_TOOL_FAILURE); got "
+            f"{data.get('error_type')!r}"
         )
         assert data["once_mode"] is True
 

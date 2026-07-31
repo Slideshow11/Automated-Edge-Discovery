@@ -1283,7 +1283,19 @@ def main() -> int:
         if ci_status != STATUS_READY_FOR_FINAL_GATES:
             _REPORT["last_known_state"] = f"ci_poll_{ci_status}"
             _REPORT["error_detail"] = ci_error or f"CI check failed: {ci_status}"
-            _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
+            # Derive error_type from the actual ci_status so the report does not
+            # contradict itself. Under --once, HOLD_CI_PENDING is the expected
+            # outcome (CI genuinely still running) — not a tooling failure.
+            # HOLD_CI_FAILED is a real CI failure and should not be flagged as
+            # ERROR_TOOL_FAILURE either. Only the truly terminal / unexpected
+            # status flows (none of the current ones in this branch) would map
+            # to ERROR_TOOL_FAILURE.
+            if ci_status == STATUS_HOLD_CI_PENDING:
+                _REPORT["error_type"] = "HOLD_CI_PENDING"
+            elif ci_status == STATUS_HOLD_CI_FAILED:
+                _REPORT["error_type"] = "HOLD_CI_FAILED"
+            else:
+                _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
             _REPORT["next_safe_action"] = next_action_for_status(ci_status, args.pr_number, initial_head_sha)
             _write_final(ci_status, initial_head_sha, _REPORT["next_safe_action"], False, False)
             return EXIT_FAILURE
