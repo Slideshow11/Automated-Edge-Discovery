@@ -6,16 +6,31 @@ Polls CI, collects evidence, writes JSON/Markdown reports.
 Does NOT merge, push, commit, resolve review threads, invoke live Claude,
 run autocoder batch, or mutate Hermes.
 
-Usage:
-    python3 scripts/local/wait_for_pr_ready.py \\
-        --pr-number 336 \\
-        --timeout-minutes 30 \\
-        --poll-seconds 30 \\
-        --require-review-comments-clean \\
-        --require-pmg \\
-        --require-final-gates \\
-        --output-json /tmp/aed_runs/pr336_wait/status.json \\
+Usage (default polling mode):
+    python3 scripts/local/wait_for_pr_ready.py \
+        --pr-number 336 \
+        --timeout-minutes 30 \
+        --poll-seconds 30 \
+        --require-review-comments-clean \
+        --require-pmg \
+        --require-final-gates \
+        --output-json /tmp/aed_runs/pr336_wait/status.json \
         --output-md /tmp/aed_runs/pr336_wait/status.md
+
+Usage (one-shot mode — --once):
+    python3 scripts/local/wait_for_pr_ready.py \
+        --pr-number 336 \
+        --once \
+        --require-final-gates \
+        --output-json /tmp/aed_runs/pr336_wait/status.json \
+        --output-md /tmp/aed_runs/pr336_wait/status.md
+
+When --once is supplied, the waiter performs a single complete readiness
+evaluation (one gh pr checks pass, one review-comment gate run, one PMG
+compare if requested, one final_gate_status run if requested) and writes
+the same JSON and Markdown reports as the polling mode. It then exits
+without sleeping, polling, or starting another evaluation cycle.
+timeout-minutes and poll-seconds are ignored under --once.
 
 Exit codes:
     0  — report written (status may be HOLD_* or ERROR_TOOLING)
@@ -232,6 +247,7 @@ def _write_markdown(r: Dict, path: str) -> None:
         f"- **Elapsed seconds**: {r.get('elapsed_seconds', 0.0)}",
         f"- **Timeout minutes**: {r.get('timeout_minutes', 'n/a')}",
         f"- **Poll seconds**: {r.get('poll_seconds', 'n/a')}",
+        f"- **Once mode**: {r.get('once_mode', False)}",
         f"- **Current phase**: {r.get('current_phase', 'n/a')}",
         f"- **Last completed phase**: {r.get('last_completed_phase', 'n/a')}",
         "",
@@ -557,6 +573,117 @@ def conversation_resolution_required(repo: str, base_branch: str) -> bool:
         return False
 
 
+def _evaluate_ci_once(
+    pr_number: int,
+    required_checks: List[str],
+) -> Tuple[str, Dict, Optional[str]]:
+    """
+    Perform exactly ONE gh pr checks evaluation pass and classify the result.
+
+    This is the building block for both the polling waiter (poll_ci_checks) and
+    the --once mode (poll_ci_checks_once). It executes the network call once,
+    classifies the checks according to the same precedence rules, and returns
+    the terminal classification without sleeping, looping, or applying timeout
+    pressure.
+
+    Returns:
+        (status, ci_checks_dict, error_detail)
+
+    Possible status values:
+        STATUS_READY_FOR_FINAL_GATES — all required checks passed
+        STATUS_HOLD_CI_FAILED       — a required check failed/cancelled/skipped/unknown
+        STATUS_HOLD_CI_PENDING      — at least one required check is pending or missing
+        STATUS_ERROR_TOOLING        — gh command failed or output was not valid JSON
+    """
+    try:
+        # Use check=False because gh pr checks returns exit code 8 (checks
+        # pending) even when it successfully returns data — this is not an
+        # error and must not raise ERROR_TOOLING.
+        result = gh_run(
+            ["pr", "checks", str(pr_number), "--json", "name,state,link"],
+            check=False,
+        )
+        if result.returncode not in (0, 8):
+            return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"gh pr checks failed: {result.stderr.strip()}"}, f"exit code {result.returncode}"
+    except RuntimeError as e:
+        return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": str(e)}, str(e)
+
+    raw = result.stdout.strip()
+    if not raw:
+        checks: List[Dict] = []
+    else:
+        try:
+            checks = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"JSON parse failed: {e}"}, f"JSON parse failed: {e}"
+
+    # Group checks by name to handle duplicate entries from parallel workflow runs.
+    # If a required check appears multiple times (e.g., two workflows running on the same
+    # head), we apply precedence: SUCCESS wins over SKIPPED/FAILURE/PENDING.
+    # This prevents a transient SKIPPED entry from overwriting a SUCCESS entry.
+    from collections import defaultdict
+    checks_by_name: Dict[str, List[Dict]] = defaultdict(list)
+    for c in checks:
+        checks_by_name[c["name"]].append(c)
+
+    failed_checks: List[str] = []
+    pending_checks: List[str] = []
+    missing_checks: List[str] = []
+    unknown_checks: List[str] = []
+
+    for name in required_checks:
+        records = checks_by_name.get(name, [])
+        if not records:
+            missing_checks.append(name)
+            continue
+
+        # Evaluate all records for this check name using precedence:
+        # SUCCESS > PENDING/IN_PROGRESS > FAILURE/CANCELLED/SKIPPED > UNKNOWN
+        state_vals = [r.get("state", "").lower() for r in records]
+
+        if any(s == "success" for s in state_vals):
+            pass  # at least one SUCCESS — check satisfied
+        elif any(s in ("pending", "in_progress", "queued", "requested", "waiting") or not s for s in state_vals):
+            pending_checks.append(name)
+        elif any(s in ("failure", "cancelled", "skipped", "neutral", "timed_out", "action_required") for s in state_vals):
+            failed_checks.append(name)
+        else:
+            unknown_checks.append(f"{name} (states={state_vals})")
+
+    # During polling window: a missing required check means the CI workflow
+    # has not yet posted results for that check (workflow may still be spinning
+    # up). Treat as pending — keep polling — so we do not false-fail on a
+    # transient missing check (e.g., pr-gate-live-smoke not yet posted).
+    #
+    # Fail-closed ONLY when:
+    #   (a) timeout reached with still-missing checks  → HOLD_TIMEOUT
+    #   (b) check appears with only FAILURE/SKIPPED   → HOLD_CI_FAILED
+    #   (c) check appears with unknown state          → HOLD_CI_FAILED
+    #
+    # SKIPPED is fail-closed because a check that ran and was deliberately
+    # skipped is not equivalent to "check has not started yet".
+    if missing_checks:
+        pending_checks.extend(missing_checks)
+        # Do NOT add to failed_checks — keep them separate so the
+        # fail-closed path (HOLD_CI_FAILED) only triggers on checks that
+        # actually appeared with a terminal non-success state.
+        missing_checks = []  # consumed into pending_checks
+
+    if failed_checks or unknown_checks:
+        reason = []
+        if failed_checks:
+            reason.append(f"failed/cancelled/skipped: {failed_checks}")
+        if unknown_checks:
+            reason.append(f"unknown state: {unknown_checks}")
+        return STATUS_HOLD_CI_FAILED, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, "; ".join(reason)
+
+    if not pending_checks:
+        return STATUS_READY_FOR_FINAL_GATES, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, None
+
+    # Pending or missing: report HOLD_CI_PENDING (no timeout pressure, no sleep).
+    return STATUS_HOLD_CI_PENDING, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat(), "pending_checks": pending_checks}, f"pending checks: {pending_checks}"
+
+
 def poll_ci_checks(
     pr_number: int,
     required_checks: List[str],
@@ -586,102 +713,57 @@ def poll_ci_checks(
         if remaining <= 0:
             return STATUS_HOLD_TIMEOUT, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat()}, "timeout reached with pending checks"
 
-        try:
-            # Use check=False because gh pr checks returns exit code 8 (checks
-            # pending) even when it successfully returns data — this is not an
-            # error and must not raise ERROR_TOOLING.
-            result = gh_run(
-                ["pr", "checks", str(pr_number), "--json", "name,state,link"],
-                check=False,
-            )
-            if result.returncode not in (0, 8):
-                return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"gh pr checks failed: {result.stderr.strip()}"}, f"exit code {result.returncode}"
-        except RuntimeError as e:
-            return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": str(e)}, str(e)
+        status, ci_dict, error_detail = _evaluate_ci_once(pr_number, required_checks)
 
-        raw = result.stdout.strip()
-        if not raw:
-            checks = []
-        else:
-            try:
-                checks = json.loads(raw)
-            except json.JSONDecodeError as e:
-                return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"JSON parse failed: {e}"}, f"JSON parse failed: {e}"
+        # Terminal statuses: no further polling needed.
+        if status in (STATUS_READY_FOR_FINAL_GATES, STATUS_HOLD_CI_FAILED, STATUS_ERROR_TOOLING):
+            return status, ci_dict, error_detail
 
-        # Group checks by name to handle duplicate entries from parallel workflow runs.
-        # If a required check appears multiple times (e.g., two workflows running on the same
-        # head), we apply precedence: SUCCESS wins over SKIPPED/FAILURE/PENDING.
-        # This prevents a transient SKIPPED entry from overwriting a SUCCESS entry.
-        from collections import defaultdict
-        checks_by_name: Dict[str, List[Dict]] = defaultdict(list)
-        for c in checks:
-            checks_by_name[c["name"]].append(c)
-
-        failed_checks = []
-        pending_checks = []
-        missing_checks = []
-        unknown_checks = []
-
-        for name in required_checks:
-            records = checks_by_name.get(name, [])
-            if not records:
-                missing_checks.append(name)
-                continue
-
-            # Evaluate all records for this check name using precedence:
-            # SUCCESS > PENDING/IN_PROGRESS > FAILURE/CANCELLED/SKIPPED > UNKNOWN
-            state_vals = [r.get("state", "").lower() for r in records]
-
-            if any(s == "success" for s in state_vals):
-                pass  # at least one SUCCESS — check satisfied
-            elif any(s in ("pending", "in_progress", "queued", "requested", "waiting") or not s for s in state_vals):
-                pending_checks.append(name)
-            elif any(s in ("failure", "cancelled", "skipped", "neutral", "timed_out", "action_required") for s in state_vals):
-                failed_checks.append(name)
-            else:
-                unknown_checks.append(f"{name} (states={state_vals})")
-
-        # During polling window: a missing required check means the CI workflow
-        # has not yet posted results for that check (workflow may still be spinning
-        # up). Treat as pending — keep polling — so we do not false-fail on a
-        # transient missing check (e.g., pr-gate-live-smoke not yet posted).
-        #
-        # Fail-closed ONLY when:
-        #   (a) timeout reached with still-missing checks  → HOLD_TIMEOUT
-        #   (b) check appears with only FAILURE/SKIPPED   → HOLD_CI_FAILED
-        #   (c) check appears with unknown state          → HOLD_CI_FAILED
-        #
-        # SKIPPED is fail-closed because a check that ran and was deliberately
-        # skipped is not equivalent to "check has not started yet".
-        if missing_checks:
-            pending_checks.extend(missing_checks)
-            # Do NOT add to failed_checks — keep them separate so the
-            # fail-closed path (HOLD_CI_FAILED) only triggers on checks that
-            # actually appeared with a terminal non-success state.
-            missing_checks = []  # consumed into pending_checks
-
-        if failed_checks or unknown_checks:
-            reason = []
-            if failed_checks:
-                reason.append(f"failed/cancelled/skipped: {failed_checks}")
-            if unknown_checks:
-                reason.append(f"unknown state: {unknown_checks}")
-            return STATUS_HOLD_CI_FAILED, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, "; ".join(reason)
-
-        if not pending_checks:
-            return STATUS_READY_FOR_FINAL_GATES, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, None
-
+        # status == STATUS_HOLD_CI_PENDING: still waiting on checks.
+        # Carry the pending check list forward in the canonical
+        # `pending_at_timeout` field so callers (and existing tests) can
+        # inspect which checks were outstanding at exit.
+        pending_checks = ci_dict.get("pending_checks", []) if isinstance(ci_dict, dict) else []
         # poll_seconds <= 0 means "immediate deadline": return HOLD_TIMEOUT
         # on the first iteration without sleeping. Otherwise the loop with
         # poll_seconds=0 would call time.sleep(0) repeatedly and never make
         # progress against the wall-clock deadline.
         if poll_seconds <= 0:
-            return STATUS_HOLD_TIMEOUT, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat(), "pending_at_timeout": pending_checks}, "immediate deadline with pending checks"
+            timeout_dict = dict(ci_dict) if isinstance(ci_dict, dict) else {"checks": []}
+            timeout_dict["pending_at_timeout"] = pending_checks
+            return STATUS_HOLD_TIMEOUT, timeout_dict, "immediate deadline with pending checks"
 
         if remaining <= poll_seconds:
-            return STATUS_HOLD_TIMEOUT, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat(), "pending_at_timeout": pending_checks}, f"timeout with pending: {pending_checks}"
+            timeout_dict = dict(ci_dict) if isinstance(ci_dict, dict) else {"checks": []}
+            timeout_dict["pending_at_timeout"] = pending_checks
+            return STATUS_HOLD_TIMEOUT, timeout_dict, "timeout with pending checks"
 
         time.sleep(poll_seconds)
+
+
+def poll_ci_checks_once(
+    pr_number: int,
+    required_checks: List[str],
+) -> Tuple[str, Dict, Optional[str]]:
+    """
+    Perform exactly ONE CI checks evaluation pass and return the result.
+
+    This is the --once entry point for the CI gate. It calls gh pr checks
+    exactly one time, classifies the result, and returns without ever sleeping
+    or starting another evaluation cycle.
+
+    timeout_minutes and poll_seconds are deliberately ignored under --once —
+    the call is bounded by the single gh pr checks network round-trip.
+
+    Returns:
+        (status, ci_checks_dict, error_detail) — same shape as poll_ci_checks
+        but the possible statuses are:
+            STATUS_READY_FOR_FINAL_GATES — all required checks passed
+            STATUS_HOLD_CI_PENDING       — at least one required check still pending or missing
+            STATUS_HOLD_CI_FAILED        — a required check failed/cancelled/skipped/unknown
+            STATUS_ERROR_TOOLING         — gh command failed
+    """
+    return _evaluate_ci_once(pr_number, required_checks)
 
 
 def run_review_comment_gate(
@@ -920,8 +1002,15 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--pr-number", type=int, required=True, help="PR number to poll")
-    parser.add_argument("--timeout-minutes", type=int, default=30, help="Max wait time in minutes (default: 30)")
-    parser.add_argument("--poll-seconds", type=int, default=30, help="Seconds between CI polls (default: 30)")
+    parser.add_argument("--timeout-minutes", type=int, default=30, help="Max wait time in minutes (default: 30; ignored under --once)")
+    parser.add_argument("--poll-seconds", type=int, default=30, help="Seconds between CI polls (default: 30; ignored under --once)")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Perform exactly one complete readiness evaluation and exit. "
+             "timeout-minutes and poll-seconds are ignored. "
+             "Produces the same JSON and Markdown reports as polling mode.",
+    )
     parser.add_argument("--require-review-comments-clean", action="store_true", help="Run review-comment gate after CI green")
     parser.add_argument("--require-pmg", action="store_true", help="Run PMG compare")
     parser.add_argument("--require-final-gates", action="store_true", help="Run final_gate_status.py")
@@ -1002,6 +1091,7 @@ def main() -> int:
             "elapsed_seconds": 0.0,
             "timeout_minutes": args.timeout_minutes,
             "poll_seconds": args.poll_seconds,
+            "once_mode": bool(args.once),
             "current_phase": "initializing",
             "last_completed_phase": "",
             "gate_results": {},
@@ -1134,12 +1224,18 @@ def main() -> int:
 
         # ---- Stage 1: Poll CI ----
         _REPORT["current_phase"] = "ci_poll"
-        ci_status, ci_data, ci_error = poll_ci_checks(
-            args.pr_number,
-            required_checks,
-            args.timeout_minutes,
-            args.poll_seconds,
-        )
+        if args.once:
+            ci_status, ci_data, ci_error = poll_ci_checks_once(
+                args.pr_number,
+                required_checks,
+            )
+        else:
+            ci_status, ci_data, ci_error = poll_ci_checks(
+                args.pr_number,
+                required_checks,
+                args.timeout_minutes,
+                args.poll_seconds,
+            )
         _REPORT["ci_checks"] = ci_data
         _add_stage("ci_poll", ci_status, ci_error or "", ci_data)
 

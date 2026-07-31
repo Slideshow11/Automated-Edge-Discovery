@@ -32,13 +32,49 @@ python3 scripts/local/wait_for_pr_ready.py \
   --output-md /tmp/aed_runs/pr335_wait/status.md
 ```
 
+### One-shot mode (--once)
+
+```bash
+python3 scripts/local/wait_for_pr_ready.py \
+  --pr-number 335 \
+  --once \
+  --require-final-gates \
+  --output-json /tmp/aed_runs/pr335_wait/status.json \
+  --output-md /tmp/aed_runs/pr335_wait/status.md
+```
+
+When `--once` is supplied, the waiter performs exactly one complete readiness
+evaluation (one `gh pr checks` pass, one review-comment gate run, one PMG
+compare if requested, one `final_gate_status` run if requested) and writes the
+same JSON and Markdown reports as polling mode. It then exits without
+sleeping, polling, or starting another evaluation cycle.
+
+`timeout-minutes` and `poll-seconds` are ignored under `--once` — the
+evaluation is bounded by a single `gh pr checks` network round-trip.
+
+The `once_mode` field is written into the JSON report (`true`/`false`) and
+into the Markdown Summary section so operators can confirm which mode was used
+without re-reading the invocation.
+
+CI outcome mapping under `--once`:
+
+| CI state on the single pass | Report status |
+|---|---|
+| All required checks `success` | `READY_FOR_FINAL_GATES` (proceeds to gates), or `READY_TO_MERGE_CANDIDATE` if no gates configured |
+| Any required check `pending`/`queued`/`in_progress` (or absent from list) | `HOLD_CI_PENDING` |
+| Any required check `failure`/`cancelled`/`skipped`/`timed_out` | `HOLD_CI_FAILED` |
+
+`HOLD_TIMEOUT` is never produced under `--once` because there is no deadline
+pressure on a single-pass evaluation.
+
 ## Arguments
 
 | Argument | Required | Default | Description |
 |---|---|---|---|
 | `--pr-number` | Yes | — | PR number to poll |
-| `--timeout-minutes` | No | 30 | Max wait time before HOLD_TIMEOUT |
-| `--poll-seconds` | No | 30 | Seconds between CI status polls |
+| `--timeout-minutes` | No | 30 | Max wait time before HOLD_TIMEOUT (ignored under `--once`) |
+| `--poll-seconds` | No | 30 | Seconds between CI status polls (ignored under `--once`) |
+| `--once` | No | False | Perform exactly one complete readiness evaluation and exit |
 | `--require-review-comments-clean` | No | False | Run check_pr_review_comments.py after CI green |
 | `--require-pmg` | No | False | Run PMG compare |
 | `--require-final-gates` | No | False | Run final_gate_status.py |
