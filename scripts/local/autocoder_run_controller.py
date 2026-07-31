@@ -2215,6 +2215,21 @@ def _finalize_run(args: argparse.Namespace) -> None:
     # mutation lacks a terminal result. The caller can either record
     # the missing result or mark the run as not-finalizable.
     workspace = Path(state.get("workspace", "")).resolve()
+    # P1 fix (round 7): refuse finalization when the recorded
+    # workspace is unavailable. If the workspace does not exist
+    # (deleted, unmounted), we cannot read MUTATIONS.jsonl and a
+    # missing check is NOT proof that no mutations are outstanding.
+    # Fail closed.
+    if state.get("workspace") and not workspace.is_dir():
+        print(
+            f"ERROR: refusing to finalize: workspace "
+            f"{state.get('workspace')!r} is not a directory "
+            f"(deleted, unmounted, or otherwise unavailable). "
+            f"Cannot read MUTATIONS.jsonl; refusing to assume zero "
+            f"outstanding mutations.",
+            file=sys.stderr,
+        )
+        sys.exit(8)
     if workspace.is_dir():
         # P1 fix (round 4): share the mutation-journal lock across
         # the outstanding-mutations check and the terminal state
@@ -2722,6 +2737,51 @@ def _state_mutation_target(state: dict) -> Optional[str]:
 
 def _authorize_mutation(args: argparse.Namespace) -> None:
     state = _load_state(args.state)
+    # Round-120 P1 fix (round 7): verify the launch receipt
+    # exists and matches the current run before authorizing. The
+    # receipt is the documented precondition for any repository
+    # or GitHub mutation; if it is missing, belongs to an earlier
+    # run, or was never emitted, refuse.
+    state_workspace_dir = Path(state.get("workspace", ""))
+    receipt_path = state_workspace_dir / "LAUNCH_RECEIPT.json"
+    if not receipt_path.is_file():
+        print(
+            f"ERROR: cannot authorize mutation: launch receipt "
+            f"missing at {receipt_path}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
+    try:
+        with open(receipt_path) as f:
+            receipt = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(
+            f"ERROR: cannot authorize mutation: failed to read "
+            f"launch receipt at {receipt_path}: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
+    receipt_run_id = (receipt.get("run_identity") or {}).get("run_id")
+    if receipt_run_id != state.get("run_id"):
+        print(
+            f"ERROR: cannot authorize mutation: launch receipt "
+            f"run_id={receipt_run_id!r} does not match state "
+            f"run_id={state.get('run_id')!r}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
+    receipt_workspace = (receipt.get("run_identity") or {}).get("workspace") or (
+        receipt.get("workspace")
+    )
+    # Validate workspace path matches.
+    if receipt_workspace and str(Path(receipt_workspace).resolve()) != str(Path(state.get("workspace", "")).resolve()):
+        print(
+            f"ERROR: cannot authorize mutation: launch receipt "
+            f"workspace={receipt_workspace!r} does not match state "
+            f"workspace={state.get('workspace')!r}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
     # Round-120 P2 fix: validate that the caller's --workspace
     # matches the workspace recorded in the state file. A path
     # mix-up could authorize a mutation to a journal the
