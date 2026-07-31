@@ -900,7 +900,7 @@ def _walk_pagination_cursors(
             # a PR with more than 100 review threads
             # would still leave per-review-summary
             # findings as stale-blockers.
-            "author { login } pullRequestReview { databaseId } } } } } } }"
+            "author { login } pullRequestReview { databaseId } } } } } } } }"
         )
         cmd = [
             "gh", "api", "graphql",
