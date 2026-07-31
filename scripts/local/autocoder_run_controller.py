@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,17 @@ from typing import Any, Dict, List, Optional
 # side-effect imports at module load. The seam is a dict the
 # production flow uses by default and tests can swap.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+
+# Round-120: run-identity, supervisor-lock, mutation-authorization,
+# and launch-receipt modules. These are imported here (not at top
+# of file) so existing tests that import symbols from this module
+# continue to load without circular dependencies.
+from scripts.local import (
+    aed_run_identity as _run_identity,
+    aed_supervisor_lock as _supervisor_lock,
+    aed_mutation_authorization as _mutation_auth,
+    aed_launch_receipt as _launch_receipt,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +164,27 @@ def _load_state(path: str) -> dict:
 
 
 def _save_state(state: dict, path: str) -> None:
-    with open(path, "w") as f:
-        json.dump(state, f, indent=2)
-        f.write("\n")
+    """Write state atomically with restrictive permissions (0o600 on POSIX)."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp_path = p.with_suffix(p.suffix + ".tmp")
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC,
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, p)
+    except Exception:
+        # Best-effort cleanup of the temp file.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _load_bundle_index(path: Optional[str]) -> Optional[dict]:
@@ -505,13 +535,101 @@ def _init(args: argparse.Namespace) -> None:
     else:
         out_path = str(Path(args.workspace) / "CONTROLLER_STATE.json")
 
+    # Record the launch time for the run identity (separate from
+    # created_at on the state, which is used as a last-write timestamp).
+    state["run_identity"] = None  # filled in below after lock acquisition
+
     _save_state(state, out_path)
+
+    # Round-120: acquire a host-local supervisor lock scoped to
+    # (repository, target_pr_number) when provided. The lock is
+    # only acquired when those scopes are explicit; otherwise we
+    # skip locking and only persist the launch receipt.
+    lock_outcome = None
+    lock_path_str: Optional[str] = None
+    scope: Optional[dict] = None
+    if getattr(args, "repository", None) or getattr(args, "target_pr_number", None):
+        scope = {
+            "repository": getattr(args, "repository", None) or "",
+            "target_pr_number": getattr(args, "target_pr_number", None),
+            "mutation_target": getattr(args, "mutation_target", None),
+        }
+        proc_evidence = _run_identity.capture_process_start_evidence()
+        host_identity = _run_identity.capture_host_identity()
+        # proc_evidence is guaranteed non-None on POSIX; guard defensively.
+        owner_pid = int(proc_evidence["pid"]) if proc_evidence else os.getpid()
+        owner_start_evidence = proc_evidence or {
+            "pid": owner_pid,
+            "stat_start_time": None,
+            "stat_start_time_text": None,
+            "ctime_ns": None,
+            "source": "unknown",
+        }
+        lock_outcome = _supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id=args.run_id,
+            owner_host=host_identity,
+            owner_pid=owner_pid,
+            owner_start_evidence=owner_start_evidence,
+            base_dir=Path(args.workspace).parent / "locks" if args.workspace else None,
+        )
+        if not lock_outcome.ok:
+            owner = lock_outcome.owner or {}
+            print(
+                f"ERROR: failed to acquire supervisor lock for scope "
+                f"{scope}: {lock_outcome.reason}; "
+                f"existing_owner_run_id={owner.get('owner_run_id')!r}, "
+                f"existing_owner_pid={owner.get('owner_pid')!r}, "
+                f"indeterminate={lock_outcome.indeterminate}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        lock_path_str = str(lock_outcome.path)
+
+    # Round-120: capture run identity and emit the launch receipt
+    # BEFORE any controller command that performs a repository or
+    # GitHub mutation may execute. Receipt emission is itself the
+    # final bootstrap write and is the precondition for mutation
+    # authorization.
+    proc_evidence = _run_identity.capture_process_start_evidence()
+    host_identity = _run_identity.capture_host_identity()
+    run_identity = _run_identity.capture_run_identity(
+        run_id=args.run_id,
+        controller_version=int(state["controller_version"]),
+        repository=getattr(args, "repository", None),
+        target_pr_number=getattr(args, "target_pr_number", None),
+        current_main_sha=getattr(args, "current_main_sha", None),
+        starting_target_sha=getattr(args, "starting_target_sha", None),
+        current_phase=str(state["overall_status"]),
+        pending_action=str(state["next_action"]["action"]),
+        merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
+    )
+    # Overlay host/proc evidence (already captured by capture_run_identity).
+    run_identity["host"] = host_identity
+    run_identity["process"] = proc_evidence
+
+    state["run_identity"] = run_identity
+    _save_state(state, out_path)
+
+    receipt_json_path, receipt_md_path = _launch_receipt.emit(
+        Path(args.workspace),
+        run_identity=run_identity,
+        state_path=out_path,
+        lock_path=lock_path_str,
+        pending_action=str(state["next_action"]["action"]),
+        current_phase=str(state["overall_status"]),
+        merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
+    )
 
     print(f"Initialized run controller state: {out_path}")
     print(f"  run_id:       {args.run_id}")
     print(f"  tasks:        {len(state['tasks'])}")
     print(f"  integration:  {args.integration_branch}")
     print(f"  status:       {state['overall_status']}")
+    if lock_outcome is not None:
+        print(f"  lock:         {lock_path_str}")
+    print(f"  receipt:      {receipt_json_path}")
+    print(f"  receipt.md:   {receipt_md_path}")
 
 
 def _status(args: argparse.Namespace) -> None:
@@ -2026,12 +2144,43 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
 def _finalize_run(args: argparse.Namespace) -> None:
     state = _load_state(args.state)
 
+    # Round-120: refuse finalization while an authorized or started
+    # mutation lacks a terminal result. The caller can either record
+    # the missing result or mark the run as not-finalizable.
+    workspace = Path(state.get("workspace", "")).resolve()
+    if workspace.is_dir():
+        outstanding = _mutation_auth.outstanding_mutations(workspace)
+        if outstanding:
+            mids = [m.get("mutation_id") for m in outstanding]
+            print(
+                f"ERROR: refusing to finalize: outstanding mutations: {mids}",
+                file=sys.stderr,
+            )
+            sys.exit(8)
+
     state["overall_status"] = "RUN_COMPLETE"
     state["updated_at"] = _utcnow()
     state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
     state["human_action_required"] = False
 
     _save_state(state, args.state)
+
+    # Round-120: release the supervisor lock if we own it.
+    rid = state.get("run_identity") or {}
+    if rid.get("repository"):
+        scope = {
+            "repository": rid.get("repository") or "",
+            "target_pr_number": rid.get("target_pr_number"),
+            "mutation_target": rid.get("mutation_target"),
+        }
+        try:
+            _supervisor_lock.release(
+                scope=scope,
+                owner_run_id=state.get("run_id", "unknown"),
+                base_dir=workspace.parent / "locks",
+            )
+        except Exception:
+            pass
 
     print(f"Run finalized: {state.get('run_id', 'unknown')}")
     print(f"  final status: RUN_COMPLETE")
@@ -2056,6 +2205,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--workspace", required=True, help="Working directory for this run")
     p_init.add_argument("--integration-branch", required=True, help="Integration branch name")
     p_init.add_argument("--output-state", help="Output state file path (default: <workspace>/CONTROLLER_STATE.json)")
+    # Round-120: hardening — run identity, supervisor lock, mutation policy
+    p_init.add_argument("--repository", help="Repository (owner/name) for run scope and lock")
+    p_init.add_argument("--target-pr-number", type=int, help="Target PR number for run scope and lock")
+    p_init.add_argument("--mutation-target", help="Mutation target when no PR is involved (e.g. branch name)")
+    p_init.add_argument("--current-main-sha", help="Current main SHA at run start")
+    p_init.add_argument("--starting-target-sha", help="Starting target SHA at run start")
+    p_init.add_argument("--merge-policy", default="stop_before_merge", help="Merge policy (default: stop_before_merge)")
 
     # status
     p_status = sub.add_parser("status", help="Show current run controller state")
@@ -2206,6 +2362,56 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pgc.add_argument("--compare-json", required=True,
                        help="Path to the guard's compare JSON output")
     p_pgc.add_argument("--compare-md", help="Path to the guard's compare markdown output")
+
+    # Round-120: mutation-authorization and supervisor-lock subcommands
+    p_mauth = sub.add_parser(
+        "authorize-mutation",
+        help="Authorize a one-time repository or GitHub mutation before the executor performs it",
+    )
+    p_mauth.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_mauth.add_argument("--workspace", required=True, help="Run workspace directory")
+    p_mauth.add_argument("--mutation-type", required=True,
+                         help="Type of mutation (e.g. squash_merge, push, pr_body_update)")
+    p_mauth.add_argument("--expected-main-sha", help="Expected current main SHA at execution time")
+    p_mauth.add_argument("--expected-target-sha", help="Expected target/PR-head SHA at execution time")
+    p_mauth.add_argument("--mutation-target", help="Mutation target identifier (e.g. branch name)")
+    p_mauth.add_argument("--pending-action", required=True, help="Exact pending action")
+
+    p_mres = sub.add_parser(
+        "record-mutation-result",
+        help="Record the terminal result of an authorized mutation",
+    )
+    p_mres.add_argument("--workspace", required=True, help="Run workspace directory")
+    p_mres.add_argument("--mutation-id", required=True, help="The mutation_id from authorize-mutation")
+    p_mres.add_argument("--status", required=True,
+                        choices=sorted(_mutation_auth.TERMINAL_RESULTS),
+                        help="Terminal result status")
+    p_mres.add_argument("--evidence", help="Optional evidence string")
+    p_mres.add_argument("--actual-main-sha", help="Observed main SHA after the mutation")
+    p_mres.add_argument("--actual-target-sha", help="Observed target SHA after the mutation")
+    p_mres.add_argument("--error-detail", help="Optional error detail")
+
+    p_locks = sub.add_parser(
+        "inspect-lock",
+        help="Inspect a supervisor lock for a given scope and report liveness",
+    )
+    p_locks.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_locks.add_argument("--workspace", required=True, help="Run workspace directory")
+
+    p_recover = sub.add_parser(
+        "recover-stale-lock",
+        help="Atomically reclaim a stale supervisor lock after recording the prior owner",
+    )
+    p_recover.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_recover.add_argument("--workspace", required=True, help="Run workspace directory")
+    p_recover.add_argument("--staleness-evidence", required=True,
+                           help="One-line description of the evidence declaring the lock stale")
+
+    p_outstanding = sub.add_parser(
+        "list-outstanding-mutations",
+        help="List all authorized mutations with no terminal result",
+    )
+    p_outstanding.add_argument("--workspace", required=True, help="Run workspace directory")
 
     return parser
 
@@ -2371,6 +2577,158 @@ def _record_persistent_guard_compare(args: argparse.Namespace) -> None:
         print(f"  next action: request_human — persistent_mutation_guard_error")
 
 
+def _state_target_pr_number(state: dict) -> Optional[int]:
+    rid = state.get("run_identity") or {}
+    return rid.get("target_pr_number")
+
+
+def _state_repository(state: dict) -> Optional[str]:
+    rid = state.get("run_identity") or {}
+    return rid.get("repository")
+
+
+def _state_mutation_target(state: dict) -> Optional[str]:
+    rid = state.get("run_identity") or {}
+    return rid.get("mutation_target")
+
+
+def _authorize_mutation(args: argparse.Namespace) -> None:
+    state = _load_state(args.state)
+    repository = _state_repository(state) or args.workspace
+    req = _mutation_auth.AuthorizationRequest(
+        run_id=state.get("run_id", "unknown"),
+        repository=repository,
+        target_pr_number=_state_target_pr_number(state),
+        mutation_target=args.mutation_target or _state_mutation_target(state),
+        mutation_type=args.mutation_type,
+        expected_main_sha=args.expected_main_sha,
+        expected_target_sha=args.expected_target_sha,
+        pending_action=args.pending_action,
+    )
+    outcome = _mutation_auth.authorize(Path(args.workspace), req)
+    if not outcome.ok:
+        print(
+            f"ERROR: mutation authorization rejected: {outcome.reason}; "
+            f"existing_mutation_id={outcome.record.get('mutation_id') if outcome.record else None!r}",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    assert outcome.record is not None
+    print(f"Authorized mutation {outcome.mutation_id}")
+    print(f"  type:                {outcome.record.get('mutation_type')}")
+    print(f"  run_id:              {outcome.record.get('run_id')}")
+    print(f"  repository:          {outcome.record.get('repository')}")
+    print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
+    print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
+    print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
+    print(f"  pending_action:      {outcome.record.get('pending_action')}")
+
+
+def _record_mutation_result(args: argparse.Namespace) -> None:
+    try:
+        updated = _mutation_auth.record_result(
+            Path(args.workspace),
+            mutation_id=args.mutation_id,
+            status=args.status,
+            evidence=args.evidence,
+            actual_main_sha=args.actual_main_sha,
+            actual_target_sha=args.actual_target_sha,
+            error_detail=args.error_detail,
+        )
+    except KeyError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(4)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(5)
+    result = updated.get("result") or {}
+    print(f"Recorded mutation result {args.mutation_id} -> {result.get('status')}")
+
+
+def _inspect_lock(args: argparse.Namespace) -> None:
+    state = _load_state(args.state)
+    rid = state.get("run_identity") or {}
+    scope = {
+        "repository": rid.get("repository") or "",
+        "target_pr_number": rid.get("target_pr_number"),
+        "mutation_target": rid.get("mutation_target"),
+    }
+    if not scope["repository"]:
+        print("ERROR: state has no repository scope; cannot inspect lock", file=sys.stderr)
+        sys.exit(6)
+    scope_key = _supervisor_lock.build_scope_key(
+        repository=scope["repository"],
+        target_pr_number=scope["target_pr_number"],
+        mutation_target=scope["mutation_target"],
+    )
+    path = _supervisor_lock.lock_path_for(scope_key, base_dir=Path(args.workspace).parent / "locks")
+    evidence = _supervisor_lock.assess_from_path(path)
+    if evidence is None:
+        print(f"No lock present at {path}")
+        return
+    print(f"Lock at {path}:")
+    print(f"  is_alive:           {evidence.is_alive}")
+    print(f"  is_indeterminate:   {evidence.is_indeterminate}")
+    print(f"  reason:             {evidence.reason}")
+    print(f"  pid_exists:         {evidence.pid_exists}")
+    print(f"  stat_match:         {evidence.stat_start_time_match}")
+    print(f"  ctime_match:        {evidence.ctime_match}")
+    existing = _supervisor_lock.read(path)
+    if existing:
+        print(f"  owner_run_id:       {existing.get('owner_run_id')}")
+        print(f"  owner_pid:          {existing.get('owner_pid')}")
+        print(f"  created_at:         {existing.get('created_at')}")
+
+
+def _recover_stale_lock(args: argparse.Namespace) -> None:
+    state = _load_state(args.state)
+    rid = state.get("run_identity") or {}
+    scope = {
+        "repository": rid.get("repository") or "",
+        "target_pr_number": rid.get("target_pr_number"),
+        "mutation_target": rid.get("mutation_target"),
+    }
+    if not scope["repository"]:
+        print("ERROR: state has no repository scope; cannot recover lock", file=sys.stderr)
+        sys.exit(6)
+    proc_evidence = _run_identity.capture_process_start_evidence() or {
+        "pid": os.getpid(),
+        "stat_start_time": None,
+        "stat_start_time_text": None,
+        "ctime_ns": None,
+        "source": "unknown",
+    }
+    host_identity = _run_identity.capture_host_identity()
+    outcome = _supervisor_lock.recover_stale(
+        scope=scope,
+        recovered_by_run_id=state.get("run_id", "unknown"),
+        recovered_by_host=host_identity,
+        recovered_by_pid=proc_evidence["pid"],
+        recovered_by_start_evidence=proc_evidence,
+        staleness_evidence=args.staleness_evidence,
+        base_dir=Path(args.workspace).parent / "locks",
+    )
+    if not outcome.ok:
+        print(
+            f"ERROR: stale-lock recovery rejected: {outcome.reason}; "
+            f"current_owner_run_id={(outcome.owner or {}).get('owner_run_id')!r}",
+            file=sys.stderr,
+        )
+        sys.exit(7)
+    print(f"Recovered stale lock for scope {scope}")
+    print(f"  reason: {outcome.reason}")
+
+
+def _list_outstanding_mutations(args: argparse.Namespace) -> None:
+    outstanding = _mutation_auth.outstanding_mutations(Path(args.workspace))
+    if not outstanding:
+        print("No outstanding mutations.")
+        return
+    print(f"Outstanding mutations ({len(outstanding)}):")
+    for m in outstanding:
+        print(f"  - {m.get('mutation_id')} ({m.get('mutation_type')}) run_id={m.get('run_id')}")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -2389,6 +2747,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "finalize-run": _finalize_run,
         "record-persistent-guard-snapshot": _record_persistent_guard_snapshot,
         "record-persistent-guard-compare": _record_persistent_guard_compare,
+        "authorize-mutation": _authorize_mutation,
+        "record-mutation-result": _record_mutation_result,
+        "inspect-lock": _inspect_lock,
+        "recover-stale-lock": _recover_stale_lock,
+        "list-outstanding-mutations": _list_outstanding_mutations,
     }
 
     try:
