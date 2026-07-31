@@ -133,9 +133,10 @@ def capture_process_start_evidence(pid: Optional[int] = None) -> Optional[dict]:
     fields = stat_content[last_paren + 2 :].split()
     # Field index 21 (zero-based) is start_time in jiffies after boot.
     # In /proc/<pid>/stat the fields after the comm are numbered from 0
-    # in the list above; the kernel's start_time is field 21 in 1-indexed
-    # terms → index 20 in the zero-based list of fields after ')'.
-    stat_start_time_text = fields[20] if len(fields) > 20 else None
+    # in the list above; the kernel's start_time (1-indexed field 22)
+    # is field index 19 in the zero-based list of fields after ')'.
+    # (fields[0] = state = 1-indexed field 3; so field 22 = fields[19].)
+    stat_start_time_text = fields[19] if len(fields) > 19 else None
     stat_start_time_int: Optional[int] = None
     if stat_start_time_text is not None:
         try:

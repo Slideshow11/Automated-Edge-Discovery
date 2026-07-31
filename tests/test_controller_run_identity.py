@@ -13,8 +13,10 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -814,21 +816,40 @@ class TestLaunchReceipt:
 # ---------------------------------------------------------------------------
 
 
-def run_controller(cmd):
-    import subprocess
+_LOCK_DIR_ENV_KEY = "AED_LOCK_DIR"
+
+
+def _isolated_lock_dir_setup(tmp_path, monkeypatch):
+    """Force every controller subprocess in this test to use a
+    per-test lock directory. This keeps parallel tests from
+    colliding on the host-wide default."""
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    monkeypatch.setenv(_LOCK_DIR_ENV_KEY, str(lock_dir))
+    return lock_dir
+
+
+@pytest.fixture
+def isolated_lock_dir(tmp_path, monkeypatch):
+    return _isolated_lock_dir_setup(tmp_path, monkeypatch)
+
+
+def run_controller(cmd: list[str], env: Optional[dict] = None) -> tuple[int, str, str]:
+    """Run controller CLI, return (exit_code, stdout, stderr)."""
     proc = subprocess.Popen(
         [sys.executable, "scripts/local/autocoder_run_controller.py"] + cmd,
-        cwd=str(Path(__file__).parent.parent),
+        cwd=Path(__file__).parent.parent,
+        env={**os.environ, **(env or {})},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    out, err = proc.communicate()
-    return proc.returncode, out, err
+    stdout, stderr = proc.communicate()
+    return proc.returncode, stdout, stderr
 
 
 class TestControllerInitHardening:
-    def test_init_writes_launch_receipt_and_state_with_restrictive_perms(self, tmp_path):
+    def test_init_writes_launch_receipt_and_state_with_restrictive_perms(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
         tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
         workspace = tmp_path / "ws"
@@ -867,7 +888,7 @@ class TestControllerInitHardening:
         assert receipt["kind"] == "launch_receipt"
         assert receipt["run_identity"]["run_id"] == "aed-test-init-1"
 
-    def test_init_rejects_when_live_lock_held_for_same_scope(self, tmp_path):
+    def test_init_rejects_when_live_lock_held_for_same_scope(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
         tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
         workspace1 = tmp_path / "ws1"
@@ -908,7 +929,7 @@ class TestControllerInitHardening:
         # The error MUST mention the existing owner's run_id.
         assert "aed-test-init-A" in combined
 
-    def test_init_succeeds_without_scope_and_skips_lock(self, tmp_path):
+    def test_init_succeeds_without_scope_and_skips_lock(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
         tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
         workspace = tmp_path / "ws"
@@ -943,7 +964,7 @@ class TestControllerMutationLifecycle:
         assert rc == 0
         return workspace
 
-    def test_authorize_then_result_then_finalize(self, tmp_path):
+    def test_authorize_then_result_then_finalize(self, tmp_path, isolated_lock_dir):
         workspace = self._init_run(tmp_path, "aed-mut-life-1")
         # Authorize.
         rc, out, _ = run_controller([
@@ -980,7 +1001,7 @@ class TestControllerMutationLifecycle:
         ])
         assert rc == 0, out
 
-    def test_finalize_refuses_with_outstanding_mutation(self, tmp_path):
+    def test_finalize_refuses_with_outstanding_mutation(self, tmp_path, isolated_lock_dir):
         workspace = self._init_run(tmp_path, "aed-mut-life-2")
         # Authorize but do NOT record result.
         rc, out, _ = run_controller([
@@ -1002,7 +1023,7 @@ class TestControllerMutationLifecycle:
         assert "outstanding" in err.lower() or "outstanding" in out.lower()
 
     def test_mutation_attempted_before_launch_receipt_is_unauthorized(
-        self, tmp_path
+        self, tmp_path, isolated_lock_dir
     ):
         """The receipt is emitted at init. authorize-mutation must
         succeed only when the run was init'd with a launch receipt.
@@ -1051,7 +1072,7 @@ class TestControllerMutationLifecycle:
             )
 
     def test_crash_after_authorization_before_result_keeps_state_recoverable(
-        self, tmp_path
+        self, tmp_path, isolated_lock_dir
     ):
         workspace = self._init_run(tmp_path, "aed-mut-life-crash")
         rc, out, _ = run_controller([
@@ -1095,17 +1116,17 @@ class TestControllerStaleLockRecovery:
         assert rc == 0
         return workspace
 
-    def test_recover_stale_lock_after_audit_trail(self, tmp_path):
+    def test_recover_stale_lock_after_audit_trail(self, tmp_path, isolated_lock_dir):
         workspace = self._init_run_with_scope(tmp_path, "aed-stale-1")
         # Manually plant a stale lock by overwriting the existing one
         # with a dead-pid owner.
-        # First find the lock path via the controller state.
         scope_key = supervisor_lock.build_scope_key(
             repository="Slideshow11/Automated-Edge-Discovery",
             target_pr_number=416,
         )
-        # Locks are written to <workspace.parent>/locks/.
-        lock_dir = workspace.parent / "locks"
+        # The lock file lives in the host-wide default lock dir
+        # (overridden by AED_LOCK_DIR in this test's fixture).
+        lock_dir = isolated_lock_dir
         lock_path = lock_dir / f"{scope_key.replace('/', '_').replace(':', '_').replace('|', '_')}.lock.json"
         planted = {
             "lock_version": 1,

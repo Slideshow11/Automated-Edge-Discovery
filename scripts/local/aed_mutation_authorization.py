@@ -199,76 +199,104 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
       - A different authorization exists for the same scope with
         non-matching expected heads (treated as a duplicate and
         rejected).
+
+    The duplicate scan and append are serialized with an exclusive
+    sentinel file so that two concurrent executors cannot both
+    succeed in authorizing the same scope.
     """
-    # Scan for an existing record matching this scope. A scope
-    # collision is when two records share (run_id, mutation_type,
-    # repository, target_pr_number, mutation_target) — regardless of
-    # whether the expected heads match. Differing expected heads on
-    # the same scope indicates the executor is being asked to
-    # re-authorize with stale assumptions; we must reject as a
-    # duplicate so the executor does not silently authorize a
-    # second mutation.
-    existing = _read_all_records(workspace)
-    for rec in existing:
-        if rec.get("run_id") != req.run_id:
-            continue
-        if rec.get("mutation_type") != req.mutation_type:
-            continue
-        if rec.get("repository") != req.repository:
-            continue
-        if rec.get("target_pr_number") != req.target_pr_number:
-            continue
-        if rec.get("mutation_target") != req.mutation_target:
-            continue
-        # Scope matched. Now check authorization state.
-        if rec.get("authorization_status") != AUTHORIZED:
-            continue
-        # Heads match exactly → idempotent duplicate (same authorization).
-        heads_match = (
-            rec.get("expected_main_sha") == req.expected_main_sha
-            and rec.get("expected_target_sha") == req.expected_target_sha
-        )
-        if heads_match and rec.get("result") is None:
-            return AuthorizationOutcome(
-                ok=False,
-                mutation_id=None,
-                record=rec,
-                reason="duplicate_authorization",
+    path = mutations_path(workspace)
+    sentinel_path = path.with_suffix(path.suffix + ".auth-sentinel")
+
+    # Acquire an exclusive sentinel. The first caller to reach the
+    # O_EXCL open wins; subsequent callers see FileExistsError and
+    # back off briefly. We retry the sentinel acquisition briefly to
+    # handle the case where another caller holds it momentarily.
+    sentinel_fd = None
+    for _ in range(20):
+        try:
+            sentinel_fd = os.open(
+                str(sentinel_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                0o600,
             )
-        if heads_match and rec.get("result") is not None:
-            return AuthorizationOutcome(
-                ok=False,
-                mutation_id=None,
-                record=rec,
-                reason="duplicate_authorization_already_completed",
-            )
-        # Scope matched but heads differ → reject as duplicate with
-        # a different reason so the executor knows it tried to
-        # re-authorize with drifted heads.
+            break
+        except FileExistsError:
+            import time as _time
+            _time.sleep(0.05)
+    if sentinel_fd is None:
         return AuthorizationOutcome(
             ok=False,
             mutation_id=None,
-            record=rec,
-            reason="duplicate_authorization_with_drifted_heads",
+            record=None,
+            reason="authorization_lock_busy",
         )
 
-    mutation_id = str(uuid.uuid4())
-    record = {
-        "mutation_id": mutation_id,
-        "run_id": req.run_id,
-        "repository": req.repository,
-        "target_pr_number": req.target_pr_number,
-        "mutation_target": req.mutation_target,
-        "mutation_type": req.mutation_type,
-        "expected_main_sha": req.expected_main_sha,
-        "expected_target_sha": req.expected_target_sha,
-        "pending_action": req.pending_action,
-        "created_at": _utcnow(),
-        "authorization_status": AUTHORIZED,
-        "result": None,
-    }
-    _append_record(workspace, record)
-    return AuthorizationOutcome(ok=True, mutation_id=mutation_id, record=record)
+    try:
+        existing = _read_all_records(workspace)
+        for rec in existing:
+            if rec.get("run_id") != req.run_id:
+                continue
+            if rec.get("mutation_type") != req.mutation_type:
+                continue
+            if rec.get("repository") != req.repository:
+                continue
+            if rec.get("target_pr_number") != req.target_pr_number:
+                continue
+            if rec.get("mutation_target") != req.mutation_target:
+                continue
+            if rec.get("authorization_status") != AUTHORIZED:
+                continue
+            heads_match = (
+                rec.get("expected_main_sha") == req.expected_main_sha
+                and rec.get("expected_target_sha") == req.expected_target_sha
+            )
+            if heads_match and rec.get("result") is None:
+                return AuthorizationOutcome(
+                    ok=False,
+                    mutation_id=None,
+                    record=rec,
+                    reason="duplicate_authorization",
+                )
+            if heads_match and rec.get("result") is not None:
+                return AuthorizationOutcome(
+                    ok=False,
+                    mutation_id=None,
+                    record=rec,
+                    reason="duplicate_authorization_already_completed",
+                )
+            return AuthorizationOutcome(
+                ok=False,
+                mutation_id=None,
+                record=rec,
+                reason="duplicate_authorization_with_drifted_heads",
+            )
+
+        mutation_id = str(uuid.uuid4())
+        record = {
+            "mutation_id": mutation_id,
+            "run_id": req.run_id,
+            "repository": req.repository,
+            "target_pr_number": req.target_pr_number,
+            "mutation_target": req.mutation_target,
+            "mutation_type": req.mutation_type,
+            "expected_main_sha": req.expected_main_sha,
+            "expected_target_sha": req.expected_target_sha,
+            "pending_action": req.pending_action,
+            "created_at": _utcnow(),
+            "authorization_status": AUTHORIZED,
+            "result": None,
+        }
+        _append_record(workspace, record)
+        return AuthorizationOutcome(ok=True, mutation_id=mutation_id, record=record)
+    finally:
+        try:
+            os.close(sentinel_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(sentinel_path)
+        except OSError:
+            pass
 
 
 def record_result(

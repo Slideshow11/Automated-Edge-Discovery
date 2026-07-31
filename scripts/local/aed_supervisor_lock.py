@@ -336,11 +336,20 @@ def recover_stale(
     base_dir: Optional[Path] = None,
 ) -> LockOutcome:
     """
-    Atomically take over a stale lock.
+    Atomically take over a stale lock with a strict CAS (compare-and-swap).
 
     Two workers attempting this simultaneously must not both succeed.
-    We use O_EXCL on a temporary rename-then-link dance to ensure
-    at most one worker reclaims the lock.
+    We implement CAS by:
+      1. Reading the existing lock (atomically observes the version).
+      2. Verifying staleness.
+      3. Acquire an exclusive sentinel file lock for the scope's
+         path (O_EXCL on a sibling sentinel). The first contender
+         wins.
+      4. Re-read the lock inside the sentinel to detect a winner.
+      5. Atomically rename tmp → target. If the lock file already
+         contains a different version chain, we abort and release
+         the sentinel.
+      6. Release the sentinel.
 
     On success: returns ok=True, owner=<new owner>, and writes the
     previous owner into recovery_history.
@@ -352,6 +361,7 @@ def recover_stale(
         mutation_target=scope.get("mutation_target"),
     )
     path = lock_path_for(scope_key, base_dir=base_dir)
+    sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
 
     existing = _read_lock(path)
     if existing is None:
@@ -374,51 +384,95 @@ def recover_stale(
             reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
         )
 
-    # Atomically replace the existing lock with a new one via
-    # rename. The first racer to atomically rename wins.
-    new_payload = {
-        "lock_version": LOCK_VERSION,
-        "scope_key": scope_key,
-        "scope": scope,
-        "owner_run_id": recovered_by_run_id,
-        "owner_host": recovered_by_host,
-        "owner_pid": recovered_by_pid,
-        "owner_start_evidence": recovered_by_start_evidence,
-        "created_at": _utcnow(),
-        "max_age_seconds": int(max_age_seconds),
-        "recovery_history": list(existing.get("recovery_history", [])) + [
-            {
-                "recovered_at": _utcnow(),
-                "recovered_by_run_id": recovered_by_run_id,
-                "recovered_by_host": recovered_by_host,
-                "recovered_by_pid": recovered_by_pid,
-                "previous_owner_run_id": existing.get("owner_run_id"),
-                "previous_owner_pid": existing.get("owner_pid"),
-                "previous_owner_created_at": existing.get("created_at"),
-                "staleness_evidence": staleness_evidence,
-                "assess_liveness_reason": evidence.reason,
-            }
-        ],
-    }
-    assert_no_secrets(new_payload, context=str(path))
-
-    # Atomic rename. Use os.replace for atomic rename on POSIX.
-    tmp_path = path.with_suffix(path.suffix + ".recover.tmp")
+    # Strict CAS: acquire an exclusive sentinel file lock. The
+    # first contender to acquire the sentinel wins the recovery
+    # race. Subsequent contenders see FileExistsError.
     try:
-        with safe_restrictive_open(tmp_path, "w") as f:
-            json.dump(new_payload, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp_path, path)
-    except OSError as e:
-        return LockOutcome(
-            ok=False, path=path, owner=existing,
-            reason=f"recovery_failed:{e.strerror or str(e)}",
+        sentinel_fd = os.open(
+            str(sentinel_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+            0o600,
         )
+    except FileExistsError:
+        # Another worker is already performing recovery. Re-read the
+        # lock to report the current owner.
+        current = _read_lock(path)
+        return LockOutcome(
+            ok=False, path=path, owner=current,
+            reason="recovery_in_progress_by_other_worker",
+        )
+    try:
+        # Inside the sentinel, re-read to detect a winner.
+        existing2 = _read_lock(path)
+        if existing2 is None:
+            return LockOutcome(
+                ok=False, path=path, owner=None,
+                reason="lock_disappeared_during_recovery",
+            )
+        # If the existing lock's version chain advanced (because a
+        # winner replaced it), we lose.
+        if existing2.get("lock_version_chain", 0) > existing.get("lock_version_chain", 0):
+            return LockOutcome(
+                ok=False, path=path, owner=existing2,
+                reason="cas_lost_recovery_race",
+            )
 
-    return LockOutcome(
-        ok=True, path=path, owner=new_payload,
-        reason=f"recovered_from:{existing.get('owner_run_id')}",
-    )
+        observed_version = existing2.get("lock_version_chain", 0) + 1
+        new_payload = {
+            "lock_version": LOCK_VERSION,
+            "lock_version_chain": observed_version,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": recovered_by_run_id,
+            "owner_host": recovered_by_host,
+            "owner_pid": recovered_by_pid,
+            "owner_start_evidence": recovered_by_start_evidence,
+            "created_at": _utcnow(),
+            "max_age_seconds": int(max_age_seconds),
+            "observed_predecessor_owner_run_id": existing2.get("owner_run_id"),
+            "observed_predecessor_version": existing2.get("lock_version_chain", 0),
+            "recovery_history": list(existing2.get("recovery_history", [])) + [
+                {
+                    "recovered_at": _utcnow(),
+                    "recovered_by_run_id": recovered_by_run_id,
+                    "recovered_by_host": recovered_by_host,
+                    "recovered_by_pid": recovered_by_pid,
+                    "previous_owner_run_id": existing2.get("owner_run_id"),
+                    "previous_owner_pid": existing2.get("owner_pid"),
+                    "previous_owner_created_at": existing2.get("created_at"),
+                    "previous_version": existing2.get("lock_version_chain", 0),
+                    "staleness_evidence": staleness_evidence,
+                    "assess_liveness_reason": evidence.reason,
+                }
+            ],
+        }
+        assert_no_secrets(new_payload, context=str(path))
+
+        tmp_path = path.with_suffix(path.suffix + ".recover.tmp")
+        try:
+            with safe_restrictive_open(tmp_path, "w") as f:
+                json.dump(new_payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp_path, path)
+        except OSError as e:
+            return LockOutcome(
+                ok=False, path=path, owner=existing2,
+                reason=f"recovery_failed:{e.strerror or str(e)}",
+            )
+
+        return LockOutcome(
+            ok=True, path=path, owner=new_payload,
+            reason=f"recovered_from:{existing2.get('owner_run_id')}",
+        )
+    finally:
+        try:
+            os.close(sentinel_fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(sentinel_path)
+        except OSError:
+            pass
 
 
 def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) -> bool:

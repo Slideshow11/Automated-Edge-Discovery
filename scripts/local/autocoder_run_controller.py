@@ -548,6 +548,14 @@ def _init(args: argparse.Namespace) -> None:
     lock_outcome = None
     lock_path_str: Optional[str] = None
     scope: Optional[dict] = None
+    # Round-120 P1 fix: use the host-wide lock directory by
+    # default. The host-wide dir is derived from the host alone
+    # (XDG_RUNTIME_DIR/aed/locks or ~/.aed/locks), so two runs for
+    # the same (repository, PR) under different workspaces still
+    # collide on a single lock file. Tests pass an explicit
+    # --lock-dir to isolate.
+    lock_dir_arg: Optional[str] = getattr(args, "lock_dir", None)
+    lock_base: Optional[Path] = None
     if getattr(args, "repository", None) or getattr(args, "target_pr_number", None):
         scope = {
             "repository": getattr(args, "repository", None) or "",
@@ -565,13 +573,15 @@ def _init(args: argparse.Namespace) -> None:
             "ctime_ns": None,
             "source": "unknown",
         }
+        if lock_dir_arg:
+            lock_base = Path(lock_dir_arg)
         lock_outcome = _supervisor_lock.try_acquire(
             scope=scope,
             owner_run_id=args.run_id,
             owner_host=host_identity,
             owner_pid=owner_pid,
             owner_start_evidence=owner_start_evidence,
-            base_dir=Path(args.workspace).parent / "locks" if args.workspace else None,
+            base_dir=lock_base,
         )
         if not lock_outcome.ok:
             owner = lock_outcome.owner or {}
@@ -607,6 +617,9 @@ def _init(args: argparse.Namespace) -> None:
     # Overlay host/proc evidence (already captured by capture_run_identity).
     run_identity["host"] = host_identity
     run_identity["process"] = proc_evidence
+    lock_dir_persisted = lock_dir_arg if lock_dir_arg else None
+    if lock_dir_persisted:
+        run_identity["lock_dir"] = str(Path(lock_dir_persisted).resolve())
 
     state["run_identity"] = run_identity
     _save_state(state, out_path)
@@ -2173,11 +2186,17 @@ def _finalize_run(args: argparse.Namespace) -> None:
             "target_pr_number": rid.get("target_pr_number"),
             "mutation_target": rid.get("mutation_target"),
         }
+        # Find the lock file in the same directory the init used.
+        # We try the persisted lock_dir first, then fall back to
+        # the host-wide default.
+        lock_base = None
+        if rid.get("lock_dir"):
+            lock_base = Path(rid["lock_dir"])
         try:
             _supervisor_lock.release(
                 scope=scope,
                 owner_run_id=state.get("run_id", "unknown"),
-                base_dir=workspace.parent / "locks",
+                base_dir=lock_base,
             )
         except Exception:
             pass
@@ -2212,6 +2231,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--current-main-sha", help="Current main SHA at run start")
     p_init.add_argument("--starting-target-sha", help="Starting target SHA at run start")
     p_init.add_argument("--merge-policy", default="stop_before_merge", help="Merge policy (default: stop_before_merge)")
+    p_init.add_argument("--lock-dir",
+                        help="Override the supervisor-lock directory. "
+                             "Default: host-wide dir derived from XDG_RUNTIME_DIR or ~/.aed/locks. "
+                             "Tests pass an explicit dir to isolate.")
 
     # status
     p_status = sub.add_parser("status", help="Show current run controller state")
@@ -2397,6 +2420,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_locks.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
     p_locks.add_argument("--workspace", required=True, help="Run workspace directory")
+    p_locks.add_argument("--lock-dir",
+                         help="Override the supervisor-lock directory (default: host-wide)")
 
     p_recover = sub.add_parser(
         "recover-stale-lock",
@@ -2404,6 +2429,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_recover.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
     p_recover.add_argument("--workspace", required=True, help="Run workspace directory")
+    p_recover.add_argument("--lock-dir",
+                           help="Override the supervisor-lock directory (default: host-wide)")
     p_recover.add_argument("--staleness-evidence", required=True,
                            help="One-line description of the evidence declaring the lock stale")
 
@@ -2645,6 +2672,13 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
     print(f"Recorded mutation result {args.mutation_id} -> {result.get('status')}")
 
 
+def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
+    lock_dir_arg = getattr(args, "lock_dir", None)
+    if lock_dir_arg:
+        return Path(lock_dir_arg)
+    return None
+
+
 def _inspect_lock(args: argparse.Namespace) -> None:
     state = _load_state(args.state)
     rid = state.get("run_identity") or {}
@@ -2661,7 +2695,9 @@ def _inspect_lock(args: argparse.Namespace) -> None:
         target_pr_number=scope["target_pr_number"],
         mutation_target=scope["mutation_target"],
     )
-    path = _supervisor_lock.lock_path_for(scope_key, base_dir=Path(args.workspace).parent / "locks")
+    path = _supervisor_lock.lock_path_for(
+        scope_key, base_dir=_resolve_lock_base(args, Path(args.workspace))
+    )
     evidence = _supervisor_lock.assess_from_path(path)
     if evidence is None:
         print(f"No lock present at {path}")
@@ -2706,7 +2742,7 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         recovered_by_pid=proc_evidence["pid"],
         recovered_by_start_evidence=proc_evidence,
         staleness_evidence=args.staleness_evidence,
-        base_dir=Path(args.workspace).parent / "locks",
+        base_dir=_resolve_lock_base(args, Path(args.workspace)),
     )
     if not outcome.ok:
         print(
