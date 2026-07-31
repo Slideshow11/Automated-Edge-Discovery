@@ -2176,21 +2176,50 @@ def _finalize_run(args: argparse.Namespace) -> None:
     # the missing result or mark the run as not-finalizable.
     workspace = Path(state.get("workspace", "")).resolve()
     if workspace.is_dir():
-        outstanding = _mutation_auth.outstanding_mutations(workspace)
-        if outstanding:
-            mids = [m.get("mutation_id") for m in outstanding]
+        # P1 fix (round 4): share the mutation-journal lock across
+        # the outstanding-mutations check and the terminal state
+        # transition. Without this, authorize-mutation could read
+        # RUN_ACTIVE, decide to authorize, append its record after
+        # finalization completes its "no outstanding" check, and
+        # leave the controller finalized while a mutation was
+        # authorized.
+        _mutation_auth_path = workspace / _mutation_auth.MUTATIONS_FILENAME
+        sentinel_path = _mutation_auth_path.with_suffix(
+            _mutation_auth_path.suffix + ".auth-sentinel"
+        )
+        from scripts.local.aed_supervisor_lock import (
+            _acquire_sentinel_fd,
+            _release_sentinel_fd,
+        )
+        sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+        if sentinel_fd is None:
             print(
-                f"ERROR: refusing to finalize: outstanding mutations: {mids}",
+                "ERROR: refusing to finalize: mutation journal lock busy",
                 file=sys.stderr,
             )
             sys.exit(8)
-
-    state["overall_status"] = "RUN_COMPLETE"
-    state["updated_at"] = _utcnow()
-    state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
-    state["human_action_required"] = False
-
-    _save_state(state, args.state)
+        try:
+            outstanding = _mutation_auth.outstanding_mutations(workspace)
+            if outstanding:
+                mids = [m.get("mutation_id") for m in outstanding]
+                print(
+                    f"ERROR: refusing to finalize: outstanding mutations: {mids}",
+                    file=sys.stderr,
+                )
+                sys.exit(8)
+            state["overall_status"] = "RUN_COMPLETE"
+            state["updated_at"] = _utcnow()
+            state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
+            state["human_action_required"] = False
+            _save_state(state, args.state)
+        finally:
+            _release_sentinel_fd(sentinel_fd, sentinel_path)
+    else:
+        state["overall_status"] = "RUN_COMPLETE"
+        state["updated_at"] = _utcnow()
+        state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
+        state["human_action_required"] = False
+        _save_state(state, args.state)
 
     # Round-120: release the supervisor lock if we own it.
     rid = state.get("run_identity") or {}
@@ -2660,6 +2689,54 @@ def _authorize_mutation(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(10)
+    rid = state.get("run_identity") or {}
+    # P2 fix (round 4): resolve owner_state_path to an absolute
+    # path. Relative paths become relative to the CURRENT process's
+    # CWD when later read, so a controller invocation from a
+    # different working directory would fail closed as
+    # indeterminate. Stored paths must be absolute.
+    if rid.get("lock_dir") and not Path(rid["lock_dir"]).is_absolute():
+        rid["lock_dir"] = str(Path(rid["lock_dir"]).resolve())
+    scope = {
+        "repository": rid.get("repository") or "",
+        "target_pr_number": rid.get("target_pr_number"),
+        "mutation_target": rid.get("mutation_target"),
+    }
+    # Round-120 P1 fix (round 4): verify the live scope lock still
+    # belongs to this run. If another worker has recovered our
+    # stale lease, the state may say RUN_ACTIVE but we no longer
+    # own the supervisor lock; refuse authorization.
+    if scope.get("repository"):
+        run_id = state.get("run_id", "unknown")
+        lock_base_for_check = None
+        if rid.get("lock_dir"):
+            lock_base_for_check = Path(rid["lock_dir"])
+        if not _supervisor_lock.is_lease_held_by_run(
+            scope=scope, owner_run_id=run_id, base_dir=lock_base_for_check
+        ):
+            print(
+                f"ERROR: cannot authorize mutation: no live supervisor "
+                f"lock held by run_id={run_id} for scope={scope}",
+                file=sys.stderr,
+            )
+            sys.exit(11)
+    # Round-120 P1 fix (round 4): reject mutation targets outside
+    # the locked scope. If the state scope is repo+A but the
+    # caller supplies --mutation-target B, we would authorize a
+    # mutation against B while another controller legitimately
+    # holds B's lock.
+    state_mutation_target = _state_mutation_target(state)
+    if (
+        args.mutation_target
+        and state_mutation_target
+        and args.mutation_target != state_mutation_target
+    ):
+        print(
+            f"ERROR: --mutation-target={args.mutation_target} does not "
+            f"match state scope mutation_target={state_mutation_target}",
+            file=sys.stderr,
+        )
+        sys.exit(12)
     repository = _state_repository(state) or args.workspace
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),

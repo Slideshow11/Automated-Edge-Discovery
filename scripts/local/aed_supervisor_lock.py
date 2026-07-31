@@ -566,6 +566,24 @@ def recover_stale(
                 ok=False, path=path, owner=existing2,
                 reason="cas_lost_recovery_race",
             )
+        # P1 fix (round 4): even when the chain did not advance, the
+        # lock may have been replaced by try_acquire (which resets
+        # the chain to 1 when overwriting a stale lock). Re-assess
+        # liveness of existing2 under the sentinel to confirm the
+        # predecessor is still stale; otherwise we would overwrite a
+        # live lease.
+        live2 = assess_liveness(existing2)
+        if live2.is_alive:
+            return LockOutcome(
+                ok=False, path=path, owner=existing2,
+                reason="recheck_found_lock_live",
+            )
+        if live2.is_indeterminate:
+            return LockOutcome(
+                ok=False, path=path, owner=existing2,
+                reason=f"recheck_indeterminate:{live2.reason}",
+                indeterminate=True,
+            )
 
         observed_version = existing2.get("lock_version_chain", 0) + 1
         now_iso = _utcnow()
@@ -622,23 +640,75 @@ def recover_stale(
 
 
 def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) -> bool:
-    """Release the lock IF owner_run_id matches the current owner."""
+    """Release the lock IF owner_run_id matches the current owner.
+
+    The read-and-delete sequence is serialized using the recovery
+    sentinel (flock) so that a concurrent recover_stale cannot
+    install a new lease between our check and our unlink. This
+    closes the round-4 P1 race where release() could delete a
+    freshly-installed live lease belonging to the recovering run.
+    """
     scope_key = build_scope_key(
         repository=scope["repository"],
         target_pr_number=scope.get("target_pr_number"),
         mutation_target=scope.get("mutation_target"),
     )
     path = lock_path_for(scope_key, base_dir=base_dir)
-    existing = _read_lock(path)
-    if existing is None:
-        return False
-    if existing.get("owner_run_id") != owner_run_id:
+    sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    if sentinel_fd is None:
+        # Another worker is holding the sentinel; do not unlink.
         return False
     try:
-        path.unlink()
-    except FileNotFoundError:
+        existing = _read_lock(path)
+        if existing is None:
+            return False
+        if existing.get("owner_run_id") != owner_run_id:
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+    finally:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+
+
+def is_lease_held_by_run(
+    *,
+    scope: dict,
+    owner_run_id: str,
+    base_dir: Optional[Path] = None,
+) -> bool:
+    """Return True iff a LIVE lease for `scope` is currently held
+    by `owner_run_id`. Used by callers that need to gate
+    authorization on live lock ownership.
+
+    This acquires the recovery sentinel so the check is
+    race-free with respect to recover_stale and release.
+    """
+    scope_key = build_scope_key(
+        repository=scope["repository"],
+        target_pr_number=scope.get("target_pr_number"),
+        mutation_target=scope.get("mutation_target"),
+    )
+    path = lock_path_for(scope_key, base_dir=base_dir)
+    sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    if sentinel_fd is None:
         return False
-    return True
+    try:
+        existing = _read_lock(path)
+        if existing is None:
+            return False
+        if existing.get("owner_run_id") != owner_run_id:
+            return False
+        live = assess_liveness(existing)
+        if live.is_indeterminate:
+            return False
+        return bool(live.is_alive)
+    finally:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def read(path: Path) -> Optional[dict]:
