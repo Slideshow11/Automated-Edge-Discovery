@@ -136,6 +136,23 @@ even if the overall CI would otherwise green-light the PR:
 
 The `pending` state is not a failure — it triggers another poll cycle.
 
+`gh pr checks` exit code semantics (see https://cli.github.com/manual/gh_help_exit-codes):
+
+- `0` — all checks passed (or mixed with successes)
+- `1` — at least one required check has a terminal non-success state. JSON output
+  is still valid and must be parsed so the classifier reports `HOLD_CI_FAILED`
+  with the actual failed-check names (rather than `ERROR_TOOLING`).
+- `8` — at least one required check is pending. JSON output is still valid and
+  must be parsed so the pending-check list is reported.
+- Anything else (2, 4, 127, etc.) — genuine invocation failure → `ERROR_TOOLING`.
+- Empty stdout with any exit code — transport / cancellation / auth failure →
+  `ERROR_TOOLING` (a genuine zero-checks response is JSON `[]`, not empty).
+- Malformed JSON — genuine invocation failure → `ERROR_TOOLING`.
+
+This matches the acceptance contract used in `scripts/local/aed_pr.py` (lines
+671–678) so the waiter and the AED CLI surface classify `gh pr checks`
+results identically.
+
 Default required checks for this repository:
 - `test (3.11)` or `test` (any Python version)
 - `review-comment-gate`
