@@ -741,15 +741,45 @@ def _init(args: argparse.Namespace) -> None:
             # still satisfies the existence check and
             # prevents duplicate adoption.
             existing_owner = lock_outcome.owner or {}
+            # Round-31 P1 fix (Acquire the adoption token
+            # exclusively): the previous Round-30 stub used
+            # `Path.touch(exist_ok=True)`, which does not
+            # signal a winner when two concurrent inits
+            # race. Both calls would succeed and both would
+            # set lock_outcome.ok=True, allowing them to
+            # overwrite each other's tasks and receipts.
+            # Create the token exclusively using os.open with
+            # O_CREAT|O_EXCL. The process that successfully
+            # creates the file is the unique adoption winner;
+            # any concurrent init that loses the race sees
+            # FileExistsError and falls through to the
+            # regular failure path.
             try:
                 Path(out_path).parent.mkdir(
                     parents=True, exist_ok=True, mode=0o700
                 )
-                Path(out_path).touch(mode=0o600, exist_ok=True)
-            except (OSError, FileExistsError):
-                # If touch fails for any reason, fall back to
-                # the existence check; a later concurrent
-                # init will retry.
+                cloexec = getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(
+                    str(out_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec,
+                    0o600,
+                )
+                os.close(fd)
+            except FileExistsError:
+                # Another init won the race. Fall through
+                # to the regular failure path; do NOT adopt.
+                # Reset lock_outcome so the subsequent
+                # `not lock_outcome.ok` branch fires.
+                lock_outcome = LockOutcome(
+                    ok=False,
+                    path=lock_outcome.path,
+                    owner=None,
+                    reason="adoption_token_already_consumed",
+                )
+            except OSError:
+                # If the exclusive create fails for any
+                # other reason, fall back to the existence
+                # check; a later concurrent init will retry.
                 pass
             print(
                 f"NOTE: adopting pre-existing lease for run_id="
@@ -796,6 +826,33 @@ def _init(args: argparse.Namespace) -> None:
             # Round-22 P1 fix: also bind this path to the
             # requested state path (see Round-22 fix above).
             existing_owner = lock_outcome.owner or {}
+            # Round-31 P1 fix: also create the adoption
+            # token exclusively (the live branch above does
+            # the same). Without this, the indeterminate
+            # branch can race with the live branch and with
+            # other concurrent inits. The O_EXCL create is
+            # the atomic winner signal; the loser sees
+            # FileExistsError and falls through.
+            try:
+                Path(out_path).parent.mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
+                cloexec = getattr(os, "O_CLOEXEC", 0)
+                fd = os.open(
+                    str(out_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec,
+                    0o600,
+                )
+                os.close(fd)
+            except FileExistsError:
+                lock_outcome = LockOutcome(
+                    ok=False,
+                    path=lock_outcome.path,
+                    owner=None,
+                    reason="adoption_token_already_consumed",
+                )
+            except OSError:
+                pass
             print(
                 f"NOTE: adopting pre-existing same-run lease "
                 f"(state_path missing) for run_id={args.run_id!r}",
