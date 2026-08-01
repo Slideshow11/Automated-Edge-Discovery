@@ -1214,7 +1214,7 @@ class TestControllerMutationLifecycle:
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
-            "--expected-target-sha", "c973fa6c",
+            "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "merge",
         ])
         assert rc == 0, out
@@ -1251,7 +1251,7 @@ class TestControllerMutationLifecycle:
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
-            "--expected-target-sha", "c973fa6c",
+            "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "merge",
         ])
         assert rc == 0
@@ -1322,7 +1322,7 @@ class TestControllerMutationLifecycle:
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
-            "--expected-target-sha", "c973fa6c",
+            "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "merge",
         ])
         assert rc == 0
@@ -1484,7 +1484,7 @@ class TestControllerStaleLockRecovery:
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
-            "--expected-target-sha", "c973fa6c",
+            "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "merge",
         ])
         assert rc == 10
@@ -1628,7 +1628,7 @@ class TestRound8ReceiptStatePathBinding:
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
-            "--expected-target-sha", "c973fa6c",
+            "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "merge",
         ])
         assert rc == 13, f"expected exit 13 (receipt-state-path binding), got {rc}: {err}"
@@ -2668,3 +2668,242 @@ class TestRound18TestPollutionFix:
         assert not (repo_root / "rel_state.json").exists(), (
             "test pollution: rel_state.json leaked into repo root"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-19 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound19JournalDirFsync:
+    """Round-19 P1 fix: when the journal file is created for the
+    first time, _append_record must fsync the parent directory
+    after fsync(fd) so the new directory entry is durable across
+    a power loss."""
+
+    def test_first_create_fsyncs_parent_directory(self, workspace, monkeypatch):
+        from scripts.local import aed_mutation_authorization as ma
+
+        # Track fsync calls by their fd value (parent-dir fd vs
+        # file fd). We track all fsync calls, then assert that one
+        # was for the parent directory.
+        import os as _os
+
+        fsync_calls = {"fds": []}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["fds"].append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(ma.os, "fsync", tracking_fsync)
+
+        # Confirm journal does not exist yet.
+        from scripts.local.aed_mutation_authorization import mutations_path
+        journal = mutations_path(workspace)
+        assert not journal.exists(), "fixture must not pre-create the journal"
+
+        # First-ever append.
+        ma._append_record(
+            workspace,
+            {"mutation_id": "m-dir-fsync", "kind": "test", "x": 1},
+        )
+
+        # Collect the unique fd values that were fsynced.
+        unique_fds = list(dict.fromkeys(fsync_calls["fds"]))
+        assert len(unique_fds) >= 2, (
+            f"Round-19 P1 fix missing: only {len(unique_fds)} unique "
+            f"fds were fsynced; expected at least 2 (file fd + "
+            f"parent-directory fd) when creating the journal for "
+            f"the first time. fds={unique_fds}"
+        )
+
+    def test_subsequent_appends_do_not_fsync_parent_directory(
+        self, workspace, monkeypatch
+    ):
+        """After the journal exists, re-appending should NOT
+        open the parent directory just to fsync it. The first
+        fsync was sufficient."""
+        from scripts.local import aed_mutation_authorization as ma
+
+        # First append to create the journal.
+        ma._append_record(
+            workspace,
+            {"mutation_id": "m-seed", "kind": "test", "x": 0},
+        )
+
+        # Now track fsync on the SECOND append.
+        import os as _os
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(ma.os, "fsync", tracking_fsync)
+
+        ma._append_record(
+            workspace,
+            {"mutation_id": "m-second", "kind": "test", "x": 2},
+        )
+
+        # Exactly ONE fsync call (for the file), no directory
+        # fsync on a re-append.
+        assert fsync_calls["count"] == 1, (
+            f"Round-19 P1 fix over-firing: {fsync_calls['count']} "
+            f"fsync calls on re-append; expected exactly 1 (just "
+            f"the file)."
+        )
+
+
+class TestRound19SquashMergeRequiresFullSha:
+    """Round-19 P1 fix: --expected-target-sha must be a full
+    40-character lowercase hex SHA when --mutation-type is
+    squash_merge. The previous code accepted None / short /
+    non-hex values, allowing a PR head change between
+    authorization and merge to go undetected."""
+
+    def _make_active_state(self, workspace, tmp_path):
+        """Plant a minimal controller state + launch receipt so
+        authorize-mutation can run far enough to reach the new
+        check."""
+        # Run init to get a valid state + receipt pair.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r19-sm",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "919",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc} err={err}"
+        # Read the pending_action from the freshly created state.
+        state_file = workspace / "CONTROLLER_STATE.json"
+        state = json.loads(state_file.read_text())
+        pending_action = state["next_action"]["action"]
+        return str(state_file), pending_action
+
+    def test_squash_merge_with_full_sha_succeeds(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # The launch receipt / state live in a sibling workspace
+        # to keep this test from colliding with the journal.
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path, pending_action = self._make_active_state(ws, tmp_path)
+
+        full_sha = "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70"
+        rc, out, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", full_sha,
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}"
+
+    def test_squash_merge_with_nonexistent_sha_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path, pending_action = self._make_active_state(ws, tmp_path)
+
+        # Empty string.
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", "",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, f"empty sha must be rejected, got rc={rc}, err={err}"
+        assert "expected-target-sha" in err.lower() or "full" in err.lower()
+
+    def test_squash_merge_with_short_sha_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path, pending_action = self._make_active_state(ws, tmp_path)
+
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", "abc123",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, f"short sha must be rejected, got rc={rc}, err={err}"
+
+    def test_squash_merge_with_uppercase_sha_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path, pending_action = self._make_active_state(ws, tmp_path)
+
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", "0F781D67A0C0A1B2C3D4E5F6789ABCDEF01234567",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, f"uppercase sha must be rejected, got rc={rc}, err={err}"
+
+    def test_non_squash_merge_with_short_sha_is_allowed(
+        self, tmp_path, isolated_lock_dir
+    ):
+        """The strict-SHA check is ONLY for squash_merge.
+        Other mutation types (pr_body_update, label_change) must
+        continue to accept None / any string for
+        --expected-target-sha to preserve existing semantics."""
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path, pending_action = self._make_active_state(ws, tmp_path)
+
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "pr_body_update",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"non-squash-merge without sha must be accepted, got rc={rc}, err={err}"

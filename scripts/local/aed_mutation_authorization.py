@@ -163,13 +163,25 @@ def _append_record(workspace: Path, record: dict) -> None:
     path = mutations_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     assert_no_secrets(record, context=str(path))
+    # Round-19 P1 fix: detect whether the journal file did not
+    # exist before this append. If so, we are creating it for the
+    # first time, and we MUST fsync the parent directory after the
+    # file's fsync to make the new directory entry durable. A
+    # host crash or power loss between fsync(fd) and fsync(dirfd)
+    # can leave the directory without the journal file even though
+    # fsync(fd) reported success, recreating the
+    # crash-after-authorization gap. Capture this state BEFORE
+    # opening (because O_CREAT creates the file as part of open,
+    # making it impossible to distinguish creation from re-open
+    # afterwards).
+    journal_existed_before = path.exists()
     # Append a single line atomically with restrictive permissions.
     line = json.dumps(record, sort_keys=True) + "\n"
     payload = line.encode("utf-8")
     # Record the pre-append size so we can roll back on short
     # write failure (Round-18 P2 fix).
     prev_size = 0
-    if path.exists():
+    if journal_existed_before:
         try:
             prev_size = path.stat().st_size
         except OSError:
@@ -206,6 +218,20 @@ def _append_record(workspace: Path, record: dict) -> None:
         # returns can lose the record — leaving an authorized
         # mutation without a durable journal entry.
         os.fsync(fd)
+        # Round-19 P1 fix: if we just created the journal file,
+        # fsync the parent directory so the directory entry
+        # itself is durable. On POSIX, fsync(fd) only persists
+        # the file's contents and metadata; the directory entry
+        # is a separate write that requires its own fsync.
+        # Without this, a power loss immediately after the file
+        # fsync can still leave the directory without the
+        # journal, recreating the crash-after-authorization gap.
+        if not journal_existed_before:
+            dir_fd = os.open(str(path.parent), os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     finally:
         os.close(fd)
 

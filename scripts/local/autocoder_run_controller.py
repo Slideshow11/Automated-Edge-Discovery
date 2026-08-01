@@ -54,6 +54,7 @@ from scripts.local import (
     aed_launch_receipt as _launch_receipt,
 )
 from scripts.local.aed_supervisor_lock import LockOutcome
+from scripts.local.aed_pr_lib import is_full_sha as _is_full_sha
 
 
 # ---------------------------------------------------------------------------
@@ -3218,6 +3219,23 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         )
         sys.exit(10)
     rid = state.get("run_identity") or {}
+    # Round-19 P1 fix: require an exact 40-character lowercase
+    # hex SHA for --expected-target-sha when the mutation type
+    # is squash_merge. The previous code accepted None, an empty
+    # string, a short SHA prefix, or any unvalidated value, which
+    # let an executor merge a PR whose head changed between
+    # authorization and execution. Fail closed at authorization
+    # time so the executor can compare against an exact head.
+    if args.mutation_type == "squash_merge":
+        target_sha = args.expected_target_sha or ""
+        if not _is_full_sha(target_sha):
+            print(
+                "ERROR: cannot authorize mutation: --expected-target-sha "
+                "must be a full 40-character lowercase hex SHA for "
+                f"squash_merge, got {target_sha!r}",
+                file=sys.stderr,
+            )
+            sys.exit(14)
     # P2 fix (round 4): resolve owner_state_path to an absolute
     # path. Relative paths become relative to the CURRENT process's
     # CWD when later read, so a controller invocation from a

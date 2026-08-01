@@ -40,3 +40,6 @@ vendor_data/
 # Local data manifests (user-specific)
 examples/local_only/
 test_apply_output.json
+
+# Hermes session-specific tooling (pollers, scratch dirs)
+.hermes/
