@@ -3239,6 +3239,56 @@ def _finalize_run(args: argparse.Namespace) -> None:
         lock_base = None
         if rid.get("lock_dir"):
             lock_base = Path(rid["lock_dir"])
+        # Round-47 P1 fix (Bind finalization to the lease's
+        # state file): verify that the live lease's
+        # owner_state_path matches args.state (the path the
+        # operator asked us to finalize). If the operator
+        # passed a copied or stale state file with the
+        # same run_id as the lease, releasing the lock
+        # using the copy's run_id would NOT actually release
+        # anything (the lock's owner_run_id would differ)
+        # — but accepting a release request based on a
+        # copy would also let the operator silently
+        # progress while the original run continues
+        # working. Reject when the lock's owner_state_path
+        # disagrees with args.state.
+        try:
+            from scripts.local.aed_supervisor_lock import (
+                build_scope_key,
+            )
+            live_lock_path = _supervisor_lock.lock_path_for(
+                build_scope_key(
+                    repository=scope["repository"],
+                    target_pr_number=scope.get("target_pr_number"),
+                    mutation_target=scope.get("mutation_target"),
+                ),
+                base_dir=lock_base,
+            )
+            live_lock = _supervisor_lock.read(live_lock_path)
+            if live_lock is not None:
+                live_state_path = live_lock.get("owner_state_path")
+                live_run_id = live_lock.get("owner_run_id")
+                state_run_id = state.get("run_id")
+                if (
+                    live_state_path
+                    and live_run_id == state_run_id
+                    and live_state_path != str(args.state)
+                ):
+                    print(
+                        "ERROR: refusing to finalize: --state "
+                        f"{args.state!r} does not match the live "
+                        f"lease's owner_state_path "
+                        f"{live_state_path!r}. The operator "
+                        "must run finalize-run against the "
+                        "lease's actual state file, not a copy.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(18)
+        except Exception:
+            # Best-effort guard. If we cannot read the live
+            # lock (e.g. unsupported platform), skip the
+            # check rather than fail closed.
+            pass
         # P1 fix (round 5): retry release if the sentinel is briefly
         # held by another process. Without this, finalization can
         # report success while the lock remains, blocking the next

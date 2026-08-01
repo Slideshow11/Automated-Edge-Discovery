@@ -6401,6 +6401,71 @@ class TestRound46RequireTargetHeadForForcePush:
         )
 
 
+class TestRound47FinalizeRejectsCopiedStateFile:
+    """Round-47 P1 fix: when --state names a copied or
+    stale snapshot rather than the lease's owner_state_path,
+    finalization must refuse to release the lock using
+    the copy's run_id (which would mismatch the live
+    lease anyway, but accepting the request would also let
+    the original run continue working). Verify the live
+    lease's owner_state_path matches args.state before
+    release."""
+
+    def test_finalize_with_copied_state_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        workspace = tmp_path / "ws"
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+
+        # Initialize a run with --repository so finalize
+        # reaches the lock-release path.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r47-copy",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "946",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, f"init failed: rc={rc}, err={err}"
+
+        # Copy the state to a different path.
+        copied_state = tmp_path / "copied-state.json"
+        copied_state.write_text(state_path.read_text())
+
+        # Try to finalize using the copy. The Round-47
+        # fix must refuse with rc=18 because the live
+        # lease's owner_state_path does not match.
+        rc, _, err = run_controller(
+            [
+                "finalize-run",
+                "--state", str(copied_state),
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 18, (
+            f"Round-47 P1 fix missing: finalize with copied "
+            f"state should fail with rc=18, got rc={rc}, err={err}"
+        )
+        assert "owner_state_path" in (err or ""), (
+            f"unexpected error: {err}"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.
