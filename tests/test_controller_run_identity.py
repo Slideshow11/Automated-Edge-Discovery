@@ -6037,6 +6037,98 @@ class TestRound41RefuseOverwriteDifferentRunArtifacts:
         )
 
 
+class TestRound42WorkspaceOwnedSentinel:
+    """Round-42 P1 fix: two concurrent initializers for
+    distinct PR or mutation-target scopes could point at
+    the same empty workspace and both pass the
+    artifact-existence check before either publishes
+    anything. The fix acquires a workspace-level O_EXCL
+    sentinel (.aed-workspace-owned.json) BEFORE the
+    artifact check and holds it through publication."""
+
+    def test_second_init_fails_when_workspace_owned(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        # Plant the workspace-owned sentinel from a prior
+        # in-flight init.
+        workspace.mkdir(parents=True, exist_ok=True)
+        sentinel = workspace / ".aed-workspace-owned.json"
+        sentinel.write_text(json.dumps({"held_by": "aed-r42-other"}))
+
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r42-new",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        # The init must fail with rc=17 (workspace
+        # owned by another in-flight init).
+        assert rc == 17, (
+            f"Round-42 P1 fix missing: init did not fail "
+            f"with rc=17 when workspace is owned, got "
+            f"rc={rc}, err={err}"
+        )
+
+
+class TestRound42LegacyStateOwnership:
+    """Round-42 P2 fix: legacy state files
+    (pre-Round-9 controller version) identify their
+    owner through the top-level `run_id` but have no
+    `run_identity` object. Fall back to the top-level
+    run_id for legacy state files so an upgrade cannot
+    silently destroy an active or finalized run's audit
+    state."""
+
+    def test_legacy_state_with_top_level_run_id_is_protected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir(parents=True, exist_ok=True)
+        state_path = workspace / "CONTROLLER_STATE.json"
+        # Plant a LEGACY state file (no `run_identity`
+        # object, only a top-level `run_id`).
+        state_path.write_text(json.dumps({
+            "run_id": "aed-r42-legacy",
+            "overall_status": "RUN_ACTIVE",
+        }))
+
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r42-new",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        # The init must fail because the legacy state
+        # belongs to a different run.
+        assert rc != 0, (
+            f"Round-42 P2 fix missing: init succeeded "
+            f"overwriting a legacy state with a different "
+            f"top-level run_id, got rc=0, err={err}"
+        )
+        on_disk = json.loads(state_path.read_text())
+        assert on_disk.get("run_id") == "aed-r42-legacy", (
+            "Round-42 P2 fix missing: init overwrote the "
+            "legacy state's top-level run_id"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

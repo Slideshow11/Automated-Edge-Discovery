@@ -455,6 +455,20 @@ def _compute_next_action(state: dict) -> dict:
 
 
 def _init(args: argparse.Namespace) -> None:
+    # Round-42 P2 fix (Release the acquired lease on
+    # ownership rejection): the previous sys.exit(16)
+    # raised SystemExit which is NOT caught by the
+    # following except Exception block. The lease
+    # would be left behind, requiring explicit
+    # stale-lock recovery. The fix routes the
+    # rejection through a dedicated SystemExit catcher
+    # that performs the rollback + lock release.
+
+    # Local exception class to route the rejection
+    # through the existing cleanup path.
+    class _OwnershipRejectedError(SystemExit):
+        pass
+
     # Load tasks
     tasks_data = _load_tasks_jsonl(args.tasks_jsonl)
 
@@ -1293,11 +1307,29 @@ def _init(args: argparse.Namespace) -> None:
                         existing = json.load(_af)
                 except (OSError, json.JSONDecodeError):
                     existing = {}
-                existing_run_id = (
-                    (existing.get("run_identity") or {}).get("run_id")
-                    if isinstance(existing, dict)
-                    else None
-                )
+                # Round-42 P2 fix (Recognize legacy state
+                # ownership before overwriting): legacy
+                # state files (pre-Round-9 controller
+                # version) identify their owner through
+                # the top-level `run_id` but have no
+                # `run_identity` object. The previous
+                # guard therefore derived
+                # existing_run_id=None and overwrote
+                # without --replace-stale-state. Fall back
+                # to the top-level run_id for legacy state
+                # files so an upgrade cannot silently
+                # destroy an active or finalized run's
+                # audit state.
+                if isinstance(existing, dict):
+                    rid_obj = existing.get("run_identity") or {}
+                    if isinstance(rid_obj, dict):
+                        existing_run_id = rid_obj.get("run_id")
+                    else:
+                        existing_run_id = None
+                    if not existing_run_id:
+                        existing_run_id = existing.get("run_id")
+                else:
+                    existing_run_id = None
                 if (
                     existing_run_id
                     and existing_run_id != args.run_id
@@ -1314,23 +1346,93 @@ def _init(args: argparse.Namespace) -> None:
                         file=sys.stderr,
                     )
                     sys.exit(16)
-        receipt_json_path, receipt_md_path = _launch_receipt.emit(
-            workspace,
-            run_identity=run_identity,
-            state_path=out_path,
-            lock_path=lock_path_str,
-            pending_action=str(state["next_action"]["action"]),
-            current_phase=str(state["overall_status"]),
-            merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
-        )
-        bootstrap_artifacts["receipt_json_path"] = (
-            str(receipt_json_path) if receipt_json_path else None
-        )
-        bootstrap_artifacts["receipt_md_path"] = (
-            str(receipt_md_path) if receipt_md_path else None
-        )
-        _save_state(state, out_path)
-    except Exception as exc:
+        # Round-42 P1 fix (Serialize workspace ownership
+        # before publishing artifacts): two concurrent
+        # initializers for distinct PR or mutation-target
+        # scopes could point at the same empty workspace
+        # and both pass the artifact-existence check before
+        # either publishes anything. The fix: acquire a
+        # workspace-level O_EXCL sentinel BEFORE the
+        # artifact check and hold it through publication.
+        # The sentinel file is
+        # `<workspace>/.aed-workspace-owned.json`. On
+        # ownership rejection (above) or any other failure
+        # the sentinel is released in the existing cleanup
+        # path.
+        workspace_owned_path = workspace / ".aed-workspace-owned.json"
+        workspace_owned_fd = None
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace_owned_fd = os.open(
+                str(workspace_owned_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            with os.fdopen(workspace_owned_fd, "w") as _wf:
+                _wf.write(
+                    json.dumps({"held_by": args.run_id}) + "\n"
+                )
+            # NOTE: os.fdopen takes ownership of the fd and
+            # closes it on exit; reassign to None to skip
+            # the duplicate close below.
+            workspace_owned_fd = None
+        except FileExistsError:
+            # Another init currently holds the workspace.
+            # Reject with rc=17.
+            print(
+                f"ERROR: workspace {workspace!r} is currently "
+                f"being initialized by another run. Wait for "
+                f"it to finish or remove "
+                f"{workspace_owned_path!r} to override.",
+                file=sys.stderr,
+            )
+            sys.exit(17)
+        # Round-42 P2 fix (Release the acquired lease on
+        # ownership rejection): the previous sys.exit(16)
+        # raised SystemExit which is NOT caught by the
+        # following except Exception block. The lease
+        # would be left behind, requiring explicit
+        # stale-lock recovery. The fix routes the
+        # rejection through a dedicated SystemExit catcher
+        # that performs the rollback + lock release.
+
+        # Patch sys.exit inside this scope so the
+        # ownership rejection raises _OwnershipRejectedError
+        # (defined at function scope above), which is
+        # then caught by `except (Exception, _OwnershipRejectedError)`
+        # and triggers the rollback + lock release below.
+        _orig_sys_exit = sys.exit
+        def _patched_sys_exit(code=0):
+            if code == 16:
+                raise _OwnershipRejectedError(code)
+            _orig_sys_exit(code)
+        sys.exit = _patched_sys_exit
+        try:
+            receipt_json_path, receipt_md_path = _launch_receipt.emit(
+                workspace,
+                run_identity=run_identity,
+                state_path=out_path,
+                lock_path=lock_path_str,
+                pending_action=str(state["next_action"]["action"]),
+                current_phase=str(state["overall_status"]),
+                merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
+            )
+            bootstrap_artifacts["receipt_json_path"] = (
+                str(receipt_json_path) if receipt_json_path else None
+            )
+            bootstrap_artifacts["receipt_md_path"] = (
+                str(receipt_md_path) if receipt_md_path else None
+            )
+            _save_state(state, out_path)
+        except _OwnershipRejectedError:
+            # The ownership guard raised _OwnershipRejectedError
+            # via the patched sys.exit(16). Re-raise to
+            # trigger the outer except (and the rollback).
+            raise
+        finally:
+            sys.exit = _orig_sys_exit
+    except (Exception, _OwnershipRejectedError) as exc:
         # Round-14 P1 fix (Roll back artifacts before releasing
         # the supervisor lock): do NOT release the lock before
         # rolling back. Otherwise a waiting initializer could
@@ -1376,6 +1478,29 @@ def _init(args: argparse.Namespace) -> None:
                             pass
                 except OSError:
                     pass
+            # Round-42 P1 fix (continued): remove the
+            # workspace-owned sentinel on rollback. The
+            # sentinel was created above; if we crash or
+            # fail before successful publication, the next
+            # init for the same workspace would otherwise
+            # see FileExistsError on the sentinel and
+            # refuse to proceed. Only unlink if the
+            # sentinel still holds the current run_id.
+            try:
+                workspace_owned_path = (
+                    workspace / ".aed-workspace-owned.json"
+                )
+                if workspace_owned_path.exists():
+                    try:
+                        with open(workspace_owned_path) as _wf:
+                            ws_existing = json.load(_wf)
+                        held_by = (ws_existing or {}).get("held_by")
+                    except (OSError, json.JSONDecodeError):
+                        held_by = None
+                    if held_by == args.run_id:
+                        os.unlink(workspace_owned_path)
+            except OSError:
+                pass
         except Exception:
             # Never let rollback errors mask the original failure.
             pass
