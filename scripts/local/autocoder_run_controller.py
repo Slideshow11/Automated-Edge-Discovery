@@ -682,9 +682,15 @@ def _init(args: argparse.Namespace) -> None:
                 )
                 sys.exit(2)
             try:
-                # Read the existing lock to verify it still
-                # belongs to the predecessor (round-11 fix: don't
-                # overwrite a winner's state).
+                # Round-14 P1 fix (Revalidate the predecessor
+                # before writing the recovery stub): when this
+                # replacement init observed a stale predecessor
+                # but another initializer recovered the lease in the
+                # gap, the lock owner has changed. The new owner
+                # must NOT be silently overwritten with this run's
+                # stub. Compare the post-sentinel lock against the
+                # original lock_outcome.owner (the predecessor);
+                # abort if they differ.
                 existing_for_ownership = None
                 try:
                     with open(lock_path) as f:
@@ -692,8 +698,32 @@ def _init(args: argparse.Namespace) -> None:
                 except (OSError, json.JSONDecodeError):
                     pass
                 predecessor_run_id = None
+                predecessor_chain = -1
                 if existing_for_ownership:
                     predecessor_run_id = existing_for_ownership.get("owner_run_id")
+                    predecessor_chain = int(
+                        existing_for_ownership.get("lock_version_chain", 0)
+                    )
+                if (
+                    lock_outcome.owner
+                    and existing_for_ownership
+                    and (
+                        existing_for_ownership.get("owner_run_id")
+                        != lock_outcome.owner.get("owner_run_id")
+                        or int(existing_for_ownership.get("lock_version_chain", 0))
+                        != int(lock_outcome.owner.get("lock_version_chain", 0))
+                    )
+                ):
+                    # Another initializer has changed the lease.
+                    # Abort; do not overwrite the new owner.
+                    print(
+                        f"ERROR: inline stale-lock recovery: predecessor changed. "
+                        f"Original owner={lock_outcome.owner.get('owner_run_id')!r}; "
+                        f"current owner={existing_for_ownership.get('owner_run_id')!r}. "
+                        f"Aborting.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(15)
                 # Only write the stub if the lock belongs to the
                 # predecessor or is unreadable (we can't tell). If
                 # the lock's run_id already matches ours, another
@@ -848,7 +878,13 @@ def _init(args: argparse.Namespace) -> None:
     }
     lock_to_release_on_failure = lock_outcome
     try:
-        _save_state(state, out_path)
+        # Round-14 P1 fix (Publish the runnable state only after
+        # both receipts): emit BOTH receipts to disk BEFORE
+        # publishing the runnable state. If either receipt fails,
+        # the state is never visible and no recovery is needed.
+        # On signal/host crash between receipts and state, the
+        # runnable state file is still absent so a replacement
+        # init sees "no state at this path" and proceeds.
         receipt_json_path, receipt_md_path = _launch_receipt.emit(
             workspace,
             run_identity=run_identity,
@@ -858,12 +894,64 @@ def _init(args: argparse.Namespace) -> None:
             current_phase=str(state["overall_status"]),
             merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
         )
+        bootstrap_artifacts["receipt_json_path"] = (
+            str(receipt_json_path) if receipt_json_path else None
+        )
+        bootstrap_artifacts["receipt_md_path"] = (
+            str(receipt_md_path) if receipt_md_path else None
+        )
+        _save_state(state, out_path)
     except Exception as exc:
-        # P1 fix (round 6): confirm the cleanup release actually
-        # released the lock. release() can return False when the
-        # recovery sentinel is briefly held by another worker;
-        # retry up to 5 times before declaring an orphan lease
-        # and exiting with a non-zero code.
+        # Round-14 P1 fix (Roll back artifacts before releasing
+        # the supervisor lock): do NOT release the lock before
+        # rolling back. Otherwise a waiting initializer could
+        # acquire the freed lease in the gap, publish its own
+        # state, and have it deleted by this failed initializer's
+        # unconditional unlink. Keep the lock through rollback.
+        try:
+            for key in ("receipt_md_path", "receipt_json_path", "state_path"):
+                path = bootstrap_artifacts.get(key)
+                if not path:
+                    continue
+                # Round-14 P1 fix (Revalidate the predecessor
+                # before writing the recovery stub) — also
+                # applicable here: only unlink if the artifact
+                # still belongs to THIS run by checking the
+                # receipt's run_id or state's run_identity.run_id.
+                try:
+                    if key == "receipt_json_path":
+                        try:
+                            with open(path) as f:
+                                existing = json.load(f)
+                            rid = (existing.get("run_identity") or {}).get("run_id")
+                            if rid == args.run_id:
+                                os.unlink(path)
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                    elif key == "state_path":
+                        try:
+                            with open(path) as f:
+                                existing = json.load(f)
+                            rid = (existing.get("run_identity") or {}).get("run_id")
+                            if rid == args.run_id:
+                                os.unlink(path)
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                    else:
+                        # For MD receipt, parse out the run ID.
+                        try:
+                            content = Path(path).read_text()
+                            if f"**Run ID:** `{args.run_id}`" in content:
+                                os.unlink(path)
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+        except Exception:
+            # Never let rollback errors mask the original failure.
+            pass
+        # Now release the lock (after rollback). Retry up to 5
+        # times to handle transient sentinel holds.
         if lock_to_release_on_failure is not None and scope is not None:
             released = False
             for attempt in range(5):
@@ -886,26 +974,6 @@ def _init(args: argparse.Namespace) -> None:
                     "Manual recovery required.",
                     file=sys.stderr,
                 )
-        # Round-8 P1 fix: roll back every bootstrap artifact that
-        # was successfully persisted before the failure. Without
-        # this, a partially-published state+receipt is left on
-        # disk for an unscoped run; authorize-mutation has no
-        # lease check and would happily authorize mutations even
-        # though init exited with an error.
-        try:
-            for key in ("receipt_md_path", "receipt_json_path", "state_path"):
-                path = bootstrap_artifacts.get(key)
-                if not path:
-                    continue
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
-        except Exception:
-            # Never let rollback errors mask the original failure.
-            pass
         raise
 
     # Past this point, the lock is intentionally held for the

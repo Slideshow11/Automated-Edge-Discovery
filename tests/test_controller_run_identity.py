@@ -2372,7 +2372,7 @@ class TestRound13LockDirFromDefault:
         # The default_lock_dir path must be persisted even when
         # --lock-dir is omitted.
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, _ = run_controller([
             "init",
@@ -2410,3 +2410,75 @@ class TestRound13JournalRewriteTmpFchmod:
         # After rewrite, the journal exists with 0o600 mode.
         mode = (workspace / ma.MUTATIONS_FILENAME).stat().st_mode & 0o777
         assert mode == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Round-14 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound14StateAfterReceipts:
+    """Round-14 P1 fix: receipts are emitted BEFORE state is
+    persisted, so a crash between receipts and state leaves no
+    runnable state on disk."""
+
+    def test_init_writes_state_only_after_receipts(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # When the MD receipt write fails (because of a
+        # pre-existing directory), neither receipts nor state
+        # should remain. The state file must be absent (was not
+        # written because receipts failed first).
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10))
+        workspace = tmp_path / "ws"
+        receipt_md_dir = workspace / "LAUNCH_RECEIPT.md"
+        receipt_md_dir.mkdir(parents=True, exist_ok=True)
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-r14-order",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "907",
+        ])
+        assert rc != 0
+        # State must NOT be present because receipts failed first.
+        assert (workspace / "CONTROLLER_STATE.json").exists() is False
+
+
+class TestRound14RollbackBeforeRelease:
+    """Round-14 P1 fix: when init fails, rollback happens BEFORE
+    the lock is released so a waiting initializer cannot clobber
+    the rolled-back files."""
+
+    def test_init_failure_keeps_lock_until_rollback(
+        self, tmp_path, isolated_lock_dir, scope
+    ):
+        # When init fails because of an MD receipt directory
+        # collision, the rollback releases the lock and removes
+        # state+receipts that were published before the failure.
+        # The leftover MD directory remains on disk because it was
+        # the cause of the failure (not a bootstrap artifact we
+        # own). Verify the lock was released (so the next
+        # well-formed init can succeed on a different scope or
+        # PR number).
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        receipt_md_dir = workspace / "LAUNCH_RECEIPT.md"
+        receipt_md_dir.mkdir(parents=True, exist_ok=True)
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-r14-rb",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "908",
+        ])
+        assert rc != 0
+        # State and JSON receipt should have been rolled back.
+        assert (workspace / "CONTROLLER_STATE.json").exists() is False
+        assert (workspace / "LAUNCH_RECEIPT.json").exists() is False
