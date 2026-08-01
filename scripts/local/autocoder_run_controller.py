@@ -1354,6 +1354,22 @@ def _init(args: argparse.Namespace) -> None:
         # either publishes anything. The fix: acquire a
         # workspace-level O_EXCL sentinel BEFORE the
         # artifact check and hold it through publication.
+        # Round-45 P1 fix (Route output-state contention
+        # through rollback): the sys.exit(16) and
+        # sys.exit(17) calls for workspace/output-state
+        # contention must go through the same
+        # SystemExit-subclass routing as the Round-42
+        # ownership rejection. The previous patch was
+        # installed AFTER the workspace sentinel, so
+        # sys.exit(17) raised a plain SystemExit that
+        # bypassed the outer cleanup handler. Install
+        # the patch BEFORE the sentinels.
+        _orig_sys_exit = sys.exit
+        def _patched_sys_exit(code=0):
+            if code in (16, 17):
+                raise _OwnershipRejectedError(code)
+            _orig_sys_exit(code)
+        sys.exit = _patched_sys_exit
         # The sentinel file is
         # `<workspace>/.aed-workspace-owned.json`. On
         # ownership rejection (above) or any other failure
@@ -1458,12 +1474,9 @@ def _init(args: argparse.Namespace) -> None:
         # (defined at function scope above), which is
         # then caught by `except (Exception, _OwnershipRejectedError)`
         # and triggers the rollback + lock release below.
-        _orig_sys_exit = sys.exit
-        def _patched_sys_exit(code=0):
-            if code in (16, 17):
-                raise _OwnershipRejectedError(code)
-            _orig_sys_exit(code)
-        sys.exit = _patched_sys_exit
+        # Round-45 P1 fix (continued): the sys.exit
+        # patch is now installed ABOVE this try block so
+        # rc=17 also routes through the rollback path.
         try:
             receipt_json_path, receipt_md_path = _launch_receipt.emit(
                 workspace,

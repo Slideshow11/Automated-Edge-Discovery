@@ -373,6 +373,40 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
             recorded_evidence.get("ctime_ns"),
         )
 
+        # Round-45 P2 fix (Treat a start-time mismatch as
+        # definitive PID reuse): when start-time evidence
+        # is available for BOTH the recorded lease and the
+        # actual process, the start-time comparison is
+        # strictly more reliable than ctime (cname is per-
+        # inode and can match across unrelated processes
+        # that share a PID after wraparound). If start-time
+        # is available and mismatches, the actual process
+        # is NOT the recorded owner (PID reuse). Use
+        # ctime ONLY as a fallback when start-time is not
+        # available for the recorded lease.
+        recorded_stat = recorded_evidence.get("stat_start_time")
+        actual_stat = actual_evidence.get("stat_start_time")
+        if recorded_stat is not None and actual_stat is not None:
+            # Start-time evidence is definitive. Do NOT
+            # fall back to ctime.
+            if stat_match:
+                return LivenessEvidence(
+                    is_alive=True,
+                    is_indeterminate=False,
+                    reason="lease_alive_via_pid_evidence",
+                    pid_exists=True,
+                    stat_start_time_match=stat_match,
+                    ctime_match=ctime_match,
+                )
+            # Start-time mismatch: PID reuse. Stale.
+            return LivenessEvidence(
+                is_alive=False,
+                is_indeterminate=False,
+                reason="stale_lock_pid_reuse_start_time_mismatch",
+                pid_exists=True,
+                stat_start_time_match=stat_match,
+                ctime_match=ctime_match,
+            )
         if stat_match or ctime_match:
             return LivenessEvidence(
                 is_alive=True,

@@ -6274,6 +6274,65 @@ class TestRound44OutputStateSentinel:
         )
 
 
+class TestRound45StartTimeMismatchClassifiesAsStale:
+    """Round-45 P2 fix: when start-time evidence is
+    available for both the recorded lease and the actual
+    process, a start-time mismatch must classify the
+    lease as stale (PID reuse) rather than falling back
+    to ctime."""
+
+    def test_start_time_mismatch_marks_lease_stale(self, tmp_path):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+        import time as _t
+
+        # Plant a lock with a different stat_start_time
+        # than the actual process. The actual process
+        # exists and has ctime within tolerance of the
+        # recorded one, so the OLD code would misclassify
+        # the lease as live.
+        state_path = tmp_path / "state.json"
+        state_path.write_text(json.dumps({
+            "run_identity": {"run_id": "aed-r45-owner"},
+        }))
+        # Make the state file's mtime very old so
+        # _state_file_live classifies it as stale
+        # (rather than fresh and live).
+        old = _t.time() - 86400 * 30
+        _os.utime(state_path, (old, old))
+        lock = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": "repo:x|run",
+            "scope": {"repository": "x"},
+            "owner_run_id": "aed-r45-owner",
+            "owner_pid": _os.getpid(),  # current process
+            "owner_state_path": str(state_path),
+            "owner_start_evidence": {
+                # A wildly different start time — proves
+                # this is a different process (PID reuse
+                # case).
+                "pid": _os.getpid(),
+                "stat_start_time": 1,  # epoch 1
+                "ctime_ns": _os.stat(
+                    f"/proc/{_os.getpid()}"
+                ).st_ctime_ns,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        ev = supervisor_lock.assess_liveness(lock)
+        assert ev.is_alive is False, (
+            f"Round-45 P2 fix missing: start-time mismatch "
+            f"with available evidence should mark the lease "
+            f"stale, got is_alive=True reason={ev.reason!r}"
+        )
+        assert ev.reason == "stale_lock_pid_reuse_start_time_mismatch"
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.
