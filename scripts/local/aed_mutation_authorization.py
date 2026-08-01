@@ -166,22 +166,46 @@ def _append_record(workspace: Path, record: dict) -> None:
     # Append a single line atomically with restrictive permissions.
     line = json.dumps(record, sort_keys=True) + "\n"
     payload = line.encode("utf-8")
+    # Record the pre-append size so we can roll back on short
+    # write failure (Round-18 P2 fix).
+    prev_size = 0
+    if path.exists():
+        try:
+            prev_size = path.stat().st_size
+        except OSError:
+            prev_size = 0
     fd = os.open(
         str(path),
         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
         0o600,
     )
     try:
-        # Round-10 P2 fix: when the journal already exists with
+        # Round-13 P2 fix: when the journal already exists with
         # broader perms (e.g. 0o644 left over from a prior partial
-        # write), O_CREAT with 0o600 preserves the existing mode.
-        # Explicitly fchmod so re-opening cannot leak the journal
-        # contents to other local users.
+        # write), O_CREAT preserves the existing mode. Explicitly
+        # fchmod so re-opening cannot leak the journal contents to
+        # other local users.
         try:
             os.fchmod(fd, 0o600)
         except (OSError, NotImplementedError):
             pass
-        _write_full(fd, payload)
+        try:
+            _write_full(fd, payload)
+        except OSError:
+            # Round-18 P2 fix: roll back the partial append so a
+            # subsequent authorize on a corrupt line doesn't fail
+            # parsing the journal. Truncate back to the size
+            # captured before the open.
+            try:
+                os.ftruncate(fd, prev_size)
+            except OSError:
+                pass
+            raise
+        # Round-18 P1 fix: fsync before reporting success. Without
+        # this, a host crash or power loss after authorize-mutation
+        # returns can lose the record — leaving an authorized
+        # mutation without a durable journal entry.
+        os.fsync(fd)
     finally:
         os.close(fd)
 

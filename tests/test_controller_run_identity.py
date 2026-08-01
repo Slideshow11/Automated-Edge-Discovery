@@ -1053,11 +1053,33 @@ def isolated_lock_dir(tmp_path, monkeypatch):
     return _isolated_lock_dir_setup(tmp_path, monkeypatch)
 
 
-def run_controller(cmd: list[str], env: Optional[dict] = None) -> tuple[int, str, str]:
-    """Run controller CLI, return (exit_code, stdout, stderr)."""
+_CONTROLLER_SCRIPT = str(
+    Path(__file__).parent.parent / "scripts" / "local" / "autocoder_run_controller.py"
+)
+
+
+def run_controller(
+    cmd: list[str],
+    env: Optional[dict] = None,
+    cwd: Optional[str] = None,
+) -> tuple[int, str, str]:
+    """Run controller CLI, return (exit_code, stdout, stderr).
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Subcommand + flags to pass to the controller CLI.
+    env : dict, optional
+        Extra environment variables to merge on top of os.environ.
+    cwd : str, optional
+        Working directory for the subprocess. Default is the repo root
+        (parent of this test file). Tests that exercise relative
+        --output-state / --workspace paths should pass cwd=str(tmp_path)
+        so any files written relative to CWD land inside tmp_path.
+    """
     proc = subprocess.Popen(
-        [sys.executable, "scripts/local/autocoder_run_controller.py"] + cmd,
-        cwd=Path(__file__).parent.parent,
+        [sys.executable, _CONTROLLER_SCRIPT] + cmd,
+        cwd=cwd if cwd is not None else str(Path(__file__).parent.parent),
         env={**os.environ, **(env or {})},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -2088,22 +2110,38 @@ class TestRound11OutputStateAbsolutePath:
         workspace = tmp_path / "ws"
         # The state path is relative. The controller must resolve
         # it to absolute (against the CWD when --output-state is
-        # given, which is the repo root via run_controller) and
-        # persist that absolute path in the receipt's state_path
-        # field so authorize-mutation's binding check works from
-        # any working directory.
-        rc, _, err = run_controller([
-            "init",
-            "--run-id", "aed-r11-abs",
-            "--tasks-jsonl", str(tasks),
-            "--workspace", str(workspace),
-            "--integration-branch", "feat/x",
-            "--repository", "Slideshow11/Automated-Edge-Discovery",
-            "--target-pr-number", "903",
-            "--current-main-sha", "e4ef774",
-            "--output-state", "rel_state.json",
-        ])
+        # given) and persist that absolute path in the receipt's
+        # state_path field so authorize-mutation's binding check
+        # works from any working directory.
+        #
+        # Round-18 P2 fix: run the subprocess with cwd=tmp_path
+        # so the relative --output-state value resolves to
+        # tmp_path/rel_state.json — NOT the repository root.
+        # Previously this test left rel_state.json behind in the
+        # Git worktree on every run, dirtying the working tree.
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r11-abs",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "903",
+                "--current-main-sha", "e4ef774",
+                "--output-state", "rel_state.json",
+            ],
+            cwd=str(tmp_path),
+        )
         assert rc == 0, f"unexpected rc={rc}, stderr={err}"
+        # Confirm the relative state path was resolved inside
+        # tmp_path (and did not pollute the repo root).
+        rel_state = tmp_path / "rel_state.json"
+        assert rel_state.exists(), f"relative state path did not land in tmp_path: {rel_state}"
+        repo_root_rel_state = Path(__file__).parent.parent / "rel_state.json"
+        assert not repo_root_rel_state.exists(), (
+            f"relative state path leaked into the repo root: {repo_root_rel_state}"
+        )
         # The launch receipt's state_path must be absolute
         # regardless of how --output-state was given.
         receipt = json.loads((workspace / "LAUNCH_RECEIPT.json").read_text())
@@ -2482,3 +2520,151 @@ class TestRound14RollbackBeforeRelease:
         # State and JSON receipt should have been rolled back.
         assert (workspace / "CONTROLLER_STATE.json").exists() is False
         assert (workspace / "LAUNCH_RECEIPT.json").exists() is False
+
+
+# ---------------------------------------------------------------------------
+# Round-18 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound18JournalFsync:
+    """Round-18 P1 fix: _append_record fsyncs the journal descriptor
+    before closing so authorize-mutation's reported success is
+    durable on disk."""
+
+    def test_append_record_fsyncs_before_close(self, workspace, monkeypatch):
+        from scripts.local import aed_mutation_authorization as ma
+        # Track calls to os.fsync.
+        fsync_calls = []
+
+        import os as _os
+
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls.append(fd)
+            return real_fsync(fd)
+
+        monkeypatch.setattr(ma.os, "fsync", tracking_fsync)
+
+        ma._append_record(
+            workspace,
+            {"mutation_id": "m-fsync", "kind": "test", "x": 1},
+        )
+
+        # _append_record must call fsync at least once on the journal
+        # descriptor before returning successfully.
+        assert fsync_calls, (
+            "Round-18 P1 fix missing: _append_record did not call "
+            "os.fsync before returning; a host crash could lose the "
+            "authorization record after reported success."
+        )
+
+    def test_append_record_truncates_on_short_write(self, workspace, monkeypatch):
+        """Round-18 P2 fix: when _write_full raises mid-append,
+        _append_record must ftruncate the journal back to its
+        pre-append size so subsequent scans don't fail on a
+        truncated JSON line."""
+        from scripts.local import aed_mutation_authorization as ma
+        import os as _os
+
+        # First write a valid baseline record so the journal exists.
+        ma._append_record(
+            workspace, {"mutation_id": "m-baseline", "kind": "test", "x": 0}
+        )
+        from scripts.local.aed_mutation_authorization import mutations_path
+        journal = mutations_path(workspace)
+        baseline_size = journal.stat().st_size
+        assert baseline_size > 0
+
+        # Wrap _write_full to simulate a partial write that raises
+        # mid-payload: write the first half of the buffer, then
+        # raise OSError so the caller can roll back.
+        real_write_full = ma._write_full
+
+        def failing_write_full(fd, payload):
+            # Always simulate a short-write failure. Persist half
+            # the buffer first (so a successful rollback actually
+            # has bytes to remove) and then raise.
+            half = len(payload) // 2
+            _os.write(fd, payload[:half])
+            raise OSError("simulated_short_write_for_round18_p2")
+
+        monkeypatch.setattr(ma, "_write_full", failing_write_full)
+
+        # Append should now fail AND the journal size must be
+        # unchanged (rolled back to baseline_size).
+        with pytest.raises(OSError):
+            ma._append_record(
+                workspace,
+                {"mutation_id": "m-partial", "kind": "test", "x": 99},
+            )
+        assert journal.stat().st_size == baseline_size, (
+            "Round-18 P2 fix missing: partial journal append was "
+            "not rolled back; subsequent scans will fail to parse "
+            "the truncated final line. "
+            f"size={journal.stat().st_size} baseline={baseline_size}"
+        )
+        # Also verify the partial line is not a valid JSON line at
+        # the tail of the file (the rollback truncated it).
+        tail = journal.read_bytes()[-min(64, baseline_size):]
+        assert not tail.startswith(b"{") or b"\n{" not in tail, (
+            "Rollback incomplete: a partial JSON object remains at "
+            f"the journal tail: {tail!r}"
+        )
+
+    def test_append_record_reopens_with_fchmod(self, workspace):
+        """Round-13 P2 fix (re-stated by Round-17 P2): when the
+        journal already exists with broad perms (e.g. 0o644 from a
+        prior partial write), _append_record must fchmod to 0o600
+        so re-opening cannot leak the journal contents."""
+        from scripts.local import aed_mutation_authorization as ma
+        from scripts.local.aed_mutation_authorization import mutations_path
+
+        # Plant a baseline record.
+        ma._append_record(
+            workspace, {"mutation_id": "m-reopen-1", "kind": "test", "x": 1}
+        )
+        # Broaden the perms to simulate the failure mode.
+        journal = mutations_path(workspace)
+        os.chmod(journal, 0o644)
+        # Re-append. The fix must restore 0o600.
+        ma._append_record(
+            workspace, {"mutation_id": "m-reopen-2", "kind": "test", "x": 2}
+        )
+        assert (journal.stat().st_mode & 0o777) == 0o600
+
+
+class TestRound18TestPollutionFix:
+    """Round-18 P2 fix: test_init_output_state_relative_resolves_to_absolute
+    must run the subprocess inside tmp_path so a relative
+    --output-state never leaks into the repo root."""
+
+    def test_relative_output_state_lives_inside_tmp_path(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r18-poll",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "918",
+                "--current-main-sha", "e4ef774",
+                "--output-state", "rel_state.json",
+            ],
+            cwd=str(tmp_path),
+        )
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}"
+        # The relative state path landed inside tmp_path.
+        assert (tmp_path / "rel_state.json").exists()
+        # And NEVER in the repo root.
+        repo_root = Path(__file__).parent.parent
+        assert not (repo_root / "rel_state.json").exists(), (
+            "test pollution: rel_state.json leaked into repo root"
+        )
