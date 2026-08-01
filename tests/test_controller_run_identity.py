@@ -4224,3 +4224,149 @@ class TestRound25FsyncJournalDirectoryAfterRewrite:
             f"{fsync_calls['count']} fsync call(s) during "
             f"_rewrite_record; expected at least 2 (file + dir)."
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-26 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound26FsyncStateBeforePublishing:
+    """Round-26 P1 fix: _save_state must fsync the temporary
+    descriptor and the parent directory before returning, so
+    controller transitions (task results, safety-stop state)
+    survive a host crash."""
+
+    def test_save_state_fsyncs_temp_and_directory(
+        self, tmp_path, monkeypatch
+    ):
+        import os as _os
+
+        from scripts.local import autocoder_run_controller as ctrl
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(ctrl.os, "fsync", tracking_fsync)
+
+        # Drive the state through _save_state.
+        state = {
+            "run_id": "aed-r26-fsync",
+            "overall_status": "RUN_ACTIVE",
+            "tasks": [],
+        }
+        ctrl._save_state(state, str(tmp_path / "CONTROLLER_STATE.json"))
+
+        # Both the temp file AND the parent directory must be
+        # fsynced. Two fsync calls minimum.
+        assert fsync_calls["count"] >= 2, (
+            f"Round-26 P1 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"_save_state; expected at least 2 (file + dir)."
+        )
+
+
+class TestRound26ReleaseFsyncsLockDirectory:
+    """Round-26 P2 fix: release must fsync the lock directory
+    after the archive rename so a host crash immediately after
+    release does not leave the live lease name visible."""
+
+    def test_release_fsyncs_lock_directory(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        from scripts.local.aed_supervisor_lock import (
+            build_scope_key,
+            lock_path_for,
+            release,
+        )
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 934,
+            "mutation_target": None,
+        }
+        scope_key = build_scope_key(**scope)
+        base_dir = tmp_path / "locks"
+        base_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = lock_path_for(scope_key, base_dir=base_dir)
+
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r26-archive",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # Track fsync calls.
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(supervisor_lock.os, "fsync", tracking_fsync)
+
+        ok = release(
+            scope=scope,
+            owner_run_id="aed-r26-archive",
+            base_dir=base_dir,
+        )
+        assert ok
+
+        # The release must fsync the lock directory at least
+        # once (in addition to any file-level fsyncs).
+        assert fsync_calls["count"] >= 1, (
+            f"Round-26 P2 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"release; expected at least 1 (lock directory)."
+        )
+
+
+class TestRound26WindowsSafeStateFlags:
+    """Round-26 P2 fix: _save_state must use Windows-safe open
+    flags. os.O_CLOEXEC is Unix-only and raises AttributeError
+    on Windows; conditionally include it only when available."""
+
+    def test_save_state_works_on_windows(self, tmp_path, monkeypatch):
+        from scripts.local import autocoder_run_controller as ctrl
+
+        # Simulate Windows by removing O_CLOEXEC.
+        real_CLOEXEC = ctrl.os.O_CLOEXEC
+        delattr(ctrl.os, "O_CLOEXEC")
+        try:
+            state = {
+                "run_id": "aed-r26-win",
+                "overall_status": "RUN_ACTIVE",
+                "tasks": [],
+            }
+            # Should not raise AttributeError.
+            ctrl._save_state(state, str(tmp_path / "WIN.json"))
+        finally:
+            ctrl.os.O_CLOEXEC = real_CLOEXEC
+
+        assert (tmp_path / "WIN.json").exists()

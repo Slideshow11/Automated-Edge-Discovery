@@ -170,11 +170,14 @@ def _save_state(state: dict, path: str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp_path = p.with_suffix(p.suffix + ".tmp")
-    fd = os.open(
-        str(tmp_path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC,
-        0o600,
-    )
+    # Round-26 P2 fix (Use Windows-safe flags when saving
+    # controller state): os.O_CLOEXEC is Unix-only and
+    # raises AttributeError on Windows. Conditionally add it
+    # only when available.
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_CLOEXEC"):
+        open_flags |= os.O_CLOEXEC
+    fd = os.open(str(tmp_path), open_flags, 0o600)
     try:
         # Round-11 P2 fix: when <path>.tmp already exists with
         # broader perms (e.g. 0o644 left over from an older or
@@ -188,7 +191,28 @@ def _save_state(state: dict, path: str) -> None:
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
             f.write("\n")
+            f.flush()
+            # Round-26 P1 fix (Fsync controller state before
+            # publishing it): flush Python's buffers and
+            # fsync the temp descriptor before os.replace so
+            # the controller's transitions (task results,
+            # safety-stop state, etc.) are durable across a
+            # host crash.
+            os.fsync(fd)
         os.replace(tmp_path, p)
+        # Round-26 P1 fix (continued): fsync the parent directory
+        # so the directory entry update for the new state
+        # file is durable. Without this, a power loss
+        # immediately after replace can leave the file on
+        # disk but its directory entry missing.
+        try:
+            dir_fd = os.open(str(p.parent), os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, NotImplementedError, AttributeError):
+            pass
     except Exception:
         # Best-effort cleanup of the temp file.
         try:

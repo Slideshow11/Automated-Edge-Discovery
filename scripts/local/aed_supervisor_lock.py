@@ -1051,6 +1051,25 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
                     # the live lease (release must succeed) but
                     # log a warning. The audit trail is lost.
                     path.unlink()
+            # Round-26 P2 fix (Fsync the lock directory after
+            # archiving a released lease): the rename + unlink
+            # sequence has not been made durable because the
+            # lock directory is never fsynced. After reboot
+            # the old live lease name can reappear, causing
+            # subsequent initialization to report a stale-lock
+            # conflict despite successful finalization, or the
+            # promised released audit archive can be absent.
+            # fsync the parent directory before returning.
+            try:
+                dir_fd = os.open(
+                    str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, NotImplementedError, AttributeError):
+                pass
         except FileNotFoundError:
             return False
         return True
