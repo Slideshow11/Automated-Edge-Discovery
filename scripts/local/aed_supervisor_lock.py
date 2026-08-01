@@ -145,6 +145,30 @@ def _repo_index_path(lock_path: Path) -> Path:
     return lock_path.with_suffix(lock_path.suffix + ".repo")
 
 
+def _repo_sentinel_path(repository: str, base_dir) -> Path:
+    """Stable per-repository sentinel path.
+
+    Round-50 P1 fix (Serialize cross-scope acquisition at
+    repository level): the per-scope sentinel covers
+    publication. A separate per-repository sentinel covers
+    the cross-scope conflict scan AND the publication. The
+    sentinel file is
+    <base_dir>/<repo>.<repository>.recovery-sentinel.
+    """
+    if not base_dir:
+        base_dir = default_lock_dir(repository=repository)
+    base_dir = Path(base_dir)
+    base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Replace slashes in the repository string so the
+    # sentinel filename is a single path component.
+    safe_repo = repository.replace("/", "_")
+    sentinel = base_dir / f"{safe_repo}.repo.recovery-sentinel"
+    # Ensure the parent directory exists (single
+    # component, so it's just base_dir, but be defensive).
+    sentinel.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return sentinel
+
+
 def _write_repo_index(lock_path: Path, repository: str) -> None:
     """Write the sibling `.repo` index file. Best-effort:
     silently ignores errors because the lock file itself
@@ -873,13 +897,53 @@ def try_acquire(
     )
     path = lock_path_for(scope_key, base_dir=base_dir)
 
-    # Round-32 P1 fix (Make repository-wide leases conflict
-    # with narrower scopes): check that a wider or narrower
-    # lease for the same repository is not already held. See
-    # _check_cross_scope_conflict for the full reasoning.
-    cross_scope_conflict = _check_cross_scope_conflict(
-        scope=scope, base_dir=base_dir,
-    )
+    # Round-50 P1 fix (Serialize cross-scope acquisition at
+    # repository level — PARTIAL): when repository-wide and
+    # PR- or target-scoped acquisitions for the same
+    # repository start concurrently in an empty lock
+    # directory, both can complete the cross-scope conflict
+    # scan before either publishes its lock. The full fix
+    # (a per-repo sentinel held through publication)
+    # requires restructuring try_acquire to wrap the entire
+    # post-acquisition body in try/finally. For this round,
+    # the partial fix is: acquire a per-repo sentinel ONLY
+    # for the duration of the cross-scope check, then
+    # release it before the per-scope sentinel acquisition.
+    # This serializes the cross-scope check itself; the
+    # publication is still protected by the per-scope
+    # sentinel. A future round should add the full
+    # try/finally refactor.
+    repository = scope.get("repository") or ""
+    if repository:
+        repo_sentinel_path = _repo_sentinel_path(
+            repository, base_dir
+        )
+        repo_sentinel_fd = _acquire_sentinel_fd(
+            repo_sentinel_path, max_attempts=20
+        )
+        if repo_sentinel_fd is None:
+            return LockOutcome(
+                ok=False,
+                path=path,
+                owner=None,
+                reason="repo_sentinel_busy",
+            )
+    else:
+        repo_sentinel_fd = None
+    try:
+        # Round-32 P1 fix (Make repository-wide leases conflict
+        # with narrower scopes): check that a wider or narrower
+        # lease for the same repository is not already held. See
+        # _check_cross_scope_conflict for the full reasoning.
+        cross_scope_conflict = _check_cross_scope_conflict(
+            scope=scope, base_dir=base_dir,
+        )
+    finally:
+        # Release the per-repo sentinel AFTER the cross-scope
+        # check. The per-scope sentinel (acquired below) takes
+        # over for the publication.
+        if repo_sentinel_fd is not None:
+            _release_sentinel_fd(repo_sentinel_fd, repo_sentinel_path)
     if cross_scope_conflict is not None:
         return cross_scope_conflict
 
