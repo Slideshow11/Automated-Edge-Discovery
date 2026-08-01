@@ -576,6 +576,31 @@ def try_acquire(
                         owner=None,
                         reason=f"atomic_publish_failed:{e.strerror or str(e)}",
                     )
+                # Round-23 P1 fix (Fsync the lock directory after
+                # publishing the lease): os.replace renames the
+                # tmp inode into the lock path, but on POSIX the
+                # directory entry update is a separate write that
+                # the file's own fsync does not cover. If a power
+                # loss occurs immediately after os.replace but
+                # before the directory is fsynced, the live
+                # inode may still exist but its directory entry
+                # may be missing — and a later initializer can
+                # then acquire the same scope while the original
+                # run is resumed, defeating exclusivity. fsync the
+                # lock directory before reporting acquisition.
+                try:
+                    dir_fd = os.open(
+                        str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                    )
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except (OSError, NotImplementedError):
+                    # Non-POSIX or unsupported (e.g. some FUSE
+                    # filesystems). The file is published on
+                    # disk; we accept the smaller window.
+                    pass
             except OSError as e:
                 return LockOutcome(
                     ok=False,
@@ -869,6 +894,13 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
     install a new lease between our check and our unlink. This
     closes the round-4 P1 race where release() could delete a
     freshly-installed live lease belonging to the recovering run.
+
+    Round-23 P2 fix (Preserve the recovery audit trail when
+    releasing a lease): the previous code unlinked the only
+    artifact containing recovery_history. Archive the lease to
+    a sibling `<path>.released-<timestamp>` file before deleting
+    it so the audit trail (previous owner run_id, supplied
+    staleness evidence, recovery timestamps) survives finalization.
     """
     scope_key = build_scope_key(
         repository=scope["repository"],
@@ -887,8 +919,31 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
             return False
         if existing.get("owner_run_id") != owner_run_id:
             return False
+        # Round-23 P2 fix: archive the lease to a sibling file
+        # before unlinking so the recovery_history audit trail
+        # survives finalization. The archive is best-effort; a
+        # non-POSIX host may not support the operations.
         try:
-            path.unlink()
+            import datetime as _dt
+            archive_name = (
+                f"{path.name}.released-"
+                f"{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            archive_path = path.with_name(archive_name)
+            # Move (rename) is atomic on POSIX; if the rename
+            # fails (cross-device, etc.) fall back to copy+unlink.
+            try:
+                os.replace(str(path), str(archive_path))
+            except OSError:
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(str(path), str(archive_path))
+                    path.unlink()
+                except OSError:
+                    # If archiving fails entirely, still unlink
+                    # the live lease (release must succeed) but
+                    # log a warning. The audit trail is lost.
+                    path.unlink()
         except FileNotFoundError:
             return False
         return True

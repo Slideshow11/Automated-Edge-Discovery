@@ -287,22 +287,38 @@ def safe_restrictive_open(path: Path, mode: str = "w"):
     POSIX). Creates parent dirs with 0o700.
     """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if _is_linux():
+    # Round-23 P2 fix (Create private files restrictively on
+    # every POSIX host): the previous code used the safe
+    # os.open(..., 0o600) + fchmod path only when _is_linux()
+    # returned True. On macOS, FreeBSD, and other POSIX systems
+    # the function fell through to plain `open(path, mode)`
+    # followed by os.chmod — which creates the file using the
+    # process umask (typically 022) before the chmod call. A
+    # crash between the open and the chmod leaves the file
+    # world-readable, leaking the launch receipt / lock
+    # contents. Use the restrictive os.open(..., 0o600) path
+    # for ALL POSIX platforms (the Linux-vs-other branch was
+    # only there because Windows / non-POSIX needs the
+    # fallback). The Linux `_is_linux()` was effectively a
+    # proxy for "is POSIX + supports fchmod", which is true
+    # on macOS and FreeBSD too.
+    if os.name == "posix":
         # Write atomically with explicit 0o600 mode.
-        # Round-8 P2 fix: on Linux, when the file already exists
-        # with broader permissions (e.g. 0o644 left over from a
-        # prior partial write), `O_CREAT` with mode 0o600 does NOT
-        # restrict an existing file's mode — the existing inode
-        # keeps its current permissions. Explicitly chmod via the
-        # open fd to 0o600 so re-opening an existing file cannot
-        # leak the supposedly private contents.
+        # Round-8 P2 fix: on POSIX, when the file already
+        # exists with broader permissions (e.g. 0o644 left
+        # over from a prior partial write), `O_CREAT` with
+        # mode 0o600 does NOT restrict an existing file's
+        # mode — the existing inode keeps its current
+        # permissions. Explicitly chmod via the open fd to
+        # 0o600 so re-opening an existing file cannot leak
+        # the supposedly private contents.
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
         try:
             os.fchmod(fd, 0o600)
         except (OSError, NotImplementedError):
             pass
         return os.fdopen(fd, mode)
-    # Fallback: write then chmod (best effort on non-POSIX).
+    # Fallback for non-POSIX (Windows): write then chmod.
     f = open(path, mode)
     try:
         os.chmod(path, 0o600)

@@ -3556,3 +3556,205 @@ class TestRound22BindAdoptedLeasesToStatePath:
             f"init must NOT adopt a lease with a different "
             f"state_path, got rc=0, err={err}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-23 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound23FsyncLockDirectoryAfterPublish:
+    """Round-23 P1 fix: try_acquire must fsync the lock directory
+    after the os.replace that publishes the lease. Otherwise a
+    power loss immediately after replace can leave the live
+    inode on disk but its directory entry missing, allowing a
+    later initializer to acquire the same scope."""
+
+    def test_try_acquire_fsyncs_lock_directory(
+        self, tmp_path, isolated_lock_dir, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        # Track fsync calls. We want to see fsync invoked on
+        # both the lock file descriptor (already covered by
+        # Round-18 fsync in _append_record for the journal) and
+        # the directory descriptor.
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(supervisor_lock.os, "fsync", tracking_fsync)
+
+        # Trigger a successful try_acquire by creating a fresh
+        # workspace.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 927,
+            "mutation_target": None,
+        }
+        from scripts.local.aed_supervisor_lock import build_scope_key
+        scope_key = build_scope_key(**scope)
+        path = supervisor_lock.lock_path_for(
+            scope_key, base_dir=tmp_path / "locks"
+        )
+        # Ensure no pre-existing lock for this scope.
+        if path.exists():
+            path.unlink()
+
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="aed-r23-fsync",
+            owner_host={"hostname": "h"},
+            owner_pid=99999,
+            owner_start_evidence={
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+            base_dir=tmp_path / "locks",
+        )
+        assert outcome.ok, f"try_acquire failed: {outcome.reason}"
+
+        # The previous code fsynced the lock file (1 call) but
+        # not the lock directory. Round-23 P1 fix adds at least
+        # one more fsync call (the directory fd). fds may be
+        # reused after close, so count total calls rather than
+        # unique fds.
+        assert fsync_calls["count"] >= 2, (
+            f"Round-23 P1 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"try_acquire; expected at least 2 (file fsync + "
+            f"lock directory fsync)."
+        )
+
+
+class TestRound23PosixRestrictiveOpenAllHosts:
+    """Round-23 P2 fix: safe_restrictive_open must use the
+    os.open(..., 0o600) + fchmod path for ALL POSIX platforms,
+    not just Linux. The Linux-vs-other branch was effectively
+    a proxy for POSIX-vs-Windows; macOS and FreeBSD are also
+    POSIX and must use the restrictive open path."""
+
+    def test_safe_restrictive_open_uses_o_creat_with_0o600_on_posix(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_run_identity as run_identity
+        from pathlib import Path
+        import os as _os
+
+        # Track os.open calls to confirm the function uses the
+        # restrictive path on POSIX.
+        captured = {"calls": []}
+        real_open = _os.open
+
+        def tracking_open(path, flags, mode=0o777, *args, **kwargs):
+            captured["calls"].append(
+                {"path": path, "flags": flags, "mode": mode}
+            )
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(run_identity.os, "open", tracking_open)
+        monkeypatch.setattr(run_identity.os, "name", "posix")
+
+        out = tmp_path / "artifact.json"
+        with run_identity.safe_restrictive_open(out, "w") as f:
+            f.write('{"ok": true}\n')
+
+        # Confirm a call with O_CREAT and mode=0o600 was made.
+        restrictive = [
+            c for c in captured["calls"]
+            if (c["flags"] & _os.O_CREAT) and c["mode"] == 0o600
+        ]
+        assert restrictive, (
+            "Round-23 P2 fix missing: safe_restrictive_open did "
+            "not use os.open(..., O_CREAT, 0o600) on POSIX. "
+            f"calls={captured['calls']}"
+        )
+
+
+class TestRound23ReleaseArchivesLease:
+    """Round-23 P2 fix: release must archive the lease to a
+    sibling <path>.released-<timestamp> file before deleting it
+    so the recovery_history audit trail survives finalization."""
+
+    def test_release_creates_audit_archive(self, tmp_path):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        from scripts.local.aed_supervisor_lock import (
+            build_scope_key,
+            lock_path_for,
+            release,
+        )
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 928,
+            "mutation_target": None,
+        }
+        scope_key = build_scope_key(**scope)
+        base_dir = tmp_path / "locks"
+        base_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = lock_path_for(scope_key, base_dir=base_dir)
+
+        # Plant a lease with a non-empty recovery_history.
+        recovery_entry = {
+            "recovered_at": "2026-01-01T00:00:00Z",
+            "previous_owner_run_id": "aed-prev",
+            "staleness_evidence": "stale_lock_detected:...",
+            "reason": "test",
+        }
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 2,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r23-archive",
+            "owner_pid": 99999,
+            "owner_state_path": str(tmp_path / "ws" / "CONTROLLER_STATE.json"),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [recovery_entry],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        import os as _os
+        _os.chmod(path, 0o600)
+
+        # Release.
+        ok = release(
+            scope=scope,
+            owner_run_id="aed-r23-archive",
+            base_dir=base_dir,
+        )
+        assert ok
+
+        # The live lease must be gone.
+        assert not path.exists()
+
+        # The archive must exist and contain the recovery_history.
+        archives = [p for p in base_dir.iterdir() if ".released-" in p.name]
+        assert archives, (
+            "Round-23 P2 fix missing: release did not archive "
+            "the lease. Files in base_dir: "
+            f"{list(base_dir.iterdir())}"
+        )
+        # The archive must contain the audit trail.
+        archive_data = json.loads(archives[0].read_text())
+        assert archive_data.get("recovery_history") == [recovery_entry], (
+            f"archive missing recovery_history: {archive_data}"
+        )
