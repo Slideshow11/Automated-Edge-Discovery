@@ -810,9 +810,19 @@ def _init(args: argparse.Namespace) -> None:
     # recover-stale-lock without --lock-dir, the controller must
     # find the same directory the init used. If the env var
     # AED_LOCK_DIR was in scope at init time, lock_dir was
-    # implicit and the run_identity must record it.
+    # implicit and the run_identity must record it. Round-13
+    # fix: also persist the XDG-derived path when neither
+    # --lock-dir nor AED_LOCK_DIR is set, so later commands find
+    # the directory.
     lock_dir_env = os.environ.get("AED_LOCK_DIR")
-    lock_dir_persisted = lock_dir_arg if lock_dir_arg else lock_dir_env
+    if lock_dir_arg:
+        lock_dir_persisted = lock_dir_arg
+    elif lock_dir_env:
+        lock_dir_persisted = lock_dir_env
+    else:
+        # Resolve to the same default the lock module uses.
+        from scripts.local.aed_supervisor_lock import default_lock_dir
+        lock_dir_persisted = str(default_lock_dir(""))
     if lock_dir_persisted:
         run_identity["lock_dir"] = str(Path(lock_dir_persisted).resolve())
 

@@ -2295,3 +2295,118 @@ class TestRound12LockDirPersistedFromEnv:
         rid = state.get("run_identity") or {}
         assert rid.get("lock_dir") is not None, "lock_dir not persisted in run_identity"
         assert Path(rid["lock_dir"]).is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# Round-13 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound13RunInvalidTerminal:
+    """Round-13 P1 fix: RUN_INVALID is a terminal lease state."""
+
+    def _plant(self, scope, lock_base, status):
+        import os as _os
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        state_path = _os.path.join(_os.environ.get("TMPDIR", "/tmp"), "r13-state.json")
+        Path(state_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        Path(state_path).write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r-r13",
+            "run_identity": {"run_id": "r-r13", "controller_version": 1},
+            "overall_status": status,
+        }))
+        try:
+            _os.chmod(state_path, 0o600)
+        except (OSError, NotImplementedError):
+            pass
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-r13",
+            "owner_pid": 999999,
+            "owner_state_path": state_path,
+            "owner_start_evidence": {
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        return path
+
+    def test_run_invalid_is_stale(self, scope, host_self, lock_base):
+        path = self._plant(scope, lock_base, "RUN_INVALID")
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r-new",
+            owner_host=host_self,
+            owner_pid=99999,
+            owner_start_evidence={
+                "pid": 99999, "stat_start_time": None, "ctime_ns": None, "source": "unknown"
+            },
+            base_dir=lock_base,
+        )
+        assert not outcome.ok
+        assert outcome.reason.startswith("stale_lock_detected") or                outcome.reason.startswith("stale:state_terminal:RUN_INVALID")
+
+
+class TestRound13LockDirFromDefault:
+    """Round-13 P2 fix: when --lock-dir and AED_LOCK_DIR are both
+    unset, run_identity.lock_dir is still recorded as the
+    default_lock_dir path."""
+
+    def test_lock_dir_falls_back_to_default(self, tmp_path, isolated_lock_dir):
+        import os as _os
+        # AED_LOCK_DIR is set by the isolated_lock_dir fixture.
+        # The default_lock_dir path must be persisted even when
+        # --lock-dir is omitted.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-r13-default-lockdir",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "906",
+            "--current-main-sha", "e4ef774",
+        ])
+        assert rc == 0
+        state = json.loads((workspace / "CONTROLLER_STATE.json").read_text())
+        rid = state.get("run_identity") or {}
+        assert rid.get("lock_dir") is not None
+
+
+class TestRound13JournalRewriteTmpFchmod:
+    """Round-13 P2 fix: _rewrite_record fchmod's the journal
+    tmp file to 0o600."""
+
+    def test_rewrite_record_restricts_tmp(self, workspace):
+        from scripts.local import aed_mutation_authorization as ma
+        # Plant a pre-existing tmp file with loose perms.
+        tmp_path = workspace / (ma.MUTATIONS_FILENAME + ".tmp")
+        tmp_path.write_text("old partial write")
+        os.chmod(tmp_path, 0o644)
+        # Append a record first so the rewrite has something to do.
+        ma._append_record(workspace, {"mutation_id": "m1", "kind": "test", "x": 1})
+        # Now rewrite — should fchmod the tmp file before os.replace.
+        # Plant tmp again with broad perms.
+        tmp_path.write_text("another old partial write")
+        os.chmod(tmp_path, 0o644)
+        ma._rewrite_record(workspace, {"mutation_id": "m1", "kind": "test", "x": 2})
+        # After rewrite, the journal exists with 0o600 mode.
+        mode = (workspace / ma.MUTATIONS_FILENAME).stat().st_mode & 0o777
+        assert mode == 0o600

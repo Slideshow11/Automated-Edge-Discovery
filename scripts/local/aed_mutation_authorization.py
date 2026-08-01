@@ -213,6 +213,14 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
         0o600,
     )
     try:
+        # Round-13 P2 fix: when MUTATIONS.jsonl.tmp already exists
+        # with broader perms, O_CREAT preserves the existing
+        # mode. fchmod to 0o600 so the eventual os.replace cannot
+        # publish the rewritten journal with broader perms.
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            pass
         with os.fdopen(fd, "w") as f:
             for line in new_lines:
                 f.write(line + "\n")

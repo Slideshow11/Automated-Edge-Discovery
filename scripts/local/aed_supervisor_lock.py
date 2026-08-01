@@ -244,6 +244,7 @@ def _state_file_live(state_path: Optional[str], owner_run_id: Optional[str],
             "RUN_FAILED_TRANSIENT",
             "RUN_FAILED_PERMANENT",
             "RUN_ABORTED",
+            "RUN_INVALID",
         }
         overall_status = state.get("overall_status")
         if overall_status in TERMINAL_STATUSES:
@@ -701,11 +702,11 @@ def recover_stale(
             # first initializer's lease. Reject when the owner PID
             # is alive.
             if bypass_indeterminate_state and (
-                "state_unreadable" in evidence.reason
-                or (
-                    "state_path" in evidence.reason
-                    and not _pid_exists(int(existing.get("owner_pid", 0) or 0))
+                (
+                    "state_unreadable" in evidence.reason
+                    or "state_path" in evidence.reason
                 )
+                and not _pid_exists(int(existing.get("owner_pid", 0) or 0))
             ):
                 pass  # proceed with recovery
             else:
@@ -781,11 +782,11 @@ def recover_stale(
                 )
             if live2.is_indeterminate:
                 if bypass_indeterminate_state and (
-                    "state_unreadable" in live2.reason
-                    or (
-                        "state_path" in live2.reason
-                        and not _pid_exists(int(existing2.get("owner_pid", 0) or 0))
+                    (
+                        "state_unreadable" in live2.reason
+                        or "state_path" in live2.reason
                     )
+                    and not _pid_exists(int(existing2.get("owner_pid", 0) or 0))
                 ):
                     liveness_reason = live2.reason  # proceed
                 else:
