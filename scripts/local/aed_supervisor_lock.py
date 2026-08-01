@@ -231,13 +231,22 @@ def _state_file_live(state_path: Optional[str], owner_run_id: Optional[str],
         rid = state.get("run_identity") or {}
         if rid.get("run_id") != owner_run_id:
             return False, False, "state_run_id_mismatch"
-        # Round-11 P1 fix: a state whose overall_status is
-        # RUN_COMPLETE (or RUN_FAILED_SAFETY) is terminal; the
-        # owner is no longer active even if mtime is fresh.
-        # Treat as stale so a replacement init can recover the
-        # lease instead of waiting for max_age_seconds to elapse.
+        # Round-11 P1 fix: a state whose overall_status is a
+        # GENUINELY TERMINAL status is stale even when mtime is
+        # fresh. Round-12 P1 fix: restrict this classification to
+        # the exact set of terminal statuses. RUN_READY_FOR_SUMMARY
+        # and RUN_BLOCKED are NOT terminal (the run is still
+        # resumable); only RUN_COMPLETE, RUN_FAILED_SAFETY, and
+        # explicit aborted statuses should make the lease stale.
+        TERMINAL_STATUSES = {
+            "RUN_COMPLETE",
+            "RUN_FAILED_SAFETY",
+            "RUN_FAILED_TRANSIENT",
+            "RUN_FAILED_PERMANENT",
+            "RUN_ABORTED",
+        }
         overall_status = state.get("overall_status")
-        if overall_status and overall_status != "RUN_ACTIVE":
+        if overall_status in TERMINAL_STATUSES:
             return False, False, f"state_terminal:{overall_status}"
     return True, False, "ok"
 
@@ -683,9 +692,20 @@ def recover_stale(
             # file is missing or unreadable; refusing here would
             # force an unrecoverable lock. Round-10 fix: include
             # state_unreadable in the bypass set.
+            #
+            # Round-12 P1 fix: only bypass state_path_missing when
+            # the recorded owner PID is NOT alive. A live bootstrap
+            # subprocess publishing its state file means the
+            # missing-state indeterminate is transient; a
+            # competing --replace-stale-lock would overwrite the
+            # first initializer's lease. Reject when the owner PID
+            # is alive.
             if bypass_indeterminate_state and (
-                "state_path" in evidence.reason
-                or "state_unreadable" in evidence.reason
+                "state_unreadable" in evidence.reason
+                or (
+                    "state_path" in evidence.reason
+                    and not _pid_exists(int(existing.get("owner_pid", 0) or 0))
+                )
             ):
                 pass  # proceed with recovery
             else:
@@ -761,8 +781,11 @@ def recover_stale(
                 )
             if live2.is_indeterminate:
                 if bypass_indeterminate_state and (
-                    "state_path" in live2.reason
-                    or "state_unreadable" in live2.reason
+                    "state_unreadable" in live2.reason
+                    or (
+                        "state_path" in live2.reason
+                        and not _pid_exists(int(existing2.get("owner_pid", 0) or 0))
+                    )
                 ):
                     liveness_reason = live2.reason  # proceed
                 else:

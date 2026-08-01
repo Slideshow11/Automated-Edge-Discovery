@@ -155,11 +155,19 @@ def emit(
     Emit both machine-readable and human-readable launch receipts
     under <workspace>/. Returns the paths.
     """
-    workspace = Path(workspace)
+    workspace = Path(workspace).resolve()
     workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
     json_path = workspace / RECEIPT_JSON_FILENAME
     md_path = workspace / RECEIPT_MD_FILENAME
 
+    # Round-12 P2 fix: ensure the workspace path persisted in the
+    # receipt is absolute. A later authorize-mutation invocation
+    # from a different working directory resolves the receipt's
+    # workspace against the new CWD; persisting a relative path
+    # would mismatch the absolute workspace stored in state and
+    # cause the receipt's workspace comparison to reject an
+    # otherwise valid run.
+    workspace_str = str(workspace)
     payload = build_machine_readable(
         run_identity=run_identity,
         state_path=state_path,
@@ -167,7 +175,7 @@ def emit(
         pending_action=pending_action,
         current_phase=current_phase,
         merge_policy=merge_policy,
-        workspace=str(workspace),
+        workspace=workspace_str,
         extra=extra,
     )
     write_machine_readable(json_path, payload)
@@ -178,7 +186,7 @@ def emit(
         pending_action=pending_action,
         current_phase=current_phase,
         merge_policy=merge_policy,
-        workspace=str(workspace),
+        workspace=workspace_str,
     )
     write_human_readable(md_path, md)
     return json_path, md_path

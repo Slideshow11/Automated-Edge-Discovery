@@ -804,7 +804,15 @@ def _init(args: argparse.Namespace) -> None:
     # Overlay host/proc evidence (already captured by capture_run_identity).
     run_identity["host"] = host_identity
     run_identity["process"] = proc_evidence
-    lock_dir_persisted = lock_dir_arg if lock_dir_arg else None
+    # Round-12 P2 fix: persist the resolved default lock
+    # directory even when --lock-dir is omitted. When the lease
+    # is later inspected via inspect-lock or recovered via
+    # recover-stale-lock without --lock-dir, the controller must
+    # find the same directory the init used. If the env var
+    # AED_LOCK_DIR was in scope at init time, lock_dir was
+    # implicit and the run_identity must record it.
+    lock_dir_env = os.environ.get("AED_LOCK_DIR")
+    lock_dir_persisted = lock_dir_arg if lock_dir_arg else lock_dir_env
     if lock_dir_persisted:
         run_identity["lock_dir"] = str(Path(lock_dir_persisted).resolve())
 

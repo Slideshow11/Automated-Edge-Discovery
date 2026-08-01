@@ -1070,7 +1070,7 @@ def run_controller(cmd: list[str], env: Optional[dict] = None) -> tuple[int, str
 class TestControllerInitHardening:
     def test_init_writes_launch_receipt_and_state_with_restrictive_perms(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, out, err = run_controller([
             "init",
@@ -1109,7 +1109,7 @@ class TestControllerInitHardening:
 
     def test_init_rejects_when_live_lock_held_for_same_scope(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace1 = tmp_path / "ws1"
         workspace2 = tmp_path / "ws2"
         # First init acquires the lock.
@@ -1150,7 +1150,7 @@ class TestControllerInitHardening:
 
     def test_init_succeeds_without_scope_and_skips_lock(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, out, err = run_controller([
             "init",
@@ -1167,7 +1167,7 @@ class TestControllerInitHardening:
 class TestControllerMutationLifecycle:
     def _init_run(self, tmp_path, run_id):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, _ = run_controller([
             "init",
@@ -1319,7 +1319,7 @@ class TestControllerMutationLifecycle:
 class TestControllerStaleLockRecovery:
     def _init_run_with_scope(self, tmp_path, run_id):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, _ = run_controller([
             "init",
@@ -1397,7 +1397,7 @@ class TestControllerStaleLockRecovery:
         CONTROLLER_STATE.json on disk. A competitor must not be able
         to read a half-initialized state."""
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace1 = tmp_path / "ws1"
         workspace2 = tmp_path / "ws2"
         # First init acquires the lock.
@@ -1435,7 +1435,7 @@ class TestControllerStaleLockRecovery:
     ):
         # Inline init helper to avoid pulling in another class.
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, _ = run_controller([
             "init",
@@ -1577,7 +1577,7 @@ class TestRound8ReceiptStatePathBinding:
 
     def _init_run(self, tmp_path, run_id):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, _ = run_controller([
             "init",
@@ -1688,7 +1688,7 @@ class TestRound8BootstrapRollback:
         self, tmp_path, isolated_lock_dir
     ):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         receipt_md_dir = workspace / "LAUNCH_RECEIPT.md"
         receipt_md_dir.mkdir(parents=True, exist_ok=True)
@@ -1796,7 +1796,7 @@ class TestRound9InitInlineRecovery:
         import time
         time.sleep(2)
         tasks = tmp_path / "tasks.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, out, err = run_controller([
             "init",
@@ -1825,7 +1825,7 @@ class TestRound9InitInlineRecovery:
         import time
         time.sleep(2)
         tasks = tmp_path / "tasks.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, err = run_controller([
             "init",
@@ -1885,7 +1885,7 @@ class TestRound10InitStubDeletionRace:
         # with a state_path pointing at a non-existent file.
         self._plant_stale_lock(scope, lock_base)
         tasks = tmp_path / "tasks.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         # Pre-populate a state file with a WINNER run_id at the
         # output path. This simulates the window where a winner
@@ -1971,7 +1971,7 @@ class TestRound10RepositoryRequiredForPRScope:
         self, tmp_path, isolated_lock_dir
     ):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         rc, _, err = run_controller([
             "init",
@@ -2084,7 +2084,7 @@ class TestRound11OutputStateAbsolutePath:
 
     def test_init_output_state_relative_resolves_to_absolute(self, tmp_path, isolated_lock_dir):
         tasks = tmp_path / "TASKS.jsonl"
-        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
         # The state path is relative. The controller must resolve
         # it to absolute (against the CWD when --output-state is
@@ -2109,3 +2109,189 @@ class TestRound11OutputStateAbsolutePath:
         receipt = json.loads((workspace / "LAUNCH_RECEIPT.json").read_text())
         receipt_state_path = Path(receipt["state_path"])
         assert receipt_state_path.is_absolute(), f"receipt state_path is not absolute: {receipt_state_path}"
+
+
+# ---------------------------------------------------------------------------
+# Round-12 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound12BootstrapWindow:
+    """Round-12 P1 fix: bypass_indeterminate_state must NOT
+    bypass state_path_missing when the recorded owner PID is
+    alive (live bootstrap window)."""
+
+    def test_state_path_missing_with_live_owner_pid_is_indeterminate(
+        self, scope, host_self, lock_base, tmp_path
+    ):
+        # Plant a stale lock whose state_path is missing AND
+        # whose owner_pid is alive (we use os.getpid()).
+        import os as _os
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-live",
+            "owner_pid": _os.getpid(),  # alive!
+            "owner_state_path": "/tmp/nonexistent.json",
+            "owner_start_evidence": {
+                "pid": _os.getpid(), "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+
+        # recover_stale with bypass_indeterminate_state=True must
+        # NOT bypass state_path_missing when the owner PID is alive.
+        outcome = supervisor_lock.recover_stale(
+            scope=scope,
+            recovered_by_run_id="r-new",
+            recovered_by_host=host_self,
+            recovered_by_pid=99999,
+            recovered_by_start_evidence={
+                "pid": 99999, "stat_start_time": None, "ctime_ns": None, "source": "unknown"
+            },
+            recovered_by_state_path=None,
+            staleness_evidence="test bootstrap-window protection",
+            base_dir=lock_base,
+            bypass_indeterminate_state=True,
+        )
+        assert not outcome.ok
+        assert "state_path" in outcome.reason or "indeterminate" in outcome.reason.lower()
+
+
+class TestRound12NonterminalRunStatesLive:
+    """Round-12 P1 fix: RUN_READY_FOR_SUMMARY and RUN_BLOCKED are
+    NOT terminal and must keep the lease alive."""
+
+    def _plant_lease_with_state(self, scope, lock_base, overall_status):
+        import os as _os
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        state_path = _os.path.join(_os.environ.get("TMPDIR", "/tmp"), "r12-nonexistent.json")
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-nt",
+            "owner_pid": 999999,
+            "owner_state_path": state_path,
+            "owner_start_evidence": {
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        # Plant the state file with the requested status.
+        Path(state_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        Path(state_path).write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r-nt",
+            "run_identity": {"run_id": "r-nt", "controller_version": 1},
+            "overall_status": overall_status,
+        }))
+        os.chmod(state_path, 0o600)
+        return path
+
+    def test_run_ready_for_summary_is_live(self, scope, host_self, lock_base):
+        path = self._plant_lease_with_state(scope, lock_base, "RUN_READY_FOR_SUMMARY")
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r-nt",
+            owner_host=host_self,
+            owner_pid=999999,
+            owner_start_evidence={
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            base_dir=lock_base,
+        )
+        # Existing lease is alive, so the new try must fail with live_lock_held_by.
+        assert not outcome.ok
+        assert "live_lock_held_by" in outcome.reason
+
+    def test_run_blocked_is_live(self, scope, host_self, lock_base):
+        path = self._plant_lease_with_state(scope, lock_base, "RUN_BLOCKED")
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r-nt",
+            owner_host=host_self,
+            owner_pid=999999,
+            owner_start_evidence={
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            base_dir=lock_base,
+        )
+        assert not outcome.ok
+        assert "live_lock_held_by" in outcome.reason
+
+
+class TestRound12AbsoluteWorkspaceInReceipt:
+    """Round-12 P2 fix: receipt's workspace path is absolute."""
+
+    def test_init_relative_workspace_persists_absolute_in_receipt(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10))
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller([
+            "init",
+            "--run-id", "aed-r12-abs-ws",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "904",
+            "--current-main-sha", "e4ef774",
+        ])
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}"
+        receipt = json.loads((workspace / "LAUNCH_RECEIPT.json").read_text())
+        receipt_workspace = receipt["workspace"]
+        assert Path(receipt_workspace).is_absolute(), f"workspace not absolute: {receipt_workspace}"
+
+
+class TestRound12LockDirPersistedFromEnv:
+    """Round-12 P2 fix: when --lock-dir is omitted but AED_LOCK_DIR
+    is in env, run_identity.lock_dir is persisted."""
+
+    def test_lock_dir_from_env_is_persisted(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10))
+        workspace = tmp_path / "ws"
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", "aed-r12-env-lockdir",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "905",
+            "--current-main-sha", "e4ef774",
+        ])
+        assert rc == 0
+        state = json.loads((workspace / "CONTROLLER_STATE.json").read_text())
+        rid = state.get("run_identity") or {}
+        assert rid.get("lock_dir") is not None, "lock_dir not persisted in run_identity"
+        assert Path(rid["lock_dir"]).is_absolute()
