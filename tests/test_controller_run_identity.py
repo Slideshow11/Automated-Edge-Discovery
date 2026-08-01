@@ -5473,3 +5473,73 @@ class TestRound34FailClosedOnUnreadableCrossScopeLeases:
             f"lease incorrectly blocked the requested "
             f"acquisition: {out.reason}"
         )
+
+
+class TestRound36RejectMutationForUnscopedRuns:
+    """Round-36 P1 fix: when `init` omitted --repository
+    (an explicitly supported path), the previous lease
+    check skipped validation entirely. authorize-mutation
+    then succeeded and recorded the workspace path as the
+    repository. Two controllers operating on separate
+    worktrees of the same repository could both authorize
+    pushes without any shared lock. Require a
+    repository-scoped lease before issuing mutation
+    authorization."""
+
+    def test_authorize_without_repository_in_state_is_rejected(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Initialize a run WITHOUT --repository (workspace-
+        # only scope). The Round-19 P2 fix supports this as
+        # an "explicitly supported path".
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r36-unscoped",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, f"init (no --repository) failed: rc={rc} err={err}"
+
+        # Now try to authorize-mutation. Without the
+        # Round-36 fix this would succeed despite no
+        # repository scope. With the fix it must fail.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(state_path),
+                "--workspace", str(workspace),
+                "--mutation-type", "push",
+                "--expected-main-sha", "e4ef774",
+                "--expected-target-sha", "e4ef774",
+                "--pending-action", "push",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc != 0, (
+            f"Round-36 P1 fix missing: authorize-mutation "
+            f"succeeded without a repository scope, "
+            f"got rc=0, err={err}"
+        )
+        # The specific error code is 11 (same as missing
+        # lease) — the new error message includes "no "
+        # "repository scope".
+        assert "repository scope" in (err or ""), (
+            f"unexpected error message: {err}"
+        )

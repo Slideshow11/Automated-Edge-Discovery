@@ -3512,20 +3512,38 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # belongs to this run. If another worker has recovered our
     # stale lease, the state may say RUN_ACTIVE but we no longer
     # own the supervisor lock; refuse authorization.
-    if scope.get("repository"):
-        run_id = state.get("run_id", "unknown")
-        lock_base_for_check = None
-        if rid.get("lock_dir"):
-            lock_base_for_check = Path(rid["lock_dir"])
-        if not _supervisor_lock.is_lease_held_by_run(
-            scope=scope, owner_run_id=run_id, base_dir=lock_base_for_check
-        ):
-            print(
-                f"ERROR: cannot authorize mutation: no live supervisor "
-                f"lock held by run_id={run_id} for scope={scope}",
-                file=sys.stderr,
-            )
-            sys.exit(11)
+    #
+    # Round-36 P1 fix (Reject mutation authorization for unscoped
+    # runs): when `init` omitted --repository (an explicitly
+    # supported path), this condition previously skipped lease
+    # validation entirely, yet authorize-mutation still succeeded
+    # and recorded the workspace path as the repository. Two
+    # controllers operating on separate worktrees of the same
+    # repository could therefore both authorize pushes or other
+    # repository/GitHub mutations without any shared lock,
+    # defeating the exclusivity this change adds. Require a
+    # repository-scoped lease before issuing mutation authorization.
+    if not scope.get("repository"):
+        print(
+            "ERROR: cannot authorize mutation: no repository scope "
+            "in the controller state. Re-initialize the run with "
+            "--repository to enable mutation authorization.",
+            file=sys.stderr,
+        )
+        sys.exit(11)
+    run_id = state.get("run_id", "unknown")
+    lock_base_for_check = None
+    if rid.get("lock_dir"):
+        lock_base_for_check = Path(rid["lock_dir"])
+    if not _supervisor_lock.is_lease_held_by_run(
+        scope=scope, owner_run_id=run_id, base_dir=lock_base_for_check
+    ):
+        print(
+            f"ERROR: cannot authorize mutation: no live supervisor "
+            f"lock held by run_id={run_id} for scope={scope}",
+            file=sys.stderr,
+        )
+        sys.exit(11)
     # Round-120 P1 fix (round 4): reject mutation targets outside
     # the locked scope. If the state scope is repo+A but the
     # caller supplies --mutation-target B, we would authorize a
