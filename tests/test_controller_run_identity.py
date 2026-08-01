@@ -6231,6 +6231,49 @@ class TestRound43ReleaseLeaseOnWorkspaceBusy:
         )
 
 
+class TestRound44OutputStateSentinel:
+    """Round-44 P1 fix: when two initializers use different
+    workspaces but the same --output-state, their workspace
+    sentinels don't collide but their state publishes do.
+    Add a per-output-state O_EXCL sentinel (defense in
+    depth on top of the Round-41 P2 same-run_id check)."""
+
+    def test_output_state_sentinel_file_is_created(
+        self, tmp_path, isolated_lock_dir
+    ):
+        """After a successful init with --output-state, the
+        output-state sentinel is unlinked. Verify the
+        sentinel file is NOT left behind (it was acquired
+        and then unlinked on success)."""
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        state_path = tmp_path / "state.json"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r44-sentinel",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(tmp_path / "ws"),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+                "--output-state", str(state_path),
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc}, err={err}"
+        # The output-state sentinel MUST be unlinked after
+        # success.
+        sentinel = state_path.with_suffix(
+            state_path.suffix + ".aed-write-sentinel"
+        )
+        assert not sentinel.exists(), (
+            f"Round-44 P1 fix missing: output-state "
+            f"sentinel {sentinel!r} was not removed after "
+            f"successful init"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

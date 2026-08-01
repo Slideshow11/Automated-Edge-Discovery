@@ -1360,6 +1360,12 @@ def _init(args: argparse.Namespace) -> None:
         # the sentinel is released in the existing cleanup
         # path.
         workspace_owned_path = workspace / ".aed-workspace-owned.json"
+        # Round-44 P1 fix: also declare the output-state
+        # sentinel at outer scope so the rollback can
+        # unlink it.
+        out_state_sentinel_path = Path(out_path).with_suffix(
+            Path(out_path).suffix + ".aed-write-sentinel"
+        )
         workspace_owned_fd = None
         try:
             workspace.mkdir(parents=True, exist_ok=True)
@@ -1385,6 +1391,50 @@ def _init(args: argparse.Namespace) -> None:
                 f"being initialized by another run. Wait for "
                 f"it to finish or remove "
                 f"{workspace_owned_path!r} to override.",
+                file=sys.stderr,
+            )
+            sys.exit(17)
+        # Round-44 P1 fix (Serialize ownership of custom
+        # output-state paths): when two initializers use
+        # different workspaces but the same nonexistent
+        # --output-state, their workspace sentinel paths
+        # differ, so both can pass the preceding artifact
+        # ownership check and then publish to the same
+        # state path. Because _save_state also uses the
+        # same fixed <output-state>.tmp path, the processes
+        # can overwrite each other's state. The fix: also
+        # take an O_EXCL lock on the resolved output-state
+        # path BEFORE the artifact check, so any other init
+        # for the same output-state blocks with rc=17 (or
+        # a clear reason). The output-state sentinel is
+        # unlinked on success (or rollback) just like the
+        # workspace sentinel.
+        out_path_parent = Path(out_path).parent
+        out_path_parent.mkdir(parents=True, exist_ok=True)
+        out_state_sentinel_fd = None
+        try:
+            out_state_sentinel_fd = os.open(
+                str(out_state_sentinel_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            with os.fdopen(out_state_sentinel_fd, "w") as _wf:
+                _wf.write(
+                    json.dumps({
+                        "held_by": args.run_id,
+                        "out_path": out_path,
+                    }) + "\n"
+                )
+            out_state_sentinel_fd = None
+        except FileExistsError:
+            # Another init currently holds the output-state
+            # path. Reject with rc=17.
+            print(
+                f"ERROR: output-state path {out_path!r} is "
+                f"currently being initialized by another run. "
+                f"Wait for it to finish or remove "
+                f"{out_state_sentinel_path!r} to override.",
                 file=sys.stderr,
             )
             sys.exit(17)
@@ -1443,6 +1493,12 @@ def _init(args: argparse.Namespace) -> None:
             # initialization is currently running".
             try:
                 os.unlink(workspace_owned_path)
+            except OSError:
+                pass
+            # Round-44 P1 fix (continued): unlink the
+            # output-state sentinel on success.
+            try:
+                os.unlink(out_state_sentinel_path)
             except OSError:
                 pass
         except _OwnershipRejectedError:
@@ -1519,6 +1575,20 @@ def _init(args: argparse.Namespace) -> None:
                         held_by = None
                     if held_by == args.run_id:
                         os.unlink(workspace_owned_path)
+            except OSError:
+                pass
+            # Round-44 P1 fix (continued): remove the
+            # output-state sentinel on rollback.
+            try:
+                if out_state_sentinel_path.exists():
+                    try:
+                        with open(out_state_sentinel_path) as _sf:
+                            os_existing = json.load(_sf)
+                        held_by = (os_existing or {}).get("held_by")
+                    except (OSError, json.JSONDecodeError):
+                        held_by = None
+                    if held_by == args.run_id:
+                        os.unlink(out_state_sentinel_path)
             except OSError:
                 pass
         except Exception:
