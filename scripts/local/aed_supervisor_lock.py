@@ -488,45 +488,92 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
     Round-24 P2 fix (Use a Windows-compatible sentinel lock):
     on Windows, use msvcrt.locking instead of fcntl.flock. On
     unsupported platforms, raise OSError.
+
+    Round-41 P2 fix (Honor max_attempts when acquiring
+    sentinels): the previous implementation performed
+    exactly one nonblocking lock attempt and immediately
+    returned None on EWOULDBLOCK. The callers (auth,
+    finalize, init) all pass max_attempts=20 expecting
+    a bounded retry. The fix polls up to max_attempts
+    times with a short sleep between attempts so transient
+    overlap with another worker's sentinel does not
+    require the operator to rerun the command.
+
+    Round-41 P1 fix (Create sentinel files exclusively
+    before unlinking): the previous code used O_CREAT
+    (not O_EXCL) to open the sentinel and unlinked the
+    file on lock-acquisition failure. Two processes
+    could both see FileExistsError, both fall through to
+    the "lock the existing file" branch, and then BOTH
+    could unlink the file when their nonblocking lock
+    failed, racing with each other. The fix: never
+    unlink a sentinel file we did not just create. The
+    unlink on lock-acquisition failure is removed; the
+    sentinel file is a stable inode that persists until
+    an explicit release / cleanup.
     """
     flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = _sentinel_lock_module()
     cloexec = _posix_cloexec_flag()
+    fd: Optional[int] = None
+    just_created = False
     try:
-        fd = os.open(
-            str(sentinel_path),
-            os.O_WRONLY | os.O_CREAT | cloexec,
-            0o600,
-        )
-    except FileExistsError:
-        # The sentinel file exists from a prior process; try to open
-        # it for write (without O_EXCL) and flock it. If flock fails
-        # with EWOULDBLOCK, another live process holds it.
+        # Round-41 P1 fix: use O_EXCL on the very first
+        # attempt so the creator is uniquely identified. If
+        # O_EXCL fails with FileExistsError, the file
+        # already exists (a prior process created it),
+        # and we open WITHOUT O_EXCL. This avoids the
+        # race where two processes both pass the
+        # "FileExistsError → try locking the existing
+        # file" branch.
         try:
+            fd = os.open(
+                str(sentinel_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | cloexec,
+                0o600,
+            )
+            just_created = True
+        except FileExistsError:
+            # Sentinel already exists. Open WITHOUT O_EXCL.
             fd = os.open(
                 str(sentinel_path),
                 os.O_WRONLY | cloexec,
                 0o600,
             )
-        except OSError:
-            return None
-        try:
-            flock_fn(fd, LOCK_EX | LOCK_NB)
-        except OSError:
-            os.close(fd)
-            return None
-        return fd
-
-    # We just created the sentinel. Lock it.
-    try:
-        flock_fn(fd, LOCK_EX | LOCK_NB)
     except OSError:
-        os.close(fd)
+        return None
+    # Round-41 P2 fix: bounded retry on EWOULDBLOCK. The
+    # previous implementation returned None after one
+    # nonblocking attempt, contradicting the documented
+    # max_attempts parameter.
+    poll_interval = 0.05
+    attempts = 0
+    try:
+        while True:
+            attempts += 1
+            try:
+                flock_fn(fd, LOCK_EX | LOCK_NB)
+                return fd
+            except (OSError, BlockingIOError):
+                if attempts >= max_attempts:
+                    # Round-41 P1 fix: close the fd but
+                    # DO NOT unlink the sentinel file. The
+                    # file is a stable inode; the other
+                    # process that currently holds the
+                    # flock will release it when it exits
+                    # (or on lock release), and a future
+                    # process can then acquire it.
+                    os.close(fd)
+                    return None
+                import time as _t
+                _t.sleep(poll_interval)
+    except BaseException:
+        # On any unexpected exception, clean up the fd
+        # but never unlink the sentinel.
         try:
-            os.unlink(sentinel_path)
+            os.close(fd)
         except OSError:
             pass
-        return None
-    return fd
+        raise
 
 
 def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:

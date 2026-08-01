@@ -5934,6 +5934,109 @@ class TestRound40DurablyPublishHumanReadableReceipt:
         )
 
 
+class TestRound41HonorSentinelMaxAttempts:
+    """Round-41 P2 fix: _acquire_sentinel_fd must honor
+    max_attempts with a bounded retry on EWOULDBLOCK.
+    The previous implementation performed exactly one
+    nonblocking attempt and immediately returned None."""
+
+    def test_sentinel_retry_waits_and_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+        import time as _t
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        sentinel = lock_base / "test.sentinel"
+        # Plant the sentinel file.
+        sentinel.touch(mode=0o600)
+
+        # Track flock calls and force the FIRST 3 to fail
+        # (EWOULDBLOCK), then succeed. The retry must
+        # overcome the transient failures.
+        flock_calls = {"count": 0, "fail_remaining": 3}
+
+        def patched_flock(fd, op):
+            flock_calls["count"] += 1
+            if flock_calls["fail_remaining"] > 0:
+                flock_calls["fail_remaining"] -= 1
+                raise BlockingIOError("Resource temporarily unavailable")
+            return None  # success
+
+        monkeypatch.setattr(supervisor_lock, "_sentinel_lock_module",
+                            lambda: (patched_flock, 2, 1, 4))
+
+        start = _t.time()
+        fd = supervisor_lock._acquire_sentinel_fd(
+            sentinel, max_attempts=20
+        )
+        elapsed = _t.time() - start
+        assert fd is not None, (
+            f"Round-41 P2 fix missing: sentinel "
+            f"acquisition returned None after "
+            f"{flock_calls['count']} flock attempts"
+        )
+        # 3 failed attempts × 0.05s sleep = ~0.15s minimum
+        # elapsed. (No upper bound enforced — depends on
+        # the system scheduler.)
+        assert elapsed >= 0.1, (
+            f"Round-41 P2 fix missing: retry did not "
+            f"sleep between attempts (elapsed={elapsed:.3f}s)"
+        )
+        supervisor_lock._release_sentinel_fd(fd, sentinel)
+
+
+class TestRound41RefuseOverwriteDifferentRunArtifacts:
+    """Round-41 P2 fix: when a workspace artifact
+    (LAUNCH_RECEIPT.json, LAUNCH_RECEIPT.md, or
+    CONTROLLER_STATE.json) already exists with a
+    run_identity.run_id different from args.run_id,
+    init must refuse to overwrite. Pass
+    --replace-stale-state to override."""
+
+    def test_init_refuses_to_overwrite_another_run(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        # Pre-create a CONTROLLER_STATE.json with a
+        # DIFFERENT run_identity.run_id.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        state_path.write_text(json.dumps({
+            "run_identity": {"run_id": "aed-r41-other"},
+            "overall_status": "RUN_ACTIVE",
+        }))
+
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r41-new",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc != 0, (
+            f"Round-41 P2 fix missing: init succeeded "
+            f"overwriting a different run's state, got "
+            f"rc=0, err={err}"
+        )
+        # The existing state must NOT have been overwritten.
+        on_disk = json.loads(state_path.read_text())
+        assert on_disk["run_identity"]["run_id"] == "aed-r41-other", (
+            "Round-41 P2 fix missing: init overwrote the "
+            "existing different run's state"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

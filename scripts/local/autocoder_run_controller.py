@@ -1271,6 +1271,49 @@ def _init(args: argparse.Namespace) -> None:
         # On signal/host crash between receipts and state, the
         # runnable state file is still absent so a replacement
         # init sees "no state at this path" and proceeds.
+        #
+        # Round-41 P2 fix (Refuse to overwrite another run's
+        # workspace artifacts): before publishing the
+        # machine/human receipts and the state, refuse if any
+        # of these files already exists with a different
+        # run_identity.run_id. The previous code
+        # unconditionally overwrote them, losing the
+        # earlier run's task/audit state and leaving the
+        # earlier run's lease to see a run-ID mismatch on
+        # next observation. The user can pass
+        # --replace-stale-state (or equivalent) to override.
+        for artifact_path, kind in [
+            (receipt_json_path_predicted, "LAUNCH_RECEIPT.json"),
+            (receipt_md_path_predicted, "LAUNCH_RECEIPT.md"),
+            (Path(out_path), "CONTROLLER_STATE.json"),
+        ]:
+            if artifact_path.exists():
+                try:
+                    with open(artifact_path) as _af:
+                        existing = json.load(_af)
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+                existing_run_id = (
+                    (existing.get("run_identity") or {}).get("run_id")
+                    if isinstance(existing, dict)
+                    else None
+                )
+                if (
+                    existing_run_id
+                    and existing_run_id != args.run_id
+                    and not getattr(args, "replace_stale_state", False)
+                ):
+                    print(
+                        f"ERROR: {kind} at {artifact_path!r} "
+                        f"already belongs to a different run "
+                        f"(run_id={existing_run_id!r}). Refusing "
+                        f"to overwrite. Pass "
+                        f"--replace-stale-state to override (this "
+                        f"destroys the existing run's audit "
+                        f"trail).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(16)
         receipt_json_path, receipt_md_path = _launch_receipt.emit(
             workspace,
             run_identity=run_identity,
@@ -3029,6 +3072,15 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Override the supervisor-lock directory. "
                              "Default: host-wide dir derived from XDG_RUNTIME_DIR or ~/.aed/locks. "
                              "Tests pass an explicit dir to isolate.")
+    p_init.add_argument("--replace-stale-state",
+                        action="store_true",
+                        help="Round-41 P2 fix: if any of LAUNCH_RECEIPT.json, "
+                             "LAUNCH_RECEIPT.md, or CONTROLLER_STATE.json at the "
+                             "output paths already exists with a different "
+                             "run_identity.run_id, overwrite it. By default "
+                             "(without this flag) init refuses to overwrite "
+                             "another run's artifacts to prevent silently "
+                             "destroying the existing run's audit trail.")
     # Round-9 P1 fix (Make recovered lease adoptable by init):
     # when a stale lease blocks init, allow init to recover it
     # inline rather than requiring a separate recover-stale-lock
