@@ -95,11 +95,17 @@ class LivenessEvidence:
 def build_scope_key(*, repository: str, target_pr_number: Optional[int] = None,
                     mutation_target: Optional[str] = None) -> str:
     """Stable string key for the scope. Different scopes can have different locks."""
+    # Round-17 P2 fix (Normalize repository case before building
+    # lock scope): GitHub repository names are case-insensitive
+    # but POSIX file paths are case-sensitive. Normalize to
+    # lowercase so `Owner/Repo` and `owner/repo` map to the same
+    # lock key.
+    repo = (repository or "").lower()
     if target_pr_number is not None:
-        return f"repo:{repository}|pr:{int(target_pr_number)}"
+        return f"repo:{repo}|pr:{int(target_pr_number)}"
     if mutation_target:
-        return f"repo:{repository}|target:{mutation_target}"
-    return f"repo:{repository}|run"
+        return f"repo:{repo}|target:{mutation_target}"
+    return f"repo:{repo}|run"
 
 
 def _lock_filename_for_scope_key(scope_key: str) -> str:
