@@ -474,36 +474,89 @@ def try_acquire(
         # empty or truncated lock file that subsequent acquirers
         # cannot recover. Now: write the complete payload to a
         # sibling tmp file, then os.replace to publish atomically.
-        # If anything fails, the tmp file is removed and the
-        # scope is left untouched.
-        tmp_path = path.with_suffix(path.suffix + ".new")
-        try:
-            with safe_restrictive_open(tmp_path, "w") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-            try:
-                os.replace(tmp_path, path)
-            except OSError as e:
-                # Failed to atomically publish. Clean up tmp.
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                return LockOutcome(
-                    ok=False,
-                    path=path,
-                    owner=None,
-                    reason=f"atomic_publish_failed:{e.strerror or str(e)}",
-                )
-        except OSError as e:
+        # Round-9 P1 fix (Serialize initial lease publication):
+        # hold the same scope sentinel used by recover_stale/
+        # release while publishing. Without the sentinel, two
+        # concurrent inits could both observe no lock, both write
+        # a .new file, and the second os.replace would overwrite
+        # the first's lease — both calls would then return ok.
+        # The sentinel serializes the read+publish sequence.
+        sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
+        sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+        if sentinel_fd is None:
             return LockOutcome(
                 ok=False,
                 path=path,
                 owner=None,
-                reason=f"write_tmp_failed:{e.strerror or str(e)}",
+                reason="acquire_sentinel_busy",
             )
+        try:
+            # Re-check inside the sentinel: another contender may
+            # have raced ahead of us between _read_lock above and
+            # the sentinel acquire.
+            existing2 = _read_lock(path)
+            if existing2 is not None:
+                evidence = assess_liveness(existing2)
+                if evidence.is_indeterminate:
+                    return LockOutcome(
+                        ok=False,
+                        path=path,
+                        owner=existing2,
+                        reason=f"indeterminate_liveness_after_sentinel:{evidence.reason}",
+                        indeterminate=True,
+                    )
+                if evidence.is_alive:
+                    return LockOutcome(
+                        ok=False,
+                        path=path,
+                        owner=existing2,
+                        reason=f"live_lock_held_by:{existing2.get('owner_run_id')}",
+                    )
+            tmp_path = path.with_suffix(path.suffix + ".new")
+            try:
+                with safe_restrictive_open(tmp_path, "w") as f:
+                    json.dump(payload, f, indent=2, sort_keys=True)
+                    f.write("\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                # One more re-check immediately before replace, in
+                # case the previous contents reappeared after we
+                # cleared the sentinel — they cannot, but this is
+                # the last line of defense against the round-9 race.
+                existing3 = _read_lock(path)
+                if existing3 is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    return LockOutcome(
+                        ok=False,
+                        path=path,
+                        owner=existing3,
+                        reason="lock_reappeared_during_publish",
+                    )
+                try:
+                    os.replace(tmp_path, path)
+                except OSError as e:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    return LockOutcome(
+                        ok=False,
+                        path=path,
+                        owner=None,
+                        reason=f"atomic_publish_failed:{e.strerror or str(e)}",
+                    )
+            except OSError as e:
+                return LockOutcome(
+                    ok=False,
+                    path=path,
+                    owner=None,
+                    reason=f"write_tmp_failed:{e.strerror or str(e)}",
+                )
+        finally:
+            _release_sentinel_fd(sentinel_fd, sentinel_path)
         return LockOutcome(ok=True, path=path, owner=payload, reason="acquired")
 
     # Existing lock present. Determine if it's alive.
@@ -545,6 +598,7 @@ def recover_stale(
     staleness_evidence: str,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     base_dir: Optional[Path] = None,
+    bypass_indeterminate_state: bool = False,
 ) -> LockOutcome:
     """
     Atomically take over a stale lock with a strict CAS (compare-and-swap).
@@ -610,11 +664,22 @@ def recover_stale(
     if not corrupt_lease:
         evidence = assess_liveness(existing)
         if evidence.is_indeterminate:
-            return LockOutcome(
-                ok=False, path=path, owner=existing,
-                reason=f"indeterminate_liveness:{evidence.reason}",
-                indeterminate=True,
-            )
+            # Round-9 P1 fix: when the operator explicitly opts
+            # into inline recovery (bypass_indeterminate_state),
+            # allow state_path_missing and similar "indeterminate
+            # because we can't read the state file" cases to
+            # proceed. The operator has explicitly accepted that
+            # the predecessor's state file is missing or
+            # unreadable; refusing here would force an
+            # unrecoverable lock.
+            if bypass_indeterminate_state and "state_path" in evidence.reason:
+                pass  # proceed with recovery
+            else:
+                return LockOutcome(
+                    ok=False, path=path, owner=existing,
+                    reason=f"indeterminate_liveness:{evidence.reason}",
+                    indeterminate=True,
+                )
         if evidence.is_alive:
             return LockOutcome(
                 ok=False, path=path, owner=existing,
@@ -673,11 +738,14 @@ def recover_stale(
                     reason="recheck_found_lock_live",
                 )
             if live2.is_indeterminate:
-                return LockOutcome(
-                    ok=False, path=path, owner=existing2,
-                    reason=f"recheck_indeterminate:{live2.reason}",
-                    indeterminate=True,
-                )
+                if bypass_indeterminate_state and "state_path" in live2.reason:
+                    liveness_reason = live2.reason  # proceed
+                else:
+                    return LockOutcome(
+                        ok=False, path=path, owner=existing2,
+                        reason=f"recheck_indeterminate:{live2.reason}",
+                        indeterminate=True,
+                    )
             liveness_reason = live2.reason
 
         observed_version = existing2.get("lock_version_chain", 0) + 1

@@ -1708,3 +1708,134 @@ class TestRound8BootstrapRollback:
         assert (workspace / "LAUNCH_RECEIPT.json").exists() is False, (
             "JSON receipt was not rolled back after MD receipt write failure"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-9 hardening regression tests (P1 serialize initial lease,
+# P1 init inline recovery).
+# ---------------------------------------------------------------------------
+
+
+class TestRound9SerializeInitialLeasePublish:
+    """Finding G: concurrent try_acquire must be serialized by the
+    scope sentinel so two inits cannot both publish."""
+
+    def test_two_simultaneous_init_only_one_wins(self, scope, proc_evidence_self, host_self, lock_base, tmp_path):
+        # Use threads to run try_acquire concurrently; only one
+        # should succeed.
+        import threading
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()
+            r = supervisor_lock.try_acquire(
+                scope=scope,
+                owner_run_id=f"r-{threading.get_ident()}",
+                owner_host=host_self,
+                owner_pid=proc_evidence_self["pid"],
+                owner_start_evidence=proc_evidence_self,
+                base_dir=lock_base,
+            )
+            results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(results) == 2
+        successes = [r for r in results if r.ok]
+        assert len(successes) == 1, f"expected exactly one success, got {len(successes)}"
+
+
+class TestRound9InitInlineRecovery:
+    """Finding H: init with --replace-stale-lock recovers inline so the
+    new run's state file becomes the lease's owner_state_path."""
+
+    def _plant_stale_lock(self, scope, lock_base, run_id):
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-old",
+            "owner_pid": 999999,
+            "owner_state_path": "/tmp/old.json",
+            "owner_start_evidence": {
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 1,  # short → immediately stale
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        return path
+
+    def test_init_replace_stale_lock_recovers_inline(
+        self, scope, proc_evidence_self, lock_base, isolated_lock_dir, tmp_path
+    ):
+        """A replacement init with --replace-stale-lock must
+        successfully acquire the lock by recovering inline and
+        binding the lease to its own --output-state."""
+        path = self._plant_stale_lock(scope, lock_base, "r-old")
+        # Plant a state file so the lease can detect stale-ness:
+        # pre-populate a state file in the lock_dir path? No — the
+        # lease is stale because max_age_seconds=1 has elapsed
+        # since the planted mtime.
+        # Wait briefly so the lease is unambiguously stale by mtime.
+        import time
+        time.sleep(2)
+        tasks = tmp_path / "tasks.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        rc, out, err = run_controller([
+            "init",
+            "--run-id", "r-new",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", scope["repository"],
+            "--target-pr-number", str(scope["target_pr_number"]),
+            "--current-main-sha", "e4ef774",
+            "--starting-target-sha", "c973fa6c",
+            "--replace-stale-lock",
+        ])
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}, stdout={out}"
+        # Lease owner_run_id is now r-new and owner_state_path is
+        # the new init's state file.
+        payload = json.loads(path.read_text())
+        assert payload["owner_run_id"] == "r-new"
+        assert str(tmp_path / "ws" / "CONTROLLER_STATE.json") in payload["owner_state_path"] or                payload["owner_state_path"].endswith("CONTROLLER_STATE.json")
+
+    def test_init_without_replace_stale_lock_fails(
+        self, scope, lock_base, isolated_lock_dir, tmp_path
+    ):
+        """A stale lease without --replace-stale-lock still exits 2."""
+        self._plant_stale_lock(scope, lock_base, "r-old")
+        import time
+        time.sleep(2)
+        tasks = tmp_path / "tasks.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller([
+            "init",
+            "--run-id", "r-new",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", scope["repository"],
+            "--target-pr-number", str(scope["target_pr_number"]),
+            "--current-main-sha", "e4ef774",
+            "--starting-target-sha", "c973fa6c",
+        ])
+        assert rc == 2, f"expected rc=2 (stale lock, no --replace-stale-lock), got {rc}: {err}"

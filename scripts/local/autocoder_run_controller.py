@@ -53,6 +53,7 @@ from scripts.local import (
     aed_mutation_authorization as _mutation_auth,
     aed_launch_receipt as _launch_receipt,
 )
+from scripts.local.aed_supervisor_lock import LockOutcome
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +581,13 @@ def _init(args: argparse.Namespace) -> None:
         }
         if lock_dir_arg:
             lock_base = Path(lock_dir_arg)
+        # Round-9 P1 fix (Make recovered lease adoptable by init):
+        # when --replace-stale-lock is set and try_acquire fails
+        # because the existing lease is stale, attempt inline
+        # recovery before exiting. The recovered lease is bound
+        # to THIS init's --output-state so the state file becomes
+        # the lease's owner_state_path (alive evidence) once init
+        # persists it.
         lock_outcome = _supervisor_lock.try_acquire(
             scope=scope,
             owner_run_id=args.run_id,
@@ -589,6 +597,86 @@ def _init(args: argparse.Namespace) -> None:
             owner_state_path=str(Path(out_path).resolve()),
             base_dir=lock_base,
         )
+        if (
+            not lock_outcome.ok
+            and getattr(args, "replace_stale_lock", False)
+            and lock_outcome.reason
+            and (
+                lock_outcome.reason.startswith("stale_lock_detected:")
+                or lock_outcome.reason.startswith("indeterminate_liveness:indeterminate:state_path_missing")
+                or lock_outcome.reason.startswith("corrupt_existing_lease_recovery_required")
+            )
+        ):
+            print(
+                f"NOTE: stale lease detected, recovering inline: "
+                f"{lock_outcome.reason}",
+                file=sys.stderr,
+            )
+            # Round-9 P1 fix: write a stub state file at the
+            # lease's owner_state_path BEFORE recovering. The
+            # recovered lease will be bound to this path, and the
+            # state file MUST exist for lease-based liveness to
+            # succeed on the next try_acquire. Without this stub,
+            # the retry returns state_path_missing indeterminate
+            # and the init fails.
+            Path(out_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            Path(out_path).write_text(json.dumps({
+                "controller_version": int(state["controller_version"]),
+                "run_id": args.run_id,
+                "workspace": str(workspace) if False else args.workspace,
+                "overall_status": "RUN_ACTIVE",
+                "updated_at": _utcnow(),
+                "run_identity": {
+                    "run_id": args.run_id,
+                    "controller_version": int(state["controller_version"]),
+                },
+            }, indent=2, sort_keys=True) + "\n")
+            try:
+                os.chmod(out_path, 0o600)
+            except (OSError, NotImplementedError):
+                pass
+
+            proc_evidence2 = _run_identity.capture_process_start_evidence()
+            if proc_evidence2 is None:
+                proc_evidence2 = proc_evidence
+            host_identity2 = _run_identity.capture_host_identity()
+            recovered = _supervisor_lock.recover_stale(
+                scope=scope,
+                recovered_by_run_id=args.run_id,
+                recovered_by_host=host_identity2,
+                recovered_by_pid=proc_evidence2["pid"],
+                recovered_by_start_evidence=proc_evidence2,
+                recovered_by_state_path=str(Path(out_path).resolve()),
+                staleness_evidence=f"init inline recovery for run_id={args.run_id}; "
+                                    f"original reason={lock_outcome.reason}",
+                base_dir=lock_base,
+                bypass_indeterminate_state=True,
+            )
+            if not recovered.ok:
+                # Roll back the stub state file so the failed init
+                # leaves no orphan.
+                try:
+                    os.unlink(out_path)
+                except OSError:
+                    pass
+                print(
+                    f"ERROR: inline stale-lock recovery failed: {recovered.reason}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            # Round-9 P1 fix: the recovered lease IS our
+            # acquisition. The operator explicitly opted in to
+            # inline recovery; the recovered lease is bound to
+            # our run_id and our state path, so a retry try_acquire
+            # would correctly reject (the lock is now live and
+            # held by us). Skip the retry and synthesize a
+            # successful LockOutcome.
+            lock_outcome = LockOutcome(
+                ok=True,
+                path=recovered.path,
+                owner=recovered.owner,
+                reason="recovered_inline",
+            )
         if not lock_outcome.ok:
             owner = lock_outcome.owner or {}
             print(
@@ -2384,6 +2472,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Override the supervisor-lock directory. "
                              "Default: host-wide dir derived from XDG_RUNTIME_DIR or ~/.aed/locks. "
                              "Tests pass an explicit dir to isolate.")
+    # Round-9 P1 fix (Make recovered lease adoptable by init):
+    # when a stale lease blocks init, allow init to recover it
+    # inline rather than requiring a separate recover-stale-lock
+    # call. The recovered lease is bound to THIS init's
+    # --output-state path so init's state file becomes the
+    # lease's owner_state_path, satisfying the lease-based
+    # liveness check.
+    p_init.add_argument("--replace-stale-lock",
+                        action="store_true",
+                        help="If a stale lease blocks the scope, recover it "
+                             "inline before publishing this run's state. The "
+                             "recovered lease is bound to --output-state.")
 
     # status
     p_status = sub.add_parser("status", help="Show current run controller state")
