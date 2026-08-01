@@ -6544,6 +6544,86 @@ class TestRound48CanonicalizeStatePathsInFinalize:
         )
 
 
+class TestRound49RejectReuseOfCompletedRunId:
+    """Round-49 P2 fix: when init is rerun with the same
+    --run-id and workspace after finalize-run has
+    released the supervisor lease, the previous guard
+    permitted all existing artifacts to be overwritten
+    without --replace-stale-state. The command then
+    reset the finalized state to RUN_ACTIVE and replaced
+    its task results and launch receipts, silently
+    destroying the completed run's audit trail despite
+    --run-id being documented as unique. Refuse when the
+    run_id matches AND the existing state shows a
+    terminal status, UNLESS --replace-stale-state is
+    also set."""
+
+    def test_init_rejects_reuse_of_completed_run_id(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+
+        # First init: succeeds.
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r49-reuse",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"first init failed: rc={rc}, err={err}"
+
+        # Finalize: marks the run as RUN_COMPLETE and
+        # releases the supervisor lease.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "finalize-run",
+                "--state", str(state_path),
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"finalize failed: rc={rc}, err={err}"
+
+        # Verify the state is RUN_COMPLETE.
+        on_disk = json.loads(state_path.read_text())
+        assert on_disk["overall_status"] == "RUN_COMPLETE", (
+            f"expected RUN_COMPLETE, got {on_disk['overall_status']!r}"
+        )
+
+        # Second init with the SAME --run-id: must fail
+        # with rc=16 because the existing run is
+        # completed.
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r49-reuse",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 16, (
+            f"Round-49 P2 fix missing: second init with "
+            f"same run_id should fail with rc=16, got "
+            f"rc={rc}, err={err}"
+        )
+        assert "COMPLETED" in (err or ""), (
+            f"unexpected error: {err}"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

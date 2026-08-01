@@ -1346,6 +1346,49 @@ def _init(args: argparse.Namespace) -> None:
                         file=sys.stderr,
                     )
                     sys.exit(16)
+                # Round-49 P2 fix (Reject reuse of a completed
+                # run ID): the previous guard above refused
+                # overwrite only when the existing run_id
+                # differed from the requested one. When the
+                # operator reruns init with the SAME run_id
+                # (e.g. after finalize-run has already
+                # released the lease), the run is no longer
+                # active but the existing artifacts (state
+                # file, receipts) are not protected by any
+                # other lock. The same-run_id case could
+                # silently destroy a finalized run's audit
+                # trail. Refuse when the run_id matches AND
+                # the existing state shows a terminal
+                # status (RUN_COMPLETE / RUN_TERMINAL_*) UNLESS
+                # --replace-stale-state is also set.
+                if (
+                    existing_run_id
+                    and existing_run_id == args.run_id
+                    and not getattr(args, "replace_stale_state", False)
+                ):
+                    existing_status = (
+                        existing.get("overall_status")
+                        if isinstance(existing, dict)
+                        else None
+                    )
+                    terminal_statuses = {
+                        "RUN_COMPLETE",
+                        "RUN_TERMINAL_FAILED",
+                        "RUN_TERMINAL_ABORTED",
+                    }
+                    if existing_status in terminal_statuses:
+                        print(
+                            f"ERROR: {kind} at {artifact_path!r} "
+                            f"already belongs to a COMPLETED run "
+                            f"(run_id={existing_run_id!r}, "
+                            f"overall_status={existing_status!r}). "
+                            f"Refusing to overwrite. Pass "
+                            f"--replace-stale-state to override (this "
+                            f"destroys the existing run's audit "
+                            f"trail).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(16)
         # Round-42 P1 fix (Serialize workspace ownership
         # before publishing artifacts): two concurrent
         # initializers for distinct PR or mutation-target
