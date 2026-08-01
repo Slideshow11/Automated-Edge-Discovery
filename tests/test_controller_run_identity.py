@@ -2907,3 +2907,151 @@ class TestRound19SquashMergeRequiresFullSha:
             env={"AED_LOCK_DIR": str(tmp_path / "locks")},
         )
         assert rc == 0, f"non-squash-merge without sha must be accepted, got rc={rc}, err={err}"
+
+
+# ---------------------------------------------------------------------------
+# Round-20 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound20RepositoryRequiredForMutationTarget:
+    """Round-20 P2 fix: --mutation-target without --repository
+    must be rejected at init time. The previous code accepted
+    this partial scope and built a lease with empty repository,
+    allowing authorize-mutation to skip lease ownership
+    validation."""
+
+    def test_mutation_target_without_repository_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r20-mt",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                # NOTE: no --repository.
+                "--mutation-target", "feat/x-target",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"init with --mutation-target but no --repository must "
+            f"exit 14, got rc={rc}, err={err}"
+        )
+        assert "mutation-target" in err.lower() or "repository" in err.lower()
+
+    def test_mutation_target_with_repository_succeeds(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r20-mt-ok",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--mutation-target", "feat/x-target",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, (
+            f"init with both --mutation-target and --repository "
+            f"must succeed, got rc={rc}, err={err}"
+        )
+
+
+class TestRound20RejectMutationTargetAbsentFromScope:
+    """Round-20 P2 fix: when a run was initialized WITHOUT a
+    mutation target, authorize-mutation must reject any
+    caller-supplied --mutation-target because the held lease
+    protects a different scope (or no specific target)."""
+
+    def _make_pr_scoped_state(self, tmp_path):
+        """Init a run with --repository + --target-pr-number
+        (PR-scoped) but NO --mutation-target."""
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r20-no-mt",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(ws),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "920",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc} err={err}"
+        state = json.loads((ws / "CONTROLLER_STATE.json").read_text())
+        # Confirm mutation_target is unset in the state scope.
+        assert state.get("run_identity", {}).get("mutation_target") is None, (
+            "test fixture: PR-scoped init must not record a "
+            "mutation_target"
+        )
+        return ws, state["next_action"]["action"]
+
+    def test_authorize_with_unexpected_mutation_target_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws, pending_action = self._make_pr_scoped_state(tmp_path)
+        state_path = str(ws / "CONTROLLER_STATE.json")
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "pr_body_update",
+                "--mutation-target", "feat/rogue-target",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 12, (
+            f"authorize-mutation with an unexpected "
+            f"--mutation-target must exit 12, got rc={rc}, err={err}"
+        )
+        assert "mutation-target" in err.lower() or "scope" in err.lower()
+
+    def test_authorize_with_no_mutation_target_succeeds(
+        self, tmp_path, isolated_lock_dir
+    ):
+        """When the state scope has no mutation_target and the
+        caller also omits --mutation-target, the authorization
+        proceeds."""
+        ws, pending_action = self._make_pr_scoped_state(tmp_path)
+        state_path = str(ws / "CONTROLLER_STATE.json")
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", state_path,
+                "--workspace", str(ws),
+                "--mutation-type", "pr_body_update",
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, (
+            f"authorize-mutation without --mutation-target on a "
+            f"PR-scoped run must succeed, got rc={rc}, err={err}"
+        )

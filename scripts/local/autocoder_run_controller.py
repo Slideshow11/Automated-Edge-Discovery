@@ -579,6 +579,26 @@ def _init(args: argparse.Namespace) -> None:
     # --lock-dir to isolate.
     lock_dir_arg: Optional[str] = getattr(args, "lock_dir", None)
     lock_base: Optional[Path] = None
+    # Round-20 P2 fix (Require a repository for mutation-target
+    # locking): --mutation-target without --repository must be
+    # rejected at init time regardless of whether the run is
+    # otherwise PR-scoped. The previous code accepted this
+    # partial scope when neither --repository nor
+    # --target-pr-number was set, built a lease with empty
+    # repository, and authorize-mutation later fell back to
+    # workspace-scope and skipped lease ownership validation.
+    # Two controllers in different workspaces could then
+    # concurrently mutate the same real target. Fail closed at
+    # init time. This check must run BEFORE the
+    # repository-or-target_pr_number branch so it fires even
+    # when neither is set.
+    if getattr(args, "mutation_target", None) and not getattr(args, "repository", None):
+        print(
+            "ERROR: --mutation-target requires --repository "
+            "(a partial scope is not permitted for lock ownership)",
+            file=sys.stderr,
+        )
+        sys.exit(14)
     if getattr(args, "repository", None) or getattr(args, "target_pr_number", None):
         # Round-10 P2 fix: refuse a PR-scoped lock without an
         # explicit repository. The previous code accepted
@@ -3271,12 +3291,22 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # caller supplies --mutation-target B, we would authorize a
     # mutation against B while another controller legitimately
     # holds B's lock.
+    #
+    # Round-20 P2 fix: when the run was initialized WITHOUT a
+    # mutation target (e.g. a PR-scoped run), `state_mutation_target`
+    # is None. The previous check accepted any caller-supplied
+    # --mutation-target in that case because the guard
+    # `state_mutation_target` short-circuited the comparison.
+    # The caller could then authorize a mutation against an
+    # arbitrary target while the held lease protects a different
+    # PR/repository-run lock path, letting another controller
+    # holding the target-specific lock mutate the same target
+    # concurrently. Treat a supplied target as a mismatch
+    # whenever it is not exactly the target recorded in the
+    # state scope (including the None case where the scope has
+    # no target).
     state_mutation_target = _state_mutation_target(state)
-    if (
-        args.mutation_target
-        and state_mutation_target
-        and args.mutation_target != state_mutation_target
-    ):
+    if args.mutation_target and args.mutation_target != state_mutation_target:
         print(
             f"ERROR: --mutation-target={args.mutation_target} does not "
             f"match state scope mutation_target={state_mutation_target}",
