@@ -5849,6 +5849,91 @@ class TestRound39RevalidateLeaseDuringAdoptionToken:
         )
 
 
+class TestRound40WindowsSafeJournalDirFsync:
+    """Round-40 P2 fix: the journal directory fsync in
+    _append_record must be guarded against Windows'
+    inability to open a directory with O_RDONLY. Without
+    the guard, the fsync raises an unhandled OSError and
+    the command reports failure AFTER appending the
+    record, leaving the run wedged on a duplicate."""
+
+    def test_journal_dir_fsync_guarded_against_oserror(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_mutation_authorization as ma
+        import os as _os
+
+        # The fsync branch is only taken when the journal
+        # file did not exist before this append. Ensure
+        # that by pre-removing the journal.
+        journal = tmp_path / "MUTATIONS.jsonl"
+        if journal.exists():
+            journal.unlink()
+
+        # Monkeypatch os.open to raise OSError(EACCES) when
+        # called with O_RDONLY (simulating the Windows
+        # case). The fsync branch must catch and continue,
+        # not propagate the OSError.
+        original_open = _os.open
+        patched_calls = {"count": 0}
+
+        def patched_open(path, flags, *args, **kwargs):
+            patched_calls["count"] += 1
+            # O_RDONLY is the directory open. Reject it.
+            if (flags & _os.O_RDONLY) and (flags & _os.O_DIRECTORY):
+                raise _os.error(13, "Permission denied")
+            if (flags & _os.O_RDONLY) and not (flags & _os.O_CREAT):
+                # Directory fsync site — reject.
+                raise _os.error(13, "Permission denied")
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(ma.os, "open", patched_open)
+
+        # _append_record must NOT raise despite the
+        # unsupported dir fsync.
+        ma._append_record(
+            tmp_path,
+            {"mutation_id": "m-r40", "kind": "test"},
+        )
+        assert journal.exists()
+        # The os.open monkeypatch WAS hit (the dir fd
+        # open attempt). No exception propagated.
+        assert patched_calls["count"] >= 1
+
+
+class TestRound40DurablyPublishHumanReadableReceipt:
+    """Round-40 P2 fix: write_human_readable must fsync
+    the file descriptor and the parent directory before
+    returning, mirroring the machine-readable receipt's
+    durability guarantees."""
+
+    def test_human_readable_fsyncs_descriptor_and_dir(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_launch_receipt as lr
+        import os as _os
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(lr.os, "fsync", tracking_fsync)
+
+        path = tmp_path / "LAUNCH_RECEIPT.md"
+        lr.write_human_readable(path, "# test\n")
+
+        # At least 2 fsync calls: file descriptor + parent
+        # directory.
+        assert fsync_calls["count"] >= 2, (
+            f"Round-40 P2 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"write_human_readable; expected at least 2."
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

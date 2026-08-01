@@ -252,11 +252,32 @@ def _append_record(workspace: Path, record: dict) -> None:
         # fsync can still leave the directory without the
         # journal, recreating the crash-after-authorization gap.
         if not journal_existed_before:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY | posix_cloexec_flag())
+            # Round-40 P2 fix (Skip unsupported directory
+            # fsyncs on Windows): on native Windows, the
+            # CRT-backed os.open cannot open a directory
+            # with O_RDONLY. Unlike the other
+            # directory-fsync sites, this exception is
+            # NOT caught, so the authorization record is
+            # appended and fsynced but the command reports
+            # failure before returning its mutation ID; a
+            # retry then encounters the outstanding
+            # duplicate and wedges the run. Guard this
+            # fsync to POSIX or catch the
+            # unsupported-directory OSError.
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                dir_fd = os.open(
+                    str(path.parent), os.O_RDONLY | posix_cloexec_flag()
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except (OSError, NotImplementedError, AttributeError):
+                # On Windows or non-POSIX platforms, skip
+                # the directory fsync. The file's own
+                # fsync above already persists the journal
+                # contents.
+                pass
     finally:
         os.close(fd)
 

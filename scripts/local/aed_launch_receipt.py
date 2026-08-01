@@ -155,6 +155,27 @@ def write_human_readable(path: Path, content: str) -> None:
     assert_no_secrets(content, context=str(path))
     with safe_restrictive_open(path, "w") as f:
         f.write(content)
+        f.flush()
+        # Round-40 P2 fix (Durably publish the human-readable
+        # launch receipt): fsync the file descriptor before
+        # closing. The machine-readable receipt's
+        # write_restrictive_json already fsyncs; the
+        # human-readable receipt previously did not. Without
+        # this, a host crash or power loss after init
+        # reports success can lose LAUNCH_RECEIPT.md.
+        os.fsync(f.fileno())
+    # Round-40 P2 fix (continued): fsync the parent
+    # directory so the directory entry update is durable.
+    try:
+        dir_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, NotImplementedError, AttributeError):
+        pass
 
 
 def emit(
