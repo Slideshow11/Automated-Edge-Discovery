@@ -4813,3 +4813,98 @@ class TestRound29AdoptionConsumedByStateFile:
             "Round-29 P1 fix missing: failing init corrupted "
             "the existing state file"
         )
+
+
+class TestRound30AdoptionWritesStubStateFile:
+    """Round-30 P1 fix: the recovery-lease adoption branch must
+    atomically write a stub state file at the replacement
+    path before returning ok=True. The Round-29 existence
+    check prevented only SEQUENTIAL re-adoption; two
+    concurrent inits could both pass the check. The stub
+    file is the atomic consumption token — the second
+    concurrent init sees the stub and is rejected by the
+    Round-29 check."""
+
+    def test_adoption_writes_stub_state_file(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 938,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r30-adopt",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [
+                {
+                    "recovered_at": "2026-01-01T00:00:00Z",
+                    "previous_owner_run_id": "aed-predecessor",
+                    "staleness_evidence": "stale_lock_detected:...",
+                    "reason": "test",
+                }
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # State file does NOT exist yet.
+        state_path = tmp_path / "ws" / "CONTROLLER_STATE.json"
+        assert not state_path.exists()
+
+        # Init with the same run_id. The Round-30 fix must
+        # write a stub state file BEFORE returning ok=True so
+        # concurrent inits cannot both adopt.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r30-adopt",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "938",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, (
+            f"init must adopt the recovery lease, got "
+            f"rc={rc}, err={err}"
+        )
+        # The state file MUST exist after adoption (the
+        # stub was written atomically; the subsequent full
+        # publication overwrites it).
+        assert state_path.exists(), (
+            "Round-30 P1 fix missing: adoption did not "
+            "write a state file at the replacement path"
+        )

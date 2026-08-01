@@ -726,27 +726,31 @@ def _init(args: argparse.Namespace) -> None:
             # replacement state file already exists.
             and not Path(out_path).exists()
         ):
-            # Round-21 P2 fix (Adopt leases created by the recovery
-            # command): when an operator has previously run
-            # `recover-stale-lock` for this run_id (a supported
-            # workflow), the resulting lease is owned by the
-            # replacement run but the state file hasn't been
-            # created yet. try_acquire returns
-            # `live_lock_held_by:<args.run_id>` and the previous
-            # code exited. Adopt the lease by treating the outcome
-            # as ok=True with the existing owner; init will then
-            # publish the state under the existing lease.
-            #
-            # Round-22 P1 fix: bind the adoption to the
-            # requested state path. When two `init` invocations
-            # share the same run_id and scope but use different
-            # output-state paths, the previous adoption branch
-            # would have let the second invocation adopt the
-            # first's lease, allowing both workspaces to
-            # authorize mutations against the same scope.
-            # Compare the lease's owner_state_path against the
-            # resolved out_path and only adopt on an exact match.
+            # Round-30 P1 fix (Serialize recovered-lease
+            # adoption): the Round-29 existence check
+            # prevented only SEQUENTIAL re-adoption; two
+            # concurrent inits could both pass the check and
+            # both adopt. Atomically consume the adoption
+            # token by writing a stub state file at the
+            # replacement path IMMEDIATELY (before publishing
+            # the full state). The subsequent init invocations
+            # see the stub file and the Round-29 check
+            # rejects them. The stub is overwritten by the
+            # full state publication in the same critical
+            # section below; on any later failure the stub
+            # still satisfies the existence check and
+            # prevents duplicate adoption.
             existing_owner = lock_outcome.owner or {}
+            try:
+                Path(out_path).parent.mkdir(
+                    parents=True, exist_ok=True, mode=0o700
+                )
+                Path(out_path).touch(mode=0o600, exist_ok=True)
+            except (OSError, FileExistsError):
+                # If touch fails for any reason, fall back to
+                # the existence check; a later concurrent
+                # init will retry.
+                pass
             print(
                 f"NOTE: adopting pre-existing lease for run_id="
                 f"{args.run_id!r} (created by an earlier "
