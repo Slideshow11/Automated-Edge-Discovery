@@ -3625,7 +3625,21 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
             "mutation_target": rid.get("mutation_target"),
         }
         recovered_run_id = getattr(args, "recovered_run_id", None) or state.get("run_id", "unknown")
-        recovered_state_path = str(Path(args.state).resolve())
+        # Round-25 P1 fix (Honor the replacement state path
+        # during recovery): if the caller explicitly supplies
+        # --recovered-state-path, use it instead of the
+        # predecessor's --state path. The previous code always
+        # reused args.state, which (a) is the predecessor's
+        # state file with a different run_id, and (b) causes
+        # _state_file_live to immediately classify the new
+        # lease as stale, blocking the replacement init from
+        # adopting it because the output path differs.
+        if getattr(args, "recovered_state_path", None):
+            recovered_state_path = str(
+                Path(args.recovered_state_path).resolve()
+            )
+        else:
+            recovered_state_path = str(Path(args.state).resolve())
         # The legacy path allows the state to provide the scope,
         # but the recovered run_id MUST come from CLI so the
         # replacement is bound to its own identity.
@@ -3692,6 +3706,11 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         recovered_by_start_evidence=proc_evidence,
         recovered_by_state_path=recovered_state_path,
         staleness_evidence=args.staleness_evidence,
+        # Round-25 P1 fix: pass bypass_indeterminate_state so
+        # operators can recover leases whose state file is
+        # missing (the explicit purpose of this command —
+        # `recover-stale-lock` is the documented recovery path).
+        bypass_indeterminate_state=True,
         base_dir=base_dir,
     )
     if not outcome.ok:

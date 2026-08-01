@@ -277,6 +277,27 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
                 f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        # Round-25 P2 fix (Fsync the journal directory after
+        # replacing a result): the file's fsync persists its
+        # contents and metadata, but on POSIX the directory
+        # entry update is a separate write. If a host crash
+        # occurs immediately after os.replace but before the
+        # directory is fsynced, the live inode can persist
+        # but its directory entry may be missing — and after
+        # reboot the journal can revert to the prior
+        # authorization with result=None, losing a
+        # successfully reported terminal result. fsync the
+        # journal's parent directory before returning.
+        try:
+            dir_fd = os.open(
+                str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+            )
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, NotImplementedError):
+            pass
     except Exception:
         try:
             os.unlink(tmp_path)
@@ -352,12 +373,34 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
                     reason="duplicate_authorization",
                 )
             if heads_match and rec.get("result") is not None:
-                return AuthorizationOutcome(
-                    ok=False,
-                    mutation_id=None,
-                    record=rec,
-                    reason="duplicate_authorization_already_completed",
+                # Round-25 P1 fix (Allow a fresh authorization
+                # after a terminal result): if the previous
+                # record's terminal result was a non-success
+                # status (failure, indeterminate, or aborted),
+                # the caller may legitimately retry the same
+                # mutation against the same heads. Generate a
+                # new mutation_id and proceed. A SUCCESS result
+                # still blocks retries — once a mutation has
+                # succeeded, you cannot re-authorize it for the
+                # same scope.
+                prior_result = rec.get("result") or {}
+                prior_status = (
+                    prior_result.get("status")
+                    if isinstance(prior_result, dict)
+                    else None
                 )
+                if prior_status == "success":
+                    return AuthorizationOutcome(
+                        ok=False,
+                        mutation_id=None,
+                        record=rec,
+                        reason="duplicate_authorization_already_completed",
+                    )
+                # Otherwise, fall through and continue scanning
+                # records. Do not return — a subsequent record
+                # iteration may still hit heads_match with a
+                # SUCCESS status and reject.
+                continue
             return AuthorizationOutcome(
                 ok=False,
                 mutation_id=None,

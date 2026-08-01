@@ -3984,3 +3984,243 @@ class TestRound24WindowsSentinelCompat:
                 assert False, "expected OSError"
             except OSError as e:
                 assert "unsupported platform" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# Round-25 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound25FreshAuthorizationAfterTerminalResult:
+    """Round-25 P1 fix: authorize-mutation must allow a fresh
+    authorization after a non-success terminal result, so the
+    controller can retry transient failures. A SUCCESS result
+    still blocks retries (you cannot merge twice)."""
+
+    def _journal_path(self, workspace):
+        from scripts.local.aed_mutation_authorization import mutations_path
+        return mutations_path(workspace)
+
+    def test_retry_after_failure_is_allowed(self, workspace):
+        from scripts.local import aed_mutation_authorization as ma
+
+        # First authorization.
+        req = ma.AuthorizationRequest(
+            run_id="aed-r25-retry",
+            repository="Slideshow11/Automated-Edge-Discovery",
+            target_pr_number=931,
+            mutation_target=None,
+            mutation_type="push",
+            expected_main_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            expected_target_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            pending_action="push",
+        )
+        out1 = ma.authorize(workspace, req)
+        assert out1.ok, f"first authorize failed: {out1.reason}"
+        assert out1.mutation_id is not None
+
+        # Record a FAILURE terminal result.
+        outcome = ma.record_result(
+            workspace,
+            mutation_id=out1.mutation_id,
+            status="failure",
+            evidence="transient network error",
+        )
+        assert isinstance(outcome, dict), (
+            f"record_result must return a dict, got {type(outcome)}"
+        )
+
+        # Retry with the SAME request — must succeed with a
+        # fresh mutation_id (Round-25 P1 fix).
+        out2 = ma.authorize(workspace, req)
+        assert out2.ok, (
+            f"Round-25 P1 fix missing: retry after failure was "
+            f"rejected: {out2.reason}"
+        )
+        assert out2.mutation_id != out1.mutation_id, (
+            "retry must generate a fresh mutation_id"
+        )
+
+    def test_retry_after_success_is_rejected(self, workspace):
+        from scripts.local import aed_mutation_authorization as ma
+
+        # First authorization + SUCCESS result.
+        req = ma.AuthorizationRequest(
+            run_id="aed-r25-success",
+            repository="Slideshow11/Automated-Edge-Discovery",
+            target_pr_number=932,
+            mutation_target=None,
+            mutation_type="push",
+            expected_main_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            expected_target_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            pending_action="push",
+        )
+        out1 = ma.authorize(workspace, req)
+        assert out1.ok
+        outcome = ma.record_result(
+            workspace,
+            mutation_id=out1.mutation_id,
+            status="success",
+        )
+        assert isinstance(outcome, dict)
+
+        # Retry must be rejected: the previous record is
+        # terminal-success and cannot be re-authorized.
+        out2 = ma.authorize(workspace, req)
+        assert not out2.ok, (
+            "retry after success must be rejected"
+        )
+        assert out2.reason == "duplicate_authorization_already_completed"
+
+
+class TestRound25HonorsRecoveredStatePath:
+    """Round-25 P1 fix: _recover_stale_lock must prefer the
+    explicit --recovered-state-path over the predecessor's
+    --state when supplied. The previous code always used
+    args.state, which (a) is the predecessor's state file
+    with a different run_id, and (b) blocks the replacement
+    init from adopting the recovered lease because the
+    output path differs."""
+
+    def test_recovered_state_path_overrides_predecessor_state(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        from scripts.local.aed_supervisor_lock import (
+            build_scope_key,
+            lock_path_for,
+            release,
+        )
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 933,
+            "mutation_target": None,
+        }
+        scope_key = build_scope_key(**scope)
+        base_dir = tmp_path / "locks"
+        base_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = lock_path_for(scope_key, base_dir=base_dir)
+        # Plant a stale lock whose owner_state_path points to a
+        # path that does NOT exist. This forces
+        # _state_file_live to return state_path_missing
+        # (indeterminate), which is the typical recovery case
+        # — the predecessor's state was wiped during a crash.
+        missing_state_path = (
+            tmp_path / "predecessor-ws" / "CONTROLLER_STATE.json"
+        )
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-predecessor",
+            "owner_pid": 99999,
+            "owner_state_path": str(missing_state_path),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # Plant a replacement state file at the requested path
+        # so the recovered lease's owner_state_path can resolve
+        # to a real file.
+        replacement_ws = tmp_path / "replacement-ws"
+        replacement_ws.mkdir(parents=True, exist_ok=True)
+        replacement_state = (
+            replacement_ws / "CONTROLLER_STATE.json"
+        )
+        replacement_state.write_text(
+            json.dumps(
+                {
+                    "run_id": "aed-replacement",
+                    "run_identity": {"run_id": "aed-replacement"},
+                    "overall_status": "RUN_ACTIVE",
+                    "next_action": {"action": "stop", "task_id": None, "reason": "init"},
+                }
+            )
+        )
+
+        # Run recover-stale-lock with --state pointing at a
+        # nonexistent file (the missing predecessor state)
+        # and --recovered-state-path pointing at the
+        # replacement.
+        rc, _, err = run_controller(
+            [
+                "recover-stale-lock",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "933",
+                "--recovered-run-id", "aed-replacement",
+                "--recovered-state-path", str(replacement_state),
+                "--staleness-evidence", "stale_lock_detected:...",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(base_dir)},
+        )
+        assert rc == 0, f"recover-stale-lock failed: rc={rc} err={err}"
+
+        # The recovered lease must bind to the replacement state
+        # path (NOT the predecessor's). Read the live lease and
+        # check owner_state_path.
+        with open(path) as f:
+            recovered = json.load(f)
+        assert (
+            recovered["owner_state_path"]
+            == str(replacement_state.resolve())
+        ), (
+            f"Round-25 P1 fix missing: recovered lease still "
+            f"binds to {recovered['owner_state_path']!r} "
+            f"instead of {str(replacement_state.resolve())!r}"
+        )
+
+
+class TestRound25FsyncJournalDirectoryAfterRewrite:
+    """Round-25 P2 fix: _rewrite_record must fsync the journal
+    directory after the os.replace that publishes the rewritten
+    journal, mirroring the Round-23/24 P1 fixes for the
+    supervisor lock."""
+
+    def test_rewrite_record_fsyncs_journal_directory(
+        self, workspace, monkeypatch
+    ):
+        from scripts.local import aed_mutation_authorization as ma
+        from scripts.local.aed_mutation_authorization import mutations_path
+        import os as _os
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(ma.os, "fsync", tracking_fsync)
+
+        # First, append a record so the journal exists.
+        ma._append_record(
+            workspace,
+            {"mutation_id": "m-rewrite", "kind": "test", "x": 1},
+        )
+
+        # Now rewrite — should fsync at least twice (file + dir).
+        ma._rewrite_record(
+            workspace,
+            {"mutation_id": "m-rewrite", "kind": "test", "x": 2},
+        )
+
+        assert fsync_calls["count"] >= 2, (
+            f"Round-25 P2 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"_rewrite_record; expected at least 2 (file + dir)."
+        )
