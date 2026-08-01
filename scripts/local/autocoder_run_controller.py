@@ -766,16 +766,24 @@ def _init(args: argparse.Namespace) -> None:
                 )
                 os.close(fd)
             except FileExistsError:
-                # Another init won the race. Fall through
-                # to the regular failure path; do NOT adopt.
-                # Reset lock_outcome so the subsequent
-                # `not lock_outcome.ok` branch fires.
-                lock_outcome = LockOutcome(
-                    ok=False,
-                    path=lock_outcome.path,
-                    owner=None,
-                    reason="adoption_token_already_consumed",
+                # Another init won the race. Set lock_outcome
+                # to ok=False and return; do NOT adopt.
+                # Round-32 P1 fix (Preserve the failed adoption
+                # outcome): the previous Round-31 fix had a
+                # bug where the unconditional
+                # `lock_outcome = LockOutcome(ok=True, ...)`
+                # below overwrote the failed outcome, allowing
+                # the loser to publish competing state. The
+                # fix is to return immediately here so the
+                # caller sees the FileExistsError as a
+                # terminal failure for this init.
+                print(
+                    "ERROR: cannot authorize init: another "
+                    "init process won the adoption race for "
+                    f"the recovery lease at {out_path!r}",
+                    file=sys.stderr,
                 )
+                sys.exit(15)
             except OSError:
                 # If the exclusive create fails for any
                 # other reason, fall back to the existence
@@ -845,12 +853,16 @@ def _init(args: argparse.Namespace) -> None:
                 )
                 os.close(fd)
             except FileExistsError:
-                lock_outcome = LockOutcome(
-                    ok=False,
-                    path=lock_outcome.path,
-                    owner=None,
-                    reason="adoption_token_already_consumed",
+                # Round-32 P1 fix: return immediately on the
+                # indeterminate branch too (see the live
+                # branch above).
+                print(
+                    "ERROR: cannot authorize init: another "
+                    "init process won the adoption race for "
+                    f"the recovery lease at {out_path!r}",
+                    file=sys.stderr,
                 )
+                sys.exit(15)
             except OSError:
                 pass
             print(

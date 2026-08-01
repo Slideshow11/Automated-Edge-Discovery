@@ -519,6 +519,100 @@ def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:
     # in tests or by the user.
 
 
+def _check_cross_scope_conflict(
+    scope: dict,
+    base_dir: Optional[Path],
+) -> Optional[LockOutcome]:
+    """Return a conflict LockOutcome if a wider or narrower
+    lease for the same repository is held; else None.
+
+    Round-32 P1 fix (Make repository-wide leases conflict
+    with narrower scopes): the existing build_scope_key
+    function returns distinct keys for `repo:<r>|run`
+    (repo-wide), `repo:<r>|pr:N` (PR-scoped), and
+    `repo:<r>|target:T` (target-scoped). A wider run can
+    therefore co-exist with a narrower run on the same
+    repository, allowing concurrent mutations that the
+    wider lease was supposed to exclude. The fix: any
+    acquisition must check the repo-wide key alongside
+    narrower keys (and vice versa).
+
+    This helper scans the base_dir for any live lease whose
+    repository matches AND whose scope is wider/narrower
+    relative to the requested scope, and returns a
+    LockOutcome(ok=False) on conflict.
+    """
+    repository = scope.get("repository") or ""
+    if not repository:
+        return None
+    is_repo_wide = (
+        scope.get("target_pr_number") is None
+        and not scope.get("mutation_target")
+    )
+    if not base_dir or not base_dir.is_dir():
+        return None
+    repo_prefix = (
+        build_scope_key(
+            repository=repository,
+            target_pr_number=None,
+            mutation_target=None,
+        )
+        + "|"
+    )
+    narrower_locks = []
+    repo_wide_lock = None
+    try:
+        for entry in base_dir.iterdir():
+            if not entry.name.endswith(".lock.json"):
+                continue
+            try:
+                with open(entry) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            entry_scope = data.get("scope") or {}
+            if (entry_scope.get("repository") or "").lower() != repository.lower():
+                continue
+            entry_scope_key = data.get("scope_key") or ""
+            entry_is_repo_wide = (
+                entry_scope.get("target_pr_number") is None
+                and not entry_scope.get("mutation_target")
+            )
+            if is_repo_wide and not entry_is_repo_wide:
+                # We are acquiring the repo-wide lock; a
+                # narrower lock for the same repo already
+                # exists.
+                narrower_locks.append(
+                    {"path": entry, "owner": data, "scope": entry_scope}
+                )
+            elif not is_repo_wide and entry_is_repo_wide:
+                # We are acquiring a narrower lock; the
+                # repo-wide lock already exists.
+                repo_wide_lock = LockOutcome(
+                    ok=False,
+                    path=entry,
+                    owner=data,
+                    reason="repo_wide_lock_already_held",
+                )
+                break
+    except OSError:
+        return None
+    if narrower_locks:
+        # We are acquiring the repo-wide lock; report the
+        # first conflicting narrower lock.
+        first = narrower_locks[0]
+        return LockOutcome(
+            ok=False,
+            path=first["path"],
+            owner=first["owner"],
+            reason=(
+                f"narrower_scope_already_locked_by:"
+                f"{first['scope'].get('target_pr_number') or first['scope'].get('mutation_target')}"
+            ),
+        )
+    return repo_wide_lock
+
+
 def try_acquire(
     *,
     scope: dict,
@@ -547,6 +641,16 @@ def try_acquire(
         mutation_target=scope.get("mutation_target"),
     )
     path = lock_path_for(scope_key, base_dir=base_dir)
+
+    # Round-32 P1 fix (Make repository-wide leases conflict
+    # with narrower scopes): check that a wider or narrower
+    # lease for the same repository is not already held. See
+    # _check_cross_scope_conflict for the full reasoning.
+    cross_scope_conflict = _check_cross_scope_conflict(
+        scope=scope, base_dir=base_dir,
+    )
+    if cross_scope_conflict is not None:
+        return cross_scope_conflict
 
     # Build the candidate lock payload.
     now_iso = _utcnow()
