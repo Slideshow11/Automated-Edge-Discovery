@@ -304,10 +304,14 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
     if isinstance(pid, int) and pid > 0 and _pid_exists(pid):
         actual_evidence = capture_process_start_evidence(pid=pid)
         if actual_evidence is None or actual_evidence["source"] != "linux_proc":
+            # Round-16 P1 fix: a live PID whose /proc is
+            # unreadable must NOT be reported as stale. Treat as
+            # indeterminate so callers can retry or refuse to
+            # acquire.
             return LivenessEvidence(
                 is_alive=False,
-                is_indeterminate=False,
-                reason=f"state_stale:pid_alive_but_proc_unreadable:{state_reason}",
+                is_indeterminate=True,
+                reason=f"pid_live_proc_unreadable:{state_reason}",
                 pid_exists=True,
                 stat_start_time_match=False,
                 ctime_match=False,

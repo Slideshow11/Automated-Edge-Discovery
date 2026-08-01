@@ -731,6 +731,25 @@ def _init(args: argparse.Namespace) -> None:
                 # write to avoid clobbering the winner's state.
                 if predecessor_run_id != args.run_id:
                     Path(out_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    # Round-16 P1 fix (Recheck liveness before
+                    # overwriting predecessor state): the predecessor
+                    # may have resumed and refreshed its state file
+                    # between our initial stale observation and the
+                    # sentinel acquisition. Re-assess liveness of
+                    # the current lock under the sentinel; if it's
+                    # now live, abort the recovery.
+                    current_lock = existing_for_ownership or {}
+                    if current_lock:
+                        re_live = _supervisor_lock.assess_liveness(current_lock)
+                        if re_live.is_alive:
+                            print(
+                                "ERROR: inline stale-lock recovery: "
+                                "predecessor resumed during recovery. "
+                                f"current_owner_run_id={current_lock.get('owner_run_id')!r}. "
+                                "Aborting.",
+                                file=sys.stderr,
+                            )
+                            sys.exit(15)
                     # Round-15 P1 fix (Keep the recovery stub
                     # non-live until receipts are published): use
                     # RUN_INVALID (a terminal status) instead of
@@ -740,21 +759,28 @@ def _init(args: argparse.Namespace) -> None:
                     # status) so replacement recovery works
                     # immediately. Once init completes successfully,
                     # the state is re-written with RUN_ACTIVE.
-                    Path(out_path).write_text(json.dumps({
-                        "controller_version": int(state["controller_version"]),
-                        "run_id": args.run_id,
-                        "workspace": args.workspace,
-                        "overall_status": "RUN_INVALID",
-                        "updated_at": _utcnow(),
-                        "run_identity": {
-                            "run_id": args.run_id,
-                            "controller_version": int(state["controller_version"]),
-                        },
-                    }, indent=2, sort_keys=True) + "\n")
+                    # Round-16 P2 fix (Create the recovery stub
+                    # with restrictive permissions): Path.write_text
+                    # uses the process umask (commonly 0o644); use
+                    # safe_restrictive_open to ensure 0o600.
+                    from scripts.local.aed_run_identity import safe_restrictive_open
+                    fd = safe_restrictive_open(Path(out_path), "w")
                     try:
-                        os.chmod(out_path, 0o600)
-                    except (OSError, NotImplementedError):
-                        pass
+                        fd.write(json.dumps({
+                            "controller_version": int(state["controller_version"]),
+                            "run_id": args.run_id,
+                            "workspace": args.workspace,
+                            "overall_status": "RUN_INVALID",
+                            "updated_at": _utcnow(),
+                            "run_identity": {
+                                "run_id": args.run_id,
+                                "controller_version": int(state["controller_version"]),
+                            },
+                        }, indent=2, sort_keys=True) + "\n")
+                        fd.flush()
+                        os.fsync(fd.fileno())
+                    finally:
+                        fd.close()
 
                 proc_evidence2 = _run_identity.capture_process_start_evidence() or owner_start_evidence
                 host_identity2 = _run_identity.capture_host_identity()
@@ -3417,10 +3443,11 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         print("ERROR: no repository scope available; pass --repository, --state, or scope via run_identity",
               file=sys.stderr)
         sys.exit(6)
-    if not scope.get("target_pr_number") and not scope.get("mutation_target"):
-        print("ERROR: scope is missing both target_pr_number and mutation_target; cannot compute lock key",
-              file=sys.stderr)
-        sys.exit(6)
+    # Round-16 P2 fix (Allow recovery of repository-wide locks):
+    # a scope with only --repository (no PR number, no mutation
+    # target) is the valid repository-wide scope produced by
+    # build_scope_key as `repo:<r>|run`. Removing the prior
+    # rejection lets recovery proceed for repository-wide locks.
 
     proc_evidence = _run_identity.capture_process_start_evidence() or {
         "pid": os.getpid(),
