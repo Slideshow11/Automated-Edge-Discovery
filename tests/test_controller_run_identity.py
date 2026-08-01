@@ -6466,6 +6466,84 @@ class TestRound47FinalizeRejectsCopiedStateFile:
         )
 
 
+class TestRound48CanonicalizeStatePathsInFinalize:
+    """Round-48 P2 fix: the Round-47 P1 check used raw
+    string comparison. If the operator invokes
+    finalize-run with a relative or lexically different
+    path to the same file, the raw comparison rejects it
+    even though the resolved paths match. Resolve both
+    paths before comparing."""
+
+    def test_finalize_with_relative_path_to_same_state_accepted(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        workspace = tmp_path / "ws"
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+
+        # Initialize.
+        state_abs = (tmp_path / "ws" / "CONTROLLER_STATE.json").resolve()
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r48-relative",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "947",
+                "--current-main-sha", "e4ef774",
+                "--output-state", str(state_abs),
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, f"init failed: rc={rc}, err={err}"
+
+        # Verify the lease's owner_state_path is the
+        # resolved absolute path.
+        lease_path = supervisor_lock.lock_path_for(
+            supervisor_lock.build_scope_key(
+                repository="Slideshow11/Automated-Edge-Discovery",
+                target_pr_number=947,
+                mutation_target=None,
+            ),
+            base_dir=lock_base,
+        )
+        lease = supervisor_lock.read(lease_path)
+        assert lease["owner_state_path"] == str(state_abs)
+
+        # Finalize using a RELATIVE path (state_abs is
+        # inside tmp_path, but we make the args.state
+        # relative by computing it from the parent dir).
+        # The Round-48 fix's canonicalization ensures the
+        # relative path resolves to the same absolute
+        # path as the lease's owner_state_path.
+        relative_state = "ws/CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "finalize-run",
+                "--state", relative_state,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        # Finalize should succeed (rc=0).
+        assert rc == 0, (
+            f"Round-48 P2 fix missing: finalize with the "
+            f"relative state path "
+            f"({Path(tmp_path) / relative_state!r} resolves "
+            f"to the same file as the lease's "
+            f"owner_state_path {state_abs!r}) should succeed, "
+            f"got rc={rc}, err={err}"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

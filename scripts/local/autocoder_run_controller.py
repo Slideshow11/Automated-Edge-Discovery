@@ -3269,18 +3269,35 @@ def _finalize_run(args: argparse.Namespace) -> None:
                 live_state_path = live_lock.get("owner_state_path")
                 live_run_id = live_lock.get("owner_run_id")
                 state_run_id = state.get("run_id")
+                # Round-48 P2 fix (Canonicalize the state
+                # paths before comparing them): the
+                # previous Round-47 check used a raw
+                # string comparison. The lease's
+                # owner_state_path is stored as an absolute
+                # resolved path (Round-11 P2 fix). If the
+                # operator invokes finalize-run with a
+                # relative or lexically different path to
+                # the same file, the raw comparison
+                # rejects it. Resolve both paths before
+                # comparing so a path that resolves to the
+                # same file is accepted.
                 if (
                     live_state_path
                     and live_run_id == state_run_id
-                    and live_state_path != str(args.state)
+                    and str(Path(live_state_path).resolve())
+                    != str(Path(args.state).resolve())
                 ):
                     print(
                         "ERROR: refusing to finalize: --state "
-                        f"{args.state!r} does not match the live "
-                        f"lease's owner_state_path "
-                        f"{live_state_path!r}. The operator "
-                        "must run finalize-run against the "
-                        "lease's actual state file, not a copy.",
+                        f"{args.state!r} (resolves to "
+                        f"{Path(args.state).resolve()!r}) does "
+                        f"not match the live lease's "
+                        f"owner_state_path "
+                        f"{live_state_path!r} (resolves to "
+                        f"{Path(live_state_path).resolve()!r}). "
+                        "The operator must run finalize-run "
+                        "against the lease's actual state "
+                        "file, not a copy.",
                         file=sys.stderr,
                     )
                     sys.exit(18)
