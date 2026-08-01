@@ -5166,3 +5166,166 @@ class TestRound32CrossScopeConflict:
         assert "repo_wide_lock_already_held" in (out.reason or ""), (
             f"unexpected reason: {out.reason}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-33 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound33ScanDefaultDirectoryForCrossScope:
+    """Round-33 P1 fix: when try_acquire is called with
+    base_dir=None, the cross-scope conflict scan must
+    resolve the effective default lock directory first
+    (rather than short-circuiting to no conflict). Without
+    this fix, sequential repo-wide and PR-scoped
+    acquisitions using the same default AED_LOCK_DIR both
+    return ok=True."""
+
+    def test_repo_wide_blocks_narrower_when_base_dir_is_none(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        # The cross-scope scan resolves the default
+        # directory via default_lock_dir(); set the env var
+        # so the resolution lands in our tmp_path.
+        lock_base = tmp_path / "default-locks"
+        monkeypatch.setenv("AED_LOCK_DIR", str(lock_base))
+
+        # Plant a PR-scoped lease in the default directory.
+        narrow_scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 1,
+            "mutation_target": None,
+        }
+        narrow_key = supervisor_lock.build_scope_key(**narrow_scope)
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        narrow_path = supervisor_lock.lock_path_for(narrow_key)
+        with open(narrow_path, "w") as f:
+            json.dump({
+                "lock_version": 1,
+                "lock_version_chain": 1,
+                "scope_key": narrow_key,
+                "scope": narrow_scope,
+                "owner_run_id": "aed-r33-narrow",
+                "owner_pid": 99999,
+                "owner_state_path": str(
+                    tmp_path / "narrow" / "CONTROLLER_STATE.json"
+                ),
+                "owner_start_evidence": {
+                    "pid": 99999, "stat_start_time": 1,
+                    "ctime_ns": None, "source": "linux_proc",
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+                "last_renewed_at": "2026-01-01T00:00:00Z",
+                "max_age_seconds": 86400,
+                "recovery_history": [],
+            }, f)
+        _os.chmod(narrow_path, 0o600)
+
+        # Try to acquire a repo-wide lock for the same repo
+        # WITHOUT specifying base_dir — must still see the
+        # narrower lock and refuse.
+        out = supervisor_lock.try_acquire(
+            scope={
+                "repository": "Slideshow11/Automated-Edge-Discovery",
+                "target_pr_number": None,
+                "mutation_target": None,
+            },
+            owner_run_id="aed-r33-wide",
+            owner_host={"hostname": "h"},
+            owner_pid=88888,
+            owner_start_evidence={
+                "pid": 88888, "stat_start_time": 2,
+                "ctime_ns": None, "source": "linux_proc",
+            },
+            owner_state_path=str(
+                tmp_path / "wide" / "CONTROLLER_STATE.json"
+            ),
+            base_dir=None,  # explicit: use the default
+        )
+        assert not out.ok, (
+            f"Round-33 P1 fix missing: repo-wide lease did "
+            f"not conflict with narrower lease when "
+            f"base_dir=None, got ok=True reason={out.reason}"
+        )
+        assert "narrower_scope" in (out.reason or ""), (
+            f"unexpected reason: {out.reason}"
+        )
+
+
+class TestRound33AllowRepeatableMutationsAfterSuccess:
+    """Round-33 P2 fix: mutations in
+    REPEATABLE_MUTATION_TYPES (e.g. `pr_body_update`) can
+    be authorized again after a previous SUCCESS, because
+    the controller's authorization key contains neither a
+    payload digest nor another operation discriminator.
+    Without this exception the controller cannot update a
+    PR body twice in a row."""
+
+    def test_repeatable_mutation_can_reauthorize_after_success(
+        self, workspace
+    ):
+        from scripts.local import aed_mutation_authorization as ma
+
+        req = ma.AuthorizationRequest(
+            run_id="aed-r33-repeatable",
+            repository="Slideshow11/Automated-Edge-Discovery",
+            target_pr_number=933,
+            mutation_target=None,
+            mutation_type="pr_body_update",
+            expected_main_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            expected_target_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            pending_action="update",
+        )
+        out1 = ma.authorize(workspace, req)
+        assert out1.ok, f"first authorize failed: {out1.reason}"
+        outcome = ma.record_result(
+            workspace,
+            mutation_id=out1.mutation_id,
+            status="success",
+        )
+        assert isinstance(outcome, dict)
+        # Second authorize with the SAME request — must
+        # succeed with a fresh mutation_id (Round-33 P2
+        # fix).
+        out2 = ma.authorize(workspace, req)
+        assert out2.ok, (
+            f"Round-33 P2 fix missing: repeatable mutation "
+            f"was rejected after success: {out2.reason}"
+        )
+        assert out2.mutation_id != out1.mutation_id
+
+    def test_non_repeatable_mutation_still_blocked_after_success(
+        self, workspace
+    ):
+        from scripts.local import aed_mutation_authorization as ma
+
+        req = ma.AuthorizationRequest(
+            run_id="aed-r33-nonrepeatable",
+            repository="Slideshow11/Automated-Edge-Discovery",
+            target_pr_number=934,
+            mutation_target=None,
+            mutation_type="push",
+            expected_main_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            expected_target_sha="0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+            pending_action="push",
+        )
+        out1 = ma.authorize(workspace, req)
+        assert out1.ok
+        outcome = ma.record_result(
+            workspace,
+            mutation_id=out1.mutation_id,
+            status="success",
+        )
+        assert isinstance(outcome, dict)
+        # Second authorize with the SAME request — must
+        # still be rejected (push is NOT repeatable).
+        out2 = ma.authorize(workspace, req)
+        assert not out2.ok, (
+            "non-repeatable mutation must be rejected after "
+            "success"
+        )
+        assert out2.reason == "duplicate_authorization_already_completed"

@@ -81,6 +81,30 @@ from scripts.local.aed_run_identity import (
 MUTATIONS_FILENAME = "MUTATIONS.jsonl"
 MUTATIONS_LOCK_FILENAME = "MUTATIONS.jsonl.lock"
 
+# Round-33 P2 fix (Allow distinct repeatable mutations
+# after success): small whitelist of mutation types whose
+# authorization can be refreshed AFTER a previous successful
+# result. The key insight is that these mutations do not
+# change the controller's understanding of the world
+# (heads, merge state) — they only update metadata that can
+# legitimately be re-applied. Anything not in this set
+# (squash_merge, label_change that consumes state, etc.)
+# continues to block after success.
+REPEATABLE_MUTATION_TYPES = frozenset({
+    "pr_body_update",
+    "pr_comment_update",
+    "issue_comment_update",
+    "branch_label_update",
+})
+
+
+def _is_repeatable_mutation_type(mutation_type: Optional[str]) -> bool:
+    """Return True if the mutation type is in
+    REPEATABLE_MUTATION_TYPES — the caller may authorize a
+    fresh mutation against the same scope after a previous
+    SUCCESS."""
+    return mutation_type in REPEATABLE_MUTATION_TYPES
+
 AUTHORIZED = "authorized"
 REJECTED = "rejected"
 SUPERSEDED = "superseded"
@@ -384,13 +408,27 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
                 # still blocks retries — once a mutation has
                 # succeeded, you cannot re-authorize it for the
                 # same scope.
+                #
+                # Round-33 P2 fix (Allow distinct repeatable
+                # mutations after success): for repeatable
+                # mutation types (e.g. `pr_body_update`) the
+                # caller may legitimately authorize a fresh
+                # mutation after a previous SUCCESS — the
+                # authorization key contains neither a payload
+                # digest nor another operation discriminator.
+                # Without this exception the controller cannot
+                # update a PR body twice in a row. The mutation
+                # type is treated as repeatable iff it is in the
+                # small whitelist below.
                 prior_result = rec.get("result") or {}
                 prior_status = (
                     prior_result.get("status")
                     if isinstance(prior_result, dict)
                     else None
                 )
-                if prior_status == "success":
+                if prior_status == "success" and not _is_repeatable_mutation_type(
+                    rec.get("mutation_type")
+                ):
                     return AuthorizationOutcome(
                         ok=False,
                         mutation_id=None,

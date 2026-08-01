@@ -549,7 +549,22 @@ def _check_cross_scope_conflict(
         scope.get("target_pr_number") is None
         and not scope.get("mutation_target")
     )
-    if not base_dir or not base_dir.is_dir():
+    # Round-33 P1 fix (Scan the default directory for
+    # cross-scope conflicts): when ordinary `init`
+    # invocations omit --lock-dir, the caller passes
+    # base_dir=None. The previous guard returned without
+    # scanning the host-wide default directory, allowing
+    # sequential repo-wide and PR-scoped acquisitions
+    # using the same default AED_LOCK_DIR to both succeed.
+    # Resolve the effective default directory first so
+    # the scan covers the same location that
+    # lock_path_for will write to.
+    if not base_dir:
+        base_dir = default_lock_dir(repository=repository)
+    if not base_dir.exists():
+        # The default directory hasn't been created yet,
+        # so there are no conflicting leases. Return
+        # None (no conflict).
         return None
     repo_prefix = (
         build_scope_key(
