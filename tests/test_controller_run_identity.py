@@ -2000,3 +2000,112 @@ class TestRound10JournalFchmod:
         ma._append_record(workspace, rec)
         mode = journal.stat().st_mode & 0o777
         assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+# ---------------------------------------------------------------------------
+# Round-11 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound11TerminalStateStale:
+    """Round-11 P1 fix: lease with RUN_COMPLETE owner state must be
+    treated as stale even when state mtime is fresh."""
+
+    def test_terminal_state_makes_lease_stale(
+        self, scope, proc_evidence_self, host_self, lock_base, tmp_path
+    ):
+        # Plant a lease whose state file says RUN_COMPLETE.
+        state_path = tmp_path / "state.json"
+        state_path.write_text(json.dumps({
+            "controller_version": 1,
+            "run_id": "r-terminal",
+            "run_identity": {"run_id": "r-terminal", "controller_version": 1},
+            "overall_status": "RUN_COMPLETE",
+        }))
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        lock_path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-terminal",
+            "owner_pid": 99999,
+            "owner_state_path": str(state_path),
+            "owner_start_evidence": {
+                "pid": 99999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(lock_path, "w") as f:
+            json.dump(planted, f)
+
+        # Try to acquire as a new run. The lease must be classified
+        # as stale (state_terminal), not live.
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r-new",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            base_dir=lock_base,
+        )
+        assert not outcome.ok
+        assert outcome.reason.startswith("stale_lock_detected") or                outcome.reason.startswith("stale:state_terminal")
+
+
+class TestRound11StateTmpFchmod:
+    """Round-11 P2 fix: _save_state fchmod's the temp file to 0o600
+    even when it pre-exists with broader perms."""
+
+    def test_save_state_restricts_pre_existing_tmp(self, tmp_path):
+        state_path = tmp_path / "state.json"
+        tmp_path_with_ext = state_path.with_suffix(state_path.suffix + ".tmp")
+        # Plant a pre-existing tmp file with loose perms.
+        tmp_path_with_ext.write_text("old partial write")
+        os.chmod(tmp_path_with_ext, 0o644)
+        from scripts.local import autocoder_run_controller as c
+        c._save_state({"controller_version": 1, "run_id": "r1"}, str(state_path))
+        # After _save_state, the final state file must be 0o600.
+        mode = state_path.stat().st_mode & 0o777
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+
+
+class TestRound11OutputStateAbsolutePath:
+    """Round-11 P2 fix: --output-state is resolved to absolute before
+    being persisted."""
+
+    def test_init_output_state_relative_resolves_to_absolute(self, tmp_path, isolated_lock_dir):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        # The state path is relative. The controller must resolve
+        # it to absolute (against the CWD when --output-state is
+        # given, which is the repo root via run_controller) and
+        # persist that absolute path in the receipt's state_path
+        # field so authorize-mutation's binding check works from
+        # any working directory.
+        rc, _, err = run_controller([
+            "init",
+            "--run-id", "aed-r11-abs",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "903",
+            "--current-main-sha", "e4ef774",
+            "--output-state", "rel_state.json",
+        ])
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}"
+        # The launch receipt's state_path must be absolute
+        # regardless of how --output-state was given.
+        receipt = json.loads((workspace / "LAUNCH_RECEIPT.json").read_text())
+        receipt_state_path = Path(receipt["state_path"])
+        assert receipt_state_path.is_absolute(), f"receipt state_path is not absolute: {receipt_state_path}"

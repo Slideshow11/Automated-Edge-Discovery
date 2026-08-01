@@ -231,6 +231,14 @@ def _state_file_live(state_path: Optional[str], owner_run_id: Optional[str],
         rid = state.get("run_identity") or {}
         if rid.get("run_id") != owner_run_id:
             return False, False, "state_run_id_mismatch"
+        # Round-11 P1 fix: a state whose overall_status is
+        # RUN_COMPLETE (or RUN_FAILED_SAFETY) is terminal; the
+        # owner is no longer active even if mtime is fresh.
+        # Treat as stale so a replacement init can recover the
+        # lease instead of waiting for max_age_seconds to elapse.
+        overall_status = state.get("overall_status")
+        if overall_status and overall_status != "RUN_ACTIVE":
+            return False, False, f"state_terminal:{overall_status}"
     return True, False, "ok"
 
 
@@ -599,6 +607,8 @@ def recover_stale(
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     base_dir: Optional[Path] = None,
     bypass_indeterminate_state: bool = False,
+    bypass_sentinel: bool = False,
+    external_sentinel_fd: Optional[int] = None,
 ) -> LockOutcome:
     """
     Atomically take over a stale lock with a strict CAS (compare-and-swap).
@@ -696,7 +706,13 @@ def recover_stale(
     # fcntl.flock so the sentinel self-releases on process death.
     # The first contender to acquire the sentinel wins the
     # recovery race. Subsequent contenders see EWOULDBLOCK.
-    sentinel_fd = _acquire_sentinel_fd(sentinel_path)
+    sentinel_fd: Optional[int] = None
+    if not bypass_sentinel:
+        sentinel_fd = _acquire_sentinel_fd(sentinel_path)
+    else:
+        # Caller already holds the scope sentinel. Reuse it so
+        # we don't deadlock against ourselves.
+        sentinel_fd = external_sentinel_fd
     if sentinel_fd is None:
         # Another worker is already performing recovery. Re-read
         # the lock to report the current owner.

@@ -175,6 +175,15 @@ def _save_state(state: dict, path: str) -> None:
         0o600,
     )
     try:
+        # Round-11 P2 fix: when <path>.tmp already exists with
+        # broader perms (e.g. 0o644 left over from an older or
+        # externally interrupted writer), O_CREAT preserves the
+        # existing mode. fchmod to 0o600 so the eventual os.replace
+        # publishes the new state with restrictive perms.
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            pass
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
             f.write("\n")
@@ -535,6 +544,13 @@ def _init(args: argparse.Namespace) -> None:
         out_path = args.output_state
     else:
         out_path = str(Path(args.workspace) / "CONTROLLER_STATE.json")
+    # Round-11 P2 fix: resolve --output-state to an absolute path
+    # BEFORE persisting it in state and the launch receipt. The
+    # supervisor lease already resolves the same path. Without
+    # this, a relative path becomes relative to the LATER
+    # process's CWD when authorize-mutation validates the
+    # receipt's state_path field against args.state.
+    out_path = str(Path(out_path).resolve())
 
     # Record the launch time for the run identity (separate from
     # created_at on the state, which is used as a last-write timestamp).
@@ -619,6 +635,7 @@ def _init(args: argparse.Namespace) -> None:
                 or lock_outcome.reason.startswith("indeterminate_liveness:indeterminate:state_path_missing")
                 or lock_outcome.reason.startswith("indeterminate_liveness:indeterminate:state_unreadable")
                 or lock_outcome.reason.startswith("corrupt_existing_lease_recovery_required")
+                or lock_outcome.reason.startswith("stale:state_terminal:")
             )
         ):
             print(
@@ -626,56 +643,101 @@ def _init(args: argparse.Namespace) -> None:
                 f"{lock_outcome.reason}",
                 file=sys.stderr,
             )
-            # Round-9 P1 fix: write a stub state file at the
+            # Round-10 P1 fix: write a stub state file at the
             # lease's owner_state_path BEFORE recovering. The
             # recovered lease will be bound to this path, and the
             # state file MUST exist for lease-based liveness to
             # succeed on the next try_acquire. Without this stub,
             # the retry returns state_path_missing indeterminate
             # and the init fails.
-            Path(out_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            Path(out_path).write_text(json.dumps({
-                "controller_version": int(state["controller_version"]),
-                "run_id": args.run_id,
-                "workspace": str(workspace) if False else args.workspace,
-                "overall_status": "RUN_ACTIVE",
-                "updated_at": _utcnow(),
-                "run_identity": {
-                    "run_id": args.run_id,
-                    "controller_version": int(state["controller_version"]),
-                },
-            }, indent=2, sort_keys=True) + "\n")
-            try:
-                os.chmod(out_path, 0o600)
-            except (OSError, NotImplementedError):
-                pass
-
-            proc_evidence2 = _run_identity.capture_process_start_evidence()
-            if proc_evidence2 is None:
-                proc_evidence2 = proc_evidence
-            host_identity2 = _run_identity.capture_host_identity()
-            recovered = _supervisor_lock.recover_stale(
-                scope=scope,
-                recovered_by_run_id=args.run_id,
-                recovered_by_host=host_identity2,
-                recovered_by_pid=proc_evidence2["pid"],
-                recovered_by_start_evidence=proc_evidence2,
-                recovered_by_state_path=str(Path(out_path).resolve()),
-                staleness_evidence=f"init inline recovery for run_id={args.run_id}; "
-                                    f"original reason={lock_outcome.reason}",
+            #
+            # Round-11 P1 fix (Serialize replacement stubs with
+            # stale-lock recovery): two concurrent
+            # init --replace-stale-lock processes share an
+            # output path. The second process's unconditional
+            # stub write can overwrite the first's stub or
+            # completed state. Hold the scope sentinel across
+            # BOTH stub write AND recovery so the entire
+            # publish+recover sequence is serialized. The inner
+            # recover_stale call uses bypass_sentinel=True to
+            # avoid deadlock against the outer hold.
+            lock_path = _supervisor_lock.lock_path_for(
+                _supervisor_lock.build_scope_key(
+                    repository=scope["repository"],
+                    target_pr_number=scope.get("target_pr_number"),
+                    mutation_target=scope.get("mutation_target"),
+                ),
                 base_dir=lock_base,
-                bypass_indeterminate_state=True,
             )
+            sentinel_path = lock_path.with_suffix(lock_path.suffix + ".recovery-sentinel")
+            from scripts.local.aed_supervisor_lock import (
+                _acquire_sentinel_fd,
+                _release_sentinel_fd,
+            )
+            scope_sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+            if scope_sentinel_fd is None:
+                print(
+                    "ERROR: inline stale-lock recovery: scope sentinel busy",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            try:
+                # Read the existing lock to verify it still
+                # belongs to the predecessor (round-11 fix: don't
+                # overwrite a winner's state).
+                existing_for_ownership = None
+                try:
+                    with open(lock_path) as f:
+                        existing_for_ownership = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    pass
+                predecessor_run_id = None
+                if existing_for_ownership:
+                    predecessor_run_id = existing_for_ownership.get("owner_run_id")
+                # Only write the stub if the lock belongs to the
+                # predecessor or is unreadable (we can't tell). If
+                # the lock's run_id already matches ours, another
+                # inits already wrote the same path; skip stub
+                # write to avoid clobbering the winner's state.
+                if predecessor_run_id != args.run_id:
+                    Path(out_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    Path(out_path).write_text(json.dumps({
+                        "controller_version": int(state["controller_version"]),
+                        "run_id": args.run_id,
+                        "workspace": args.workspace,
+                        "overall_status": "RUN_ACTIVE",
+                        "updated_at": _utcnow(),
+                        "run_identity": {
+                            "run_id": args.run_id,
+                            "controller_version": int(state["controller_version"]),
+                        },
+                    }, indent=2, sort_keys=True) + "\n")
+                    try:
+                        os.chmod(out_path, 0o600)
+                    except (OSError, NotImplementedError):
+                        pass
+
+                proc_evidence2 = _run_identity.capture_process_start_evidence() or owner_start_evidence
+                host_identity2 = _run_identity.capture_host_identity()
+                recovered = _supervisor_lock.recover_stale(
+                    scope=scope,
+                    recovered_by_run_id=args.run_id,
+                    recovered_by_host=host_identity2,
+                    recovered_by_pid=proc_evidence2["pid"],
+                    recovered_by_start_evidence=proc_evidence2,
+                    recovered_by_state_path=str(Path(out_path).resolve()),
+                    staleness_evidence=f"init inline recovery for run_id={args.run_id}; "
+                                        f"original reason={lock_outcome.reason}",
+                    base_dir=lock_base,
+                    bypass_indeterminate_state=True,
+                    bypass_sentinel=True,
+                    external_sentinel_fd=scope_sentinel_fd,
+                )
+            finally:
+                _release_sentinel_fd(scope_sentinel_fd, sentinel_path)
             if not recovered.ok:
                 # Round-10 P1 fix: roll back the stub state file
-                # ONLY if it still belongs to this run. Two
-                # concurrent init --replace-stale-lock processes
-                # may share an output path; the loser can reach
-                # this rollback after the winner has recovered
-                # the lease and written its complete state. The
-                # loser's stub would have our run_id; the winner's
-                # full state has the winner's run_id. Read the
-                # file's run_id and only unlink if it matches.
+                # ONLY if it still belongs to this run.
                 try:
                     if Path(out_path).exists():
                         try:
@@ -693,12 +755,7 @@ def _init(args: argparse.Namespace) -> None:
                 )
                 sys.exit(2)
             # Round-9 P1 fix: the recovered lease IS our
-            # acquisition. The operator explicitly opted in to
-            # inline recovery; the recovered lease is bound to
-            # our run_id and our state path, so a retry try_acquire
-            # would correctly reject (the lock is now live and
-            # held by us). Skip the retry and synthesize a
-            # successful LockOutcome.
+            # acquisition.
             lock_outcome = LockOutcome(
                 ok=True,
                 path=recovered.path,
