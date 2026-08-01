@@ -705,13 +705,13 @@ def _init(args: argparse.Namespace) -> None:
                         existing_for_ownership.get("lock_version_chain", 0)
                     )
                 if (
-                    lock_outcome.owner
+                    (lock_outcome.owner or "corrupt_predecessor_seen")
                     and existing_for_ownership
                     and (
                         existing_for_ownership.get("owner_run_id")
-                        != lock_outcome.owner.get("owner_run_id")
+                        != (lock_outcome.owner or {}).get("owner_run_id", "<corrupt_predecessor>")
                         or int(existing_for_ownership.get("lock_version_chain", 0))
-                        != int(lock_outcome.owner.get("lock_version_chain", 0))
+                        != int((lock_outcome.owner or {}).get("lock_version_chain", 0))
                     )
                 ):
                     # Another initializer has changed the lease.
@@ -731,11 +731,20 @@ def _init(args: argparse.Namespace) -> None:
                 # write to avoid clobbering the winner's state.
                 if predecessor_run_id != args.run_id:
                     Path(out_path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    # Round-15 P1 fix (Keep the recovery stub
+                    # non-live until receipts are published): use
+                    # RUN_INVALID (a terminal status) instead of
+                    # RUN_ACTIVE. If the process is killed between
+                    # recovery and full init, _state_file_live
+                    # classifies the lease as stale (terminal
+                    # status) so replacement recovery works
+                    # immediately. Once init completes successfully,
+                    # the state is re-written with RUN_ACTIVE.
                     Path(out_path).write_text(json.dumps({
                         "controller_version": int(state["controller_version"]),
                         "run_id": args.run_id,
                         "workspace": args.workspace,
-                        "overall_status": "RUN_ACTIVE",
+                        "overall_status": "RUN_INVALID",
                         "updated_at": _utcnow(),
                         "run_identity": {
                             "run_id": args.run_id,
