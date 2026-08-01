@@ -673,6 +673,7 @@ def _init(args: argparse.Namespace) -> None:
             and lock_outcome.reason
             and lock_outcome.reason.startswith("live_lock_held_by:")
             and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
+            and str((lock_outcome.owner or {}).get("owner_state_path") or "") == str(Path(out_path).resolve())
         ):
             # Round-21 P2 fix (Adopt leases created by the recovery
             # command): when an operator has previously run
@@ -684,6 +685,16 @@ def _init(args: argparse.Namespace) -> None:
             # code exited. Adopt the lease by treating the outcome
             # as ok=True with the existing owner; init will then
             # publish the state under the existing lease.
+            #
+            # Round-22 P1 fix: bind the adoption to the
+            # requested state path. When two `init` invocations
+            # share the same run_id and scope but use different
+            # output-state paths, the previous adoption branch
+            # would have let the second invocation adopt the
+            # first's lease, allowing both workspaces to
+            # authorize mutations against the same scope.
+            # Compare the lease's owner_state_path against the
+            # resolved out_path and only adopt on an exact match.
             existing_owner = lock_outcome.owner or {}
             print(
                 f"NOTE: adopting pre-existing lease for run_id="
@@ -709,6 +720,7 @@ def _init(args: argparse.Namespace) -> None:
                 )
             )
             and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
+            and str((lock_outcome.owner or {}).get("owner_state_path") or "") == str(Path(out_path).resolve())
         ):
             # Round-21 P2 fix (continued): when the recovery
             # command leaves the lease in the indeterminate
@@ -718,6 +730,9 @@ def _init(args: argparse.Namespace) -> None:
             # with the SAME run_id as owner. Adopt it directly —
             # the lease was created for THIS run; the operator
             # will publish the state on top of it.
+            #
+            # Round-22 P1 fix: also bind this path to the
+            # requested state path (see Round-22 fix above).
             existing_owner = lock_outcome.owner or {}
             print(
                 f"NOTE: adopting pre-existing same-run lease "
@@ -3312,12 +3327,23 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # finalization. A finalized run has no live lease; permitting
     # mutation authorization here would let an external executor
     # perform a mutation with no active lock.
+    #
+    # Round-22 P1 fix: extend the acceptable statuses to include
+    # RUN_READY_FOR_SUMMARY so squash_merge can be authorized
+    # once all non-skipped tasks are promoted or ready. The
+    # status remains RUN_ACTIVE for non-merge mutations; the
+    # additional status allows the merge authorization gate to
+    # require RUN_READY_FOR_SUMMARY specifically for
+    # --mutation-type squash_merge.
     overall_status = state.get("overall_status")
-    if overall_status and overall_status != "RUN_ACTIVE":
+    if overall_status and overall_status not in (
+        "RUN_ACTIVE", "RUN_READY_FOR_SUMMARY"
+    ):
         print(
             f"ERROR: cannot authorize mutation: run is not active "
             f"(overall_status={overall_status}). The run must be "
-            f"in RUN_ACTIVE state to authorize mutations.",
+            f"in RUN_ACTIVE or RUN_READY_FOR_SUMMARY state to "
+            f"authorize mutations.",
             file=sys.stderr,
         )
         sys.exit(10)
@@ -3436,14 +3462,41 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         )
         sys.exit(14)
     merge_policy = str(state.get("merge_policy", "stop_before_merge"))
-    if args.mutation_type == "squash_merge" and merge_policy != "allow_merge":
-        print(
-            "ERROR: cannot authorize mutation: squash_merge "
-            f"requires merge_policy=allow_merge, but the active "
-            f"state's merge_policy={merge_policy!r}",
-            file=sys.stderr,
-        )
-        sys.exit(14)
+    if args.mutation_type == "squash_merge":
+        # Round-19 P1 fix: require a full 40-char lowercase hex
+        # SHA (already checked above).
+        # Round-21 P1 fix: require merge_policy=allow_merge.
+        if merge_policy != "allow_merge":
+            print(
+                "ERROR: cannot authorize mutation: squash_merge "
+                f"requires merge_policy=allow_merge, but the active "
+                f"state's merge_policy={merge_policy!r}",
+                file=sys.stderr,
+            )
+            sys.exit(14)
+        # Round-22 P1 fix: require the active state's
+        # overall_status to be RUN_READY_FOR_SUMMARY. The
+        # earlier checks verified only that args.pending_action
+        # matches the action and that merge_policy is
+        # allow_merge, but neither guarantees the controller
+        # has actually reached the merge-ready phase. If the
+        # status is RUN_ACTIVE (still running tasks),
+        # RUN_BLOCKED (waiting for human), or any non-terminal
+        # state that isn't ready-for-summary, an executor
+        # receiving squash_merge would perform a merge the
+        # controller never selected. RUN_READY_FOR_SUMMARY
+        # means all non-skipped tasks are promoted or ready,
+        # which is the natural precondition for a merge.
+        overall_status = str(state.get("overall_status", ""))
+        if overall_status != "RUN_READY_FOR_SUMMARY":
+            print(
+                "ERROR: cannot authorize mutation: squash_merge "
+                f"requires the active state to be "
+                f"RUN_READY_FOR_SUMMARY, but overall_status="
+                f"{overall_status!r}",
+                file=sys.stderr,
+            )
+            sys.exit(14)
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),
         repository=repository,

@@ -1187,7 +1187,7 @@ class TestControllerInitHardening:
 
 
 class TestControllerMutationLifecycle:
-    def _init_run(self, tmp_path, run_id):
+    def _init_run(self, tmp_path, run_id, *, merge_ready=False):
         tasks = tmp_path / "TASKS.jsonl"
         tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
         workspace = tmp_path / "ws"
@@ -1206,11 +1206,41 @@ class TestControllerMutationLifecycle:
             "--merge-policy", "allow_merge",
         ])
         assert rc == 0
+        if merge_ready:
+            # Round-22 P1 fix: tests that authorize squash_merge
+            # must drive the state to RUN_READY_FOR_SUMMARY
+            # because the merge authorization check requires
+            # the controller to have reached the merge-ready
+            # phase. Mark the lone task as TASK_READY +
+            # promoted so _compute_next_action emits
+            # generate_run_summary and overall_status becomes
+            # RUN_READY_FOR_SUMMARY.
+            state_file = workspace / "CONTROLLER_STATE.json"
+            state = json.loads(state_file.read_text())
+            for task in state.get("tasks", []):
+                task["status"] = "TASK_READY"
+                task["promotion_status"] = "promoted_to_integration"
+            state["overall_status"] = "RUN_READY_FOR_SUMMARY"
+            state["next_action"] = {
+                "action": "generate_run_summary",
+                "task_id": None,
+                "reason": "all non-skipped tasks are promoted or ready",
+            }
+            run_controller.__defaults__  # noop to keep linter happy
+            # Use the controller's _save_state to persist via
+            # the same restricted path; fall back to direct
+            # write if import is awkward in the test fixture.
+            from scripts.local.autocoder_run_controller import (
+                _save_state,
+            )
+            _save_state(state, str(state_file))
         return workspace
 
     def test_authorize_then_result_then_finalize(self, tmp_path, isolated_lock_dir):
-        workspace = self._init_run(tmp_path, "aed-mut-life-1")
-        # Authorize.
+        workspace = self._init_run(tmp_path, "aed-mut-life-1", merge_ready=True)
+        # Authorize. The state is RUN_READY_FOR_SUMMARY with
+        # next_action=generate_run_summary (set by _init_run's
+        # merge_ready branch).
         rc, out, _ = run_controller([
             "authorize-mutation",
             "--state", str(workspace / "CONTROLLER_STATE.json"),
@@ -1218,7 +1248,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "run_task",
+            "--pending-action", "generate_run_summary",
         ])
         assert rc == 0, out
         # Extract mutation id from output.
@@ -1246,7 +1276,7 @@ class TestControllerMutationLifecycle:
         assert rc == 0, out
 
     def test_finalize_refuses_with_outstanding_mutation(self, tmp_path, isolated_lock_dir):
-        workspace = self._init_run(tmp_path, "aed-mut-life-2")
+        workspace = self._init_run(tmp_path, "aed-mut-life-2", merge_ready=True)
         # Authorize but do NOT record result.
         rc, out, _ = run_controller([
             "authorize-mutation",
@@ -1255,7 +1285,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "run_task",
+            "--pending-action", "generate_run_summary",
         ])
         assert rc == 0
         # Try to finalize — must be rejected (exit 8).
@@ -1318,7 +1348,7 @@ class TestControllerMutationLifecycle:
     def test_crash_after_authorization_before_result_keeps_state_recoverable(
         self, tmp_path, isolated_lock_dir
     ):
-        workspace = self._init_run(tmp_path, "aed-mut-life-crash")
+        workspace = self._init_run(tmp_path, "aed-mut-life-crash", merge_ready=True)
         rc, out, _ = run_controller([
             "authorize-mutation",
             "--state", str(workspace / "CONTROLLER_STATE.json"),
@@ -1326,7 +1356,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "run_task",
+            "--pending-action", "generate_run_summary",
         ])
         assert rc == 0
         # Simulate a crash: do not record result, do not finalize.
@@ -1483,7 +1513,11 @@ class TestControllerStaleLockRecovery:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
         ])
         assert rc == 0
-        # Now authorize-mutation must be rejected.
+        # Now authorize-mutation must be rejected. The state's
+        # next_action.action is "stop" after finalize, so use
+        # that as --pending-action so the rejection comes from
+        # the overall_status check (rc=10) rather than the
+        # pending-action match check (rc=14).
         rc, _, err = run_controller([
             "authorize-mutation",
             "--state", str(workspace / "CONTROLLER_STATE.json"),
@@ -1491,7 +1525,7 @@ class TestControllerStaleLockRecovery:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "run_task",
+            "--pending-action", "stop",
         ])
         assert rc == 10
         assert "not active" in err.lower() or "RUN_COMPLETE" in err
@@ -1631,6 +1665,11 @@ class TestRound8ReceiptStatePathBinding:
         copied = tmp_path / "ws-copy" / "CONTROLLER_STATE.json"
         copied.parent.mkdir(parents=True, exist_ok=True)
         copied.write_text((workspace / "CONTROLLER_STATE.json").read_text())
+        # Round-22 P1 fix: the state's next_action.action is
+        # "run_task" after init, so use that to reach the
+        # receipt-state-path binding check (the rejection we
+        # want to assert is rc=13). With a wrong --pending-action
+        # the controller would exit 14 instead.
         rc, _, err = run_controller([
             "authorize-mutation",
             "--state", str(copied),
@@ -2801,9 +2840,22 @@ class TestRound19SquashMergeRequiresFullSha:
             env={"AED_LOCK_DIR": str(tmp_path / "locks")},
         )
         assert rc == 0, f"init failed: rc={rc} err={err}"
-        # Read the pending_action from the freshly created state.
+        # Round-22 P1 fix: drive the state to RUN_READY_FOR_SUMMARY
+        # so squash_merge authorization passes the new
+        # overall_status check.
         state_file = workspace / "CONTROLLER_STATE.json"
         state = json.loads(state_file.read_text())
+        for task in state.get("tasks", []):
+            task["status"] = "TASK_READY"
+            task["promotion_status"] = "promoted_to_integration"
+        state["overall_status"] = "RUN_READY_FOR_SUMMARY"
+        state["next_action"] = {
+            "action": "generate_run_summary",
+            "task_id": None,
+            "reason": "all non-skipped tasks are promoted or ready",
+        }
+        from scripts.local.autocoder_run_controller import _save_state
+        _save_state(state, str(state_file))
         pending_action = state["next_action"]["action"]
         return str(state_file), pending_action
 
@@ -3303,3 +3355,204 @@ class TestRound21AdoptLeasesFromRecoveryCommand:
         assert state_file.exists()
         state = json.loads(state_file.read_text())
         assert state["run_id"] == "aed-r21-adopt"
+
+
+# ---------------------------------------------------------------------------
+# Round-22 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound22SquashMergeRequiresMergeReady:
+    """Round-22 P1 fix: squash_merge must require the active
+    state's overall_status to be RUN_READY_FOR_SUMMARY. The
+    previous code accepted squash_merge as long as
+    merge_policy=allow_merge and --pending-action echoed the
+    state's action, even when the controller had not reached
+    the merge-ready phase. An executor receiving squash_merge
+    would then perform a merge the controller never selected."""
+
+    def _make_active_state(
+        self, tmp_path, *, overall_status="RUN_ACTIVE"
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r22-squash",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(ws),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "925",
+                "--current-main-sha", "e4ef774",
+                "--merge-policy", "allow_merge",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc} err={err}"
+        # Force the desired status if the caller wants
+        # something other than RUN_ACTIVE.
+        state_file = ws / "CONTROLLER_STATE.json"
+        state = json.loads(state_file.read_text())
+        state["overall_status"] = overall_status
+        if overall_status == "RUN_READY_FOR_SUMMARY":
+            state["next_action"] = {
+                "action": "generate_run_summary",
+                "task_id": None,
+                "reason": "all non-skipped tasks are promoted or ready",
+            }
+            for task in state.get("tasks", []):
+                task["status"] = "TASK_READY"
+                task["promotion_status"] = "promoted_to_integration"
+        from scripts.local.autocoder_run_controller import _save_state
+        _save_state(state, str(state_file))
+        return ws, state["next_action"]["action"]
+
+    def test_squash_merge_requires_ready_for_summary(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # RUN_ACTIVE is the initial status. squash_merge must
+        # be rejected because the controller has not reached
+        # the merge-ready phase.
+        ws, _ = self._make_active_state(
+            tmp_path, overall_status="RUN_ACTIVE"
+        )
+        full_sha = "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(ws / "CONTROLLER_STATE.json"),
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", full_sha,
+                "--pending-action", "run_task",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"squash_merge with RUN_ACTIVE status must exit 14, "
+            f"got rc={rc}, err={err}"
+        )
+        assert "RUN_READY_FOR_SUMMARY" in err
+
+    def test_squash_merge_succeeds_in_ready_for_summary(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # RUN_READY_FOR_SUMMARY is the merge-ready phase.
+        # squash_merge must succeed when status is here AND
+        # merge_policy=allow_merge AND --expected-target-sha is
+        # a full hex SHA AND --pending-action matches.
+        ws, pending_action = self._make_active_state(
+            tmp_path, overall_status="RUN_READY_FOR_SUMMARY"
+        )
+        full_sha = "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(ws / "CONTROLLER_STATE.json"),
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", full_sha,
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, (
+            f"squash_merge with RUN_READY_FOR_SUMMARY must "
+            f"succeed, got rc={rc}, err={err}"
+        )
+
+
+class TestRound22BindAdoptedLeasesToStatePath:
+    """Round-22 P1 fix: when init adopts a same-run lease from
+    a prior recover-stale-lock invocation, the adoption must
+    compare the lease's owner_state_path with the requested
+    out_path. Two inits with the same run_id but different
+    output paths must NOT adopt each other's leases."""
+
+    def test_init_rejects_lease_with_different_state_path(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 926,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        lock_path = supervisor_lock.lock_path_for(
+            scope_key, base_dir=lock_base
+        )
+        # Plant a lease owned by the same run_id but with a
+        # DIFFERENT state path than the init will request.
+        different_state_path = (
+            tmp_path / "other-ws" / "CONTROLLER_STATE.json"
+        )
+        different_state_path.parent.mkdir(parents=True, exist_ok=True)
+        different_state_path.touch()
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r22-bindpath",
+            "owner_pid": 99999,
+            "owner_state_path": str(different_state_path),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(lock_path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(lock_path, 0o600)
+
+        # Init with a different output-state path. Without the
+        # Round-22 fix, this would adopt the planted lease and
+        # succeed. With the fix, the path mismatch must reject
+        # the adoption and exit with a clear error.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r22-bindpath",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "926",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        # The init must NOT succeed in adopting a lease that
+        # points at a different state path. The exact rc may
+        # vary (lock acquisition may fail with a different
+        # reason), but rc MUST NOT be 0.
+        assert rc != 0, (
+            f"init must NOT adopt a lease with a different "
+            f"state_path, got rc=0, err={err}"
+        )
