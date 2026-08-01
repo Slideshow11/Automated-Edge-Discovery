@@ -4691,3 +4691,125 @@ class TestRound28WindowsSafeMutationJournalFlags:
             assert posix_cloexec_flag() != 0
         else:
             assert posix_cloexec_flag() == 0
+
+
+# ---------------------------------------------------------------------------
+# Round-29 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound29AdoptionConsumedByStateFile:
+    """Round-29 P1 fix: the same-run lease adoption branch
+    must additionally require that the replacement state file
+    does NOT already exist. Adoption is a one-time token; a
+    second init with the same run_id and state path must NOT
+    silently overwrite the active controller state."""
+
+    def test_init_does_not_re_adopt_when_state_already_exists(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 937,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+
+        # Plant a recovery-history lease AND a pre-existing
+        # CONTROLLER_STATE.json at the replacement path. The
+        # combination means a previous recovery + init has
+        # already published; a second init must NOT re-adopt
+        # and overwrite.
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r29-replay",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [
+                {
+                    "recovered_at": "2026-01-01T00:00:00Z",
+                    "previous_owner_run_id": "aed-predecessor",
+                    "staleness_evidence": "stale_lock_detected:...",
+                    "reason": "test",
+                }
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # Plant the pre-existing state file at the
+        # replacement path (representing a prior successful
+        # init that already published the state).
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        state_path = ws / "CONTROLLER_STATE.json"
+        original_state = {
+            "run_id": "aed-r29-replay",
+            "overall_status": "RUN_ACTIVE",
+            "tasks": [
+                {"task_id": "completed-task", "status": "TASK_READY"}
+            ],
+        }
+        state_path.write_text(json.dumps({
+            "run_identity": {"run_id": "aed-r29-replay"},
+            "overall_status": "RUN_ACTIVE",
+            "tasks": [
+                {"task_id": "completed-task", "status": "TASK_READY"}
+            ],
+        }))
+
+        # Init with the same run_id. The Round-29 fix must
+        # reject re-adoption because the state file already
+        # exists.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r29-replay",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(ws),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "937",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        # Init must NOT succeed: the recovery provenance has
+        # been consumed (the state file exists). The exact rc
+        # depends on the failure path; rc MUST NOT be 0.
+        assert rc != 0, (
+            f"Round-29 P1 fix missing: init re-adopted a "
+            f"recovery lease after the state file already "
+            f"existed, got rc=0, err={err}"
+        )
+        # Confirm the original state file is intact (the
+        # failing init must not have overwritten it).
+        on_disk = json.loads(state_path.read_text())
+        assert on_disk["tasks"] == original_state["tasks"], (
+            "Round-29 P1 fix missing: failing init corrupted "
+            "the existing state file"
+        )

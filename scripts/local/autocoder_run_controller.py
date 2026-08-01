@@ -712,6 +712,19 @@ def _init(args: argparse.Namespace) -> None:
             # it; normal try_acquire leaves it empty (or
             # absent).
             and ((lock_outcome.owner or {}).get("recovery_history") or [])
+            # Round-29 P1 fix (Consume recovery provenance
+            # after the first adoption): a recovery_history
+            # marker is permanent, so a second init with the
+            # same run_id and state path would still match
+            # and silently overwrite the active controller
+            # state — resetting completed tasks and other
+            # recorded progress. Adoption is a one-time
+            # token. After the first adoption, the operator
+            # publishes CONTROLLER_STATE.json at the lease's
+            # owner_state_path. Subsequent init invocations
+            # must NOT adopt again. Reject adoption when the
+            # replacement state file already exists.
+            and not Path(out_path).exists()
         ):
             # Round-21 P2 fix (Adopt leases created by the recovery
             # command): when an operator has previously run
@@ -762,6 +775,10 @@ def _init(args: argparse.Namespace) -> None:
             # Round-27 P1 fix: also require recovery provenance
             # for the indeterminate-state branch.
             and ((lock_outcome.owner or {}).get("recovery_history") or [])
+            # Round-29 P1 fix: also require the replacement
+            # state file does NOT exist (one-time adoption
+            # token — see the live branch above).
+            and not Path(out_path).exists()
         ):
             # Round-21 P2 fix (continued): when the recovery
             # command leaves the lease in the indeterminate
