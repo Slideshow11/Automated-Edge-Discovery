@@ -500,6 +500,7 @@ def _init(args: argparse.Namespace) -> None:
         "updated_at": _utcnow(),
         "workspace": str(Path(args.workspace).resolve()),
         "integration_branch": args.integration_branch,
+        "merge_policy": getattr(args, "merge_policy", "stop_before_merge"),
         "overall_status": "RUN_ACTIVE",
         "tasks": ordered_tasks,
         "repair_events": [],
@@ -599,6 +600,26 @@ def _init(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(14)
+    # Round-21 P1 fix (Reject simultaneous PR and mutation-target
+    # scopes): --target-pr-number and --mutation-target are
+    # mutually exclusive. build_scope_key prioritizes
+    # target_pr_number (returning `repo:...|pr:N`) and ignores
+    # mutation_target, so the acquired lock only covers the PR.
+    # The state, however, records the mutation_target, and
+    # authorize-mutation authorizes a mutation against that
+    # target. Another run initialized with only
+    # --mutation-target acquires the distinct
+    # `repo:...|target:...` lock and can concurrently mutate
+    # the same branch. Reject this combination explicitly.
+    if getattr(args, "target_pr_number", None) and getattr(args, "mutation_target", None):
+        print(
+            "ERROR: --target-pr-number and --mutation-target are "
+            "mutually exclusive (the supervisor lock covers only "
+            "the PR; authorize-mutation would authorize against "
+            "the target). Use one or the other, not both.",
+            file=sys.stderr,
+        )
+        sys.exit(14)
     if getattr(args, "repository", None) or getattr(args, "target_pr_number", None):
         # Round-10 P2 fix: refuse a PR-scoped lock without an
         # explicit repository. The previous code accepted
@@ -647,6 +668,68 @@ def _init(args: argparse.Namespace) -> None:
             owner_state_path=str(Path(out_path).resolve()),
             base_dir=lock_base,
         )
+        if (
+            not lock_outcome.ok
+            and lock_outcome.reason
+            and lock_outcome.reason.startswith("live_lock_held_by:")
+            and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
+        ):
+            # Round-21 P2 fix (Adopt leases created by the recovery
+            # command): when an operator has previously run
+            # `recover-stale-lock` for this run_id (a supported
+            # workflow), the resulting lease is owned by the
+            # replacement run but the state file hasn't been
+            # created yet. try_acquire returns
+            # `live_lock_held_by:<args.run_id>` and the previous
+            # code exited. Adopt the lease by treating the outcome
+            # as ok=True with the existing owner; init will then
+            # publish the state under the existing lease.
+            existing_owner = lock_outcome.owner or {}
+            print(
+                f"NOTE: adopting pre-existing lease for run_id="
+                f"{args.run_id!r} (created by an earlier "
+                f"recover-stale-lock)",
+                file=sys.stderr,
+            )
+            lock_outcome = LockOutcome(
+                ok=True,
+                path=lock_outcome.path,
+                owner=existing_owner,
+                reason="adopted_existing_recovery_lease",
+            )
+        elif (
+            not lock_outcome.ok
+            and lock_outcome.reason
+            and (
+                lock_outcome.reason.startswith(
+                    "indeterminate_liveness:indeterminate:state_path_missing"
+                )
+                or lock_outcome.reason.startswith(
+                    "indeterminate_liveness:indeterminate:state_unreadable"
+                )
+            )
+            and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
+        ):
+            # Round-21 P2 fix (continued): when the recovery
+            # command leaves the lease in the indeterminate
+            # state_path_missing state (state file not yet
+            # created), try_acquire returns
+            # `indeterminate_liveness:indeterminate:state_path_missing`
+            # with the SAME run_id as owner. Adopt it directly —
+            # the lease was created for THIS run; the operator
+            # will publish the state on top of it.
+            existing_owner = lock_outcome.owner or {}
+            print(
+                f"NOTE: adopting pre-existing same-run lease "
+                f"(state_path missing) for run_id={args.run_id!r}",
+                file=sys.stderr,
+            )
+            lock_outcome = LockOutcome(
+                ok=True,
+                path=lock_outcome.path,
+                owner=existing_owner,
+                reason="adopted_existing_recovery_lease",
+            )
         if (
             not lock_outcome.ok
             and getattr(args, "replace_stale_lock", False)
@@ -3331,6 +3414,36 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         repository = str(Path(state_workspace_for_repo).resolve())
     else:
         repository = args.workspace
+    # Round-21 P1 fix (Bind mutation authorization to the pending
+    # controller action): require args.pending_action to exactly
+    # match state.next_action.action, AND require the mutation
+    # type to be compatible with the recorded merge_policy. The
+    # previous code accepted any --pending-action value (even
+    # `merge` when the state is on `run_task` or `request_human`)
+    # and recorded it as the authorization's pending_action. An
+    # executor consuming the record could then perform a merge
+    # the controller state machine never selected — in particular
+    # squash_merge would succeed for the default
+    # `stop_before_merge` policy. Compare action + policy before
+    # authorizing.
+    state_pending_action = str(state.get("next_action", {}).get("action", ""))
+    if args.pending_action != state_pending_action:
+        print(
+            "ERROR: cannot authorize mutation: --pending-action "
+            f"{args.pending_action!r} does not match the active "
+            f"state's next action {state_pending_action!r}",
+            file=sys.stderr,
+        )
+        sys.exit(14)
+    merge_policy = str(state.get("merge_policy", "stop_before_merge"))
+    if args.mutation_type == "squash_merge" and merge_policy != "allow_merge":
+        print(
+            "ERROR: cannot authorize mutation: squash_merge "
+            f"requires merge_policy=allow_merge, but the active "
+            f"state's merge_policy={merge_policy!r}",
+            file=sys.stderr,
+        )
+        sys.exit(14)
     req = _mutation_auth.AuthorizationRequest(
         run_id=state.get("run_id", "unknown"),
         repository=repository,

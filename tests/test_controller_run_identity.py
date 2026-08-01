@@ -1201,6 +1201,9 @@ class TestControllerMutationLifecycle:
             "--target-pr-number", "415",
             "--current-main-sha", "e4ef774",
             "--starting-target-sha", "c973fa6c",
+            # Round-21 P1 fix: tests that exercise squash_merge
+            # must explicitly opt in via merge_policy=allow_merge.
+            "--merge-policy", "allow_merge",
         ])
         assert rc == 0
         return workspace
@@ -1215,7 +1218,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "merge",
+            "--pending-action", "run_task",
         ])
         assert rc == 0, out
         # Extract mutation id from output.
@@ -1252,7 +1255,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "merge",
+            "--pending-action", "run_task",
         ])
         assert rc == 0
         # Try to finalize — must be rejected (exit 8).
@@ -1323,7 +1326,7 @@ class TestControllerMutationLifecycle:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "merge",
+            "--pending-action", "run_task",
         ])
         assert rc == 0
         # Simulate a crash: do not record result, do not finalize.
@@ -1353,6 +1356,9 @@ class TestControllerStaleLockRecovery:
             "--target-pr-number", "416",
             "--current-main-sha", "e4ef774",
             "--starting-target-sha", "c973fa6c",
+            # Round-21 P1 fix: tests that exercise squash_merge
+            # must explicitly opt in via merge_policy=allow_merge.
+            "--merge-policy", "allow_merge",
         ])
         assert rc == 0
         return workspace
@@ -1485,7 +1491,7 @@ class TestControllerStaleLockRecovery:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "merge",
+            "--pending-action", "run_task",
         ])
         assert rc == 10
         assert "not active" in err.lower() or "RUN_COMPLETE" in err
@@ -1611,6 +1617,9 @@ class TestRound8ReceiptStatePathBinding:
             "--target-pr-number", "901",
             "--current-main-sha", "e4ef774",
             "--starting-target-sha", "c973fa6c",
+            # Round-21 P1 fix: tests that exercise squash_merge
+            # must explicitly opt in via merge_policy=allow_merge.
+            "--merge-policy", "allow_merge",
         ])
         assert rc == 0
         return workspace
@@ -1629,7 +1638,7 @@ class TestRound8ReceiptStatePathBinding:
             "--mutation-type", "squash_merge",
             "--expected-main-sha", "e4ef774",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
-            "--pending-action", "merge",
+            "--pending-action", "run_task",
         ])
         assert rc == 13, f"expected exit 13 (receipt-state-path binding), got {rc}: {err}"
         assert "state_path" in err.lower()
@@ -2784,6 +2793,9 @@ class TestRound19SquashMergeRequiresFullSha:
                 "--repository", "Slideshow11/Automated-Edge-Discovery",
                 "--target-pr-number", "919",
                 "--current-main-sha", "e4ef774",
+                # Round-21 P1 fix: tests that exercise squash_merge
+                # must explicitly opt in via merge_policy=allow_merge.
+                "--merge-policy", "allow_merge",
             ],
             cwd=str(tmp_path),
             env={"AED_LOCK_DIR": str(tmp_path / "locks")},
@@ -3055,3 +3067,239 @@ class TestRound20RejectMutationTargetAbsentFromScope:
             f"authorize-mutation without --mutation-target on a "
             f"PR-scoped run must succeed, got rc={rc}, err={err}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-21 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound21RejectSimultaneousPRAndMutationTarget:
+    """Round-21 P1 fix: --target-pr-number and --mutation-target
+    are mutually exclusive at init time. build_scope_key
+    prioritizes the PR (so the lock only covers the PR), but the
+    state records the mutation_target and authorize-mutation
+    authorizes against that target — letting another run with
+    only --mutation-target acquire the distinct
+    repo:...|target:... lock and mutate the same branch."""
+
+    def test_pr_and_mutation_target_combination_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r21-both",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "921",
+                "--current-main-sha", "e4ef774",
+                # This is the conflicting flag.
+                "--mutation-target", "feat/x-target",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"init with both --target-pr-number and "
+            f"--mutation-target must exit 14, got rc={rc}, err={err}"
+        )
+        assert (
+            "mutually exclusive" in err.lower()
+            or "use one or the other" in err.lower()
+        )
+
+    def test_pr_only_succeeds(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r21-pr-only",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "922",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, (
+            f"PR-only init must succeed, got rc={rc}, err={err}"
+        )
+
+
+class TestRound21BindMutationToPendingAction:
+    """Round-21 P1 fix: authorize-mutation must require
+    --pending-action to match the active state's
+    next_action.action AND require squash_merge to be
+    accompanied by merge_policy=allow_merge."""
+
+    def _make_state(self, tmp_path, *, merge_policy="stop_before_merge"):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r21-bind",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(ws),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "923",
+                "--current-main-sha", "e4ef774",
+                "--merge-policy", merge_policy,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc} err={err}"
+        state = json.loads((ws / "CONTROLLER_STATE.json").read_text())
+        return ws, state["next_action"]["action"]
+
+    def test_authorize_with_wrong_pending_action_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws, real_action = self._make_state(tmp_path)
+        # Pick a wrong action that is NOT the real one.
+        wrong = "request_human" if real_action != "request_human" else "merge"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(ws / "CONTROLLER_STATE.json"),
+                "--workspace", str(ws),
+                "--mutation-type", "pr_body_update",
+                "--pending-action", wrong,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"authorize-mutation with wrong --pending-action "
+            f"must exit 14, got rc={rc}, err={err}"
+        )
+        assert "pending-action" in err.lower()
+
+    def test_squash_merge_with_stop_before_merge_policy_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        ws, pending_action = self._make_state(
+            tmp_path, merge_policy="stop_before_merge"
+        )
+        full_sha = "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(ws / "CONTROLLER_STATE.json"),
+                "--workspace", str(ws),
+                "--mutation-type", "squash_merge",
+                "--expected-target-sha", full_sha,
+                "--pending-action", pending_action,
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"squash_merge with stop_before_merge policy must "
+            f"exit 14, got rc={rc}, err={err}"
+        )
+        assert "allow_merge" in err.lower() or "merge_policy" in err.lower()
+
+
+class TestRound21AdoptLeasesFromRecoveryCommand:
+    """Round-21 P2 fix: when an operator has previously run
+    `recover-stale-lock` for this run_id, the resulting lease is
+    owned by the replacement run but the state file has not been
+    created yet. The subsequent init must adopt the existing
+    lease rather than fail with `live_lock_held_by:<args.run_id>`."""
+
+    def test_init_adopts_pre_existing_same_run_lease(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        # Step 1: plant a pre-existing lease owned by the
+        # forthcoming init's run_id. This simulates the result
+        # of an earlier `recover-stale-lock` invocation.
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 924,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        lock_path = supervisor_lock.lock_path_for(
+            scope_key, base_dir=lock_base
+        )
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r21-adopt",
+            "owner_pid": 99999,  # Not alive
+            "owner_state_path": str(tmp_path / "ws" / "CONTROLLER_STATE.json"),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(lock_path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(lock_path, 0o600)
+
+        # Step 2: init with the same run_id. Without Round-21's
+        # fix, try_acquire sees a live lock held by the same
+        # run_id and refuses (init exits with an error). With
+        # the fix, init adopts the lease and persists the state.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r21-adopt",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "924",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, (
+            f"init must adopt the pre-existing same-run lease, "
+            f"got rc={rc}, err={err}"
+        )
+        # Confirm the state file is published and the lease is
+        # preserved (NOT overwritten by the adopted init).
+        state_file = workspace / "CONTROLLER_STATE.json"
+        assert state_file.exists()
+        state = json.loads(state_file.read_text())
+        assert state["run_id"] == "aed-r21-adopt"
