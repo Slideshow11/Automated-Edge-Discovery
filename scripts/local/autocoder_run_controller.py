@@ -784,11 +784,30 @@ def _init(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(15)
-            except OSError:
-                # If the exclusive create fails for any
-                # other reason, fall back to the existence
-                # check; a later concurrent init will retry.
-                pass
+            except OSError as e:
+                # Round-37 P1 fix (Fail closed when
+                # adoption-token creation errors): only
+                # FileExistsError indicates a successful
+                # concurrency-loser race. ALL other OSError
+                # outcomes (transient I/O, missing O_EXCL
+                # support, EPERM on a read-only filesystem,
+                # etc.) must also fail closed — otherwise a
+                # concurrent initializer could create the
+                # token while this process also adopts the
+                # lease, allowing both to publish competing
+                # tasks and receipts. Exit with rc=15 and
+                # include the OSError details so the
+                # operator can diagnose the underlying
+                # filesystem problem.
+                print(
+                    "ERROR: cannot authorize init: failed to "
+                    f"create adoption-token at {out_path!r}: "
+                    f"{type(e).__name__}: {e}. Refusing to "
+                    "proceed without the exclusive creation "
+                    "guarantee.",
+                    file=sys.stderr,
+                )
+                sys.exit(15)
             print(
                 f"NOTE: adopting pre-existing lease for run_id="
                 f"{args.run_id!r} (created by an earlier "
@@ -863,8 +882,19 @@ def _init(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(15)
-            except OSError:
-                pass
+            except OSError as e:
+                # Round-37 P1 fix (continued): fail closed
+                # on any non-FileExistsError OSError in the
+                # indeterminate-state adoption branch too.
+                print(
+                    "ERROR: cannot authorize init: failed to "
+                    f"create adoption-token at {out_path!r}: "
+                    f"{type(e).__name__}: {e}. Refusing to "
+                    "proceed without the exclusive creation "
+                    "guarantee.",
+                    file=sys.stderr,
+                )
+                sys.exit(15)
             print(
                 f"NOTE: adopting pre-existing same-run lease "
                 f"(state_path missing) for run_id={args.run_id!r}",

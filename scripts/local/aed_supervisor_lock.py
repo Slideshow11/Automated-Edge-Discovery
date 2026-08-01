@@ -124,6 +124,39 @@ def _lock_filename_for_scope_key(scope_key: str) -> str:
     return f"{digest}.lock.json"
 
 
+def _repo_index_path(lock_path: Path) -> Path:
+    """Sibling index file that records the lock's repository.
+
+    Round-37 P2 fix (Keep repo-wide acquisition closed on
+    corrupt narrower leases): the lock filename is a
+    SHA-256 hash and cannot be mapped back to the
+    repository when the lease JSON is corrupt. The
+    cross-scope scan therefore cannot tell whether a
+    corrupt narrower lease belongs to the SAME repository
+    or to a different one. Persist a sibling
+    `<lock>.repo` file at publish time, alongside the
+    `.lock.json`, recording the (lowercased) repository
+    string. The cross-scope scan can then consult the
+    sibling `.repo` file when the lock is unreadable and
+    decide whether to fail closed. The `.repo` file is
+    not authoritative — the lock JSON is — but it's a
+    safe index for a corrupt-leak-fail-closed decision.
+    """
+    return lock_path.with_suffix(lock_path.suffix + ".repo")
+
+
+def _write_repo_index(lock_path: Path, repository: str) -> None:
+    """Write the sibling `.repo` index file. Best-effort:
+    silently ignores errors because the lock file itself
+    is authoritative. Operators can rebuild the index via
+    a future tooling command if needed."""
+    try:
+        with safe_restrictive_open(_repo_index_path(lock_path), "w") as f:
+            f.write((repository or "").lower() + "\n")
+    except (OSError, NotImplementedError):
+        pass
+
+
 def default_lock_dir(repository: str) -> Path:
     """Default lock directory under $XDG_RUNTIME_DIR or ~/.aed/locks."""
     base = os.environ.get("AED_LOCK_DIR")
@@ -613,6 +646,49 @@ def _check_cross_scope_conflict(
                 # for repo-wide requests the self-collision is
                 # the only one we can identify without
                 # readable content. Anything else is skipped.
+                # Round-37 P2 fix (Keep repo-wide acquisition closed on
+                # corrupt narrower leases): augment the
+                # filename-only check from Round-35 P2 with
+                # the sibling `.repo` index file. The index
+                # is published alongside the lock JSON by
+                # try_acquire / recover_stale. When the lock
+                # JSON is corrupt but the index is
+                # readable, we know the corrupt lock's
+                # repository. If it matches the requested
+                # repository, the lease IS potentially
+                # conflicting (narrower run for the same
+                # repo) and we must fail closed. If the
+                # index is also missing or unreadable,
+                # fall back to the Round-35 filename-only
+                # behavior.
+                try:
+                    repo_index_path = _repo_index_path(entry)
+                    if repo_index_path.is_file():
+                        with open(repo_index_path) as _idx_f:
+                            index_repo = _idx_f.read().strip().lower()
+                        if index_repo == repository.lower():
+                            # Corrupt narrower lease for
+                            # the SAME repository —
+                            # fail closed.
+                            return LockOutcome(
+                                ok=False,
+                                path=entry,
+                                owner=None,
+                                reason=(
+                                    f"corrupt_cross_scope_lease_recovery_required:"
+                                    f"{type(e).__name__}:same_repo_via_index"
+                                ),
+                                indeterminate=True,
+                            )
+                        # Corrupt lease for a DIFFERENT
+                        # repository (per the index).
+                        # Skip — cannot conflict with
+                        # the requested scope.
+                        continue
+                except OSError:
+                    pass
+                # No usable `.repo` index. Fall back to
+                # the Round-35 P2 filename-only check.
                 try:
                     requested_filename = _lock_filename_for_scope_key(
                         build_scope_key(
@@ -631,19 +707,8 @@ def _check_cross_scope_conflict(
                     if entry.name not in (
                         requested_filename, same_repo_filename
                     ):
-                        # The corrupt lease is for some
-                        # other scope (other PR, other
-                        # target, or other repository).
-                        # Cannot identify the repository
-                        # without readable content. Skip —
-                        # the operator must recover it via
-                        # explicit recover-stale-lock with
-                        # the correct --repository.
                         continue
                 except Exception:
-                    # On any error in computing the
-                    # comparison, fall back to skipping
-                    # (fail-open in this narrow edge case).
                     continue
                 return LockOutcome(
                     ok=False,
@@ -840,6 +905,15 @@ def try_acquire(
                     )
                 try:
                     os.replace(tmp_path, path)
+                    # Round-37 P2 fix: write the sibling
+                    # `.repo` index file alongside the
+                    # lock so the cross-scope scan can
+                    # identify corrupt leases'
+                    # repositories. Best-effort: ignore
+                    # errors.
+                    _write_repo_index(
+                        path, (scope.get("repository") or "")
+                    )
                 except OSError as e:
                     try:
                         os.unlink(tmp_path)
@@ -1149,6 +1223,11 @@ def recover_stale(
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, path)
+            # Round-37 P2 fix: write the sibling `.repo`
+            # index for the recovered lease.
+            _write_repo_index(
+                path, (scope.get("repository") or "")
+            )
         except OSError as e:
             return LockOutcome(
                 ok=False, path=path, owner=existing2,
@@ -1274,6 +1353,12 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
                 finally:
                     os.close(dir_fd)
             except (OSError, NotImplementedError, AttributeError):
+                pass
+            # Round-37 P2 fix: clean up the sibling `.repo`
+            # index file alongside the archived lease.
+            try:
+                os.unlink(_repo_index_path(path))
+            except OSError:
                 pass
         except FileNotFoundError:
             return False

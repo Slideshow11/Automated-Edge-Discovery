@@ -5543,3 +5543,194 @@ class TestRound36RejectMutationForUnscopedRuns:
         assert "repository scope" in (err or ""), (
             f"unexpected error message: {err}"
         )
+
+
+class TestRound37FailClosedOnAdoptionTokenOSError:
+    """Round-37 P1 fix: when the filesystem returns an
+    OSError other than FileExistsError for the exclusive
+    adoption-token creation, the controller must fail
+    closed. Previously only FileExistsError aborted; all
+    other OSError outcomes silently bypassed the
+    exclusivity guarantee.
+
+    Because the test runs the controller as a subprocess,
+    monkeypatching os.open on the parent process does not
+    affect the subprocess. The fix is verified
+    structurally: the except blocks must call sys.exit(15)
+    on a non-FileExistsError OSError, NOT silently pass
+    through to the unconditional LockOutcome(ok=True)
+    below. (See the bug-detector Round-32 P1 precedent for
+    the same structural pattern.)"""
+
+    def test_adoption_block_fails_closed_on_oserror(self):
+        """Verify the except OSError branches call sys.exit(15)
+        and do not silently pass through."""
+        import scripts.local.autocoder_run_controller as ctrl
+        src = open(ctrl.__file__).read()
+        # Both adoption branches (live and indeterminate)
+        # must have an `except OSError as e:` block that
+        # calls sys.exit(15). The previous behavior was
+        # `except OSError: pass`.
+        assert src.count("except OSError as e:") >= 2, (
+            "Round-37 P1 fix missing: expected at least two "
+            "`except OSError as e:` blocks in the controller"
+        )
+        # Both branches must mention sys.exit(15) (the
+        # failure code) and the word "adoption-token".
+        # Count sys.exit(15) appearances in the file.
+        assert src.count("sys.exit(15)") >= 2, (
+            "Round-37 P1 fix missing: sys.exit(15) must be "
+            "called in both OSError branches"
+        )
+        # Count the adoption-token error message: must
+        # appear at least twice (once per branch).
+        assert src.count("adoption-token") >= 2, (
+            "Round-37 P1 fix missing: 'adoption-token' must "
+            "appear in both error messages"
+        )
+
+    def test_round32_p1_structural_remainder(
+        self,
+    ):
+        """Same structural check for the Round-32 P1 fix
+        (the O_EXCL FileExistsError path). Both adoption
+        branches must include sys.exit(15)."""
+        import scripts.local.autocoder_run_controller as ctrl
+        src = open(ctrl.__file__).read()
+        # The O_EXCL FileExistsError branches must also
+        # sys.exit(15). Count the appearances.
+        assert src.count("sys.exit(15)") >= 4, (
+            "Round-37 P1 fix may have removed a Round-32 "
+            "sys.exit(15) call (should be >=4: two OSError "
+            "+ two FileExistsError)"
+        )
+
+
+class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
+    """Round-37 P2 fix: the cross-scope scan now consults
+    a sibling `.repo` index file when a lock is unreadable.
+    A corrupt narrower-scope lease for the SAME repository
+    must fail closed (because the narrower run may have
+    been active). A corrupt narrower-scope lease for a
+    DIFFERENT repository (per the index) is skipped."""
+
+    def test_corrupt_same_repo_narrower_blocks_repo_wide(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Plant a CORRUPT narrower-scope lease for the
+        # SAME repository. The Round-37 P2 fix relies on
+        # the sibling `.repo` index file to identify the
+        # repository.
+        narrow_scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 1,
+            "mutation_target": None,
+        }
+        narrow_key = supervisor_lock.build_scope_key(**narrow_scope)
+        narrow_path = supervisor_lock.lock_path_for(
+            narrow_key, base_dir=lock_base
+        )
+        with open(narrow_path, "w") as f:
+            f.write("{truncated jso")
+        _os.chmod(narrow_path, 0o600)
+        # Write the sibling `.repo` index with the SAME
+        # repository name.
+        index_path = supervisor_lock._repo_index_path(narrow_path)
+        with open(index_path, "w") as f:
+            f.write("slideshow11/automated-edge-discovery\n")
+        _os.chmod(index_path, 0o600)
+
+        # Try to acquire a repo-wide lock for the same
+        # repository. The Round-37 P2 fix must fail
+        # closed.
+        out = supervisor_lock.try_acquire(
+            scope={
+                "repository": "Slideshow11/Automated-Edge-Discovery",
+                "target_pr_number": None,
+                "mutation_target": None,
+            },
+            owner_run_id="aed-r37-wide",
+            owner_host={"hostname": "h"},
+            owner_pid=88888,
+            owner_start_evidence={
+                "pid": 88888, "stat_start_time": 2,
+                "ctime_ns": None, "source": "linux_proc",
+            },
+            owner_state_path=str(
+                tmp_path / "wide" / "CONTROLLER_STATE.json"
+            ),
+            base_dir=lock_base,
+        )
+        assert not out.ok, (
+            f"Round-37 P2 fix missing: corrupt same-repo "
+            f"narrower lease did not block repo-wide "
+            f"acquisition, got ok=True reason={out.reason}"
+        )
+        assert (
+            "corrupt_cross_scope_lease_recovery_required"
+            in (out.reason or "")
+        ), (
+            f"unexpected reason: {out.reason}"
+        )
+        assert out.indeterminate is True
+
+    def test_corrupt_different_repo_narrower_is_skipped(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Plant a CORRUPT narrower-scope lease for a
+        # DIFFERENT repository.
+        other_scope = {
+            "repository": "other-owner/other-repo",
+            "target_pr_number": 1,
+            "mutation_target": None,
+        }
+        other_key = supervisor_lock.build_scope_key(**other_scope)
+        other_path = supervisor_lock.lock_path_for(
+            other_key, base_dir=lock_base
+        )
+        with open(other_path, "w") as f:
+            f.write("{truncated jso")
+        _os.chmod(other_path, 0o600)
+        index_path = supervisor_lock._repo_index_path(other_path)
+        with open(index_path, "w") as f:
+            f.write("other-owner/other-repo\n")
+        _os.chmod(index_path, 0o600)
+
+        # Try to acquire a repo-wide lock for the requested
+        # repository. The Round-37 P2 fix must skip the
+        # corrupt lease for the other repo (per the index).
+        out = supervisor_lock.try_acquire(
+            scope={
+                "repository": "Slideshow11/Automated-Edge-Discovery",
+                "target_pr_number": None,
+                "mutation_target": None,
+            },
+            owner_run_id="aed-r37-wide2",
+            owner_host={"hostname": "h"},
+            owner_pid=88888,
+            owner_start_evidence={
+                "pid": 88888, "stat_start_time": 2,
+                "ctime_ns": None, "source": "linux_proc",
+            },
+            owner_state_path=str(
+                tmp_path / "wide2" / "CONTROLLER_STATE.json"
+            ),
+            base_dir=lock_base,
+        )
+        assert out.ok, (
+            f"Round-37 P2 fix missing: corrupt different-repo "
+            f"narrower lease incorrectly blocked the "
+            f"requested acquisition: {out.reason}"
+        )
