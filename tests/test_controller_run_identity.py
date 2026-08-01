@@ -5704,6 +5704,151 @@ class TestRound38StandaloneRecoveryDerivesFromWorkspace:
         assert str(workspace) in recovered["owner_state_path"]
 
 
+class TestRound39DeriveReplacementPathInLegacyRecovery:
+    """Round-39 P1 fix: when recover-stale-lock is given
+    --state but NOT --recovered-state-path, the previous
+    code always reused args.state (the predecessor's
+    state file). With --workspace, the replacement path
+    must now be derived from --workspace instead,
+    mirroring the bootstrap branch's Round-38 P1 fix."""
+
+    def test_legacy_recovery_uses_workspace_when_no_recovered_state_path(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Plant a stale lock.
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 942,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        predecessor_state = tmp_path / "predecessor" / "CONTROLLER_STATE.json"
+        predecessor_state.parent.mkdir(parents=True, exist_ok=True)
+        predecessor_state.write_text(json.dumps({
+            "run_identity": {
+                "run_id": "aed-r39-predecessor",
+                "repository": "Slideshow11/Automated-Edge-Discovery",
+                "target_pr_number": 942,
+            },
+            "overall_status": "RUN_TERMINAL_FAILED",  # terminal → stale
+            "tasks": [],
+        }))
+        # Make the state file mtime very old so the
+        # assess_liveness check marks the lease stale.
+        import time as _t
+        _t0 = _t.time() - 86400 * 7  # 7 days ago
+        _os.utime(predecessor_state, (_t0, _t0))
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r39-predecessor",
+            "owner_pid": 99999,
+            "owner_state_path": str(predecessor_state),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # Use the LEGACY path (--state is given) and pass
+        # --workspace. Without --recovered-state-path the
+        # recovered lease must bind to
+        # <workspace>/CONTROLLER_STATE.json, NOT the
+        # predecessor's state.
+        workspace = tmp_path / "replacement-ws"
+        rc, _, err = run_controller(
+            [
+                "recover-stale-lock",
+                "--state", str(predecessor_state),
+                "--recovered-run-id", "aed-r39-replacement",
+                "--workspace", str(workspace),
+                "--staleness-evidence", "stale_lock_detected:...",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, (
+            f"Round-39 P1 fix missing: legacy recovery "
+            f"failed, got rc={rc}, err={err}"
+        )
+        with open(path) as f:
+            recovered = json.load(f)
+        assert recovered.get("owner_state_path") is not None
+        # The recovered owner_state_path must be derived
+        # from --workspace, NOT the predecessor's --state.
+        assert str(workspace) in recovered["owner_state_path"], (
+            f"Round-39 P1 fix missing: recovered "
+            f"owner_state_path {recovered['owner_state_path']!r} "
+            f"does not derive from --workspace {workspace!r}"
+        )
+        assert str(predecessor_state) not in recovered["owner_state_path"], (
+            "Round-39 P1 fix missing: recovered owner_state_path "
+            "still binds to the predecessor's --state file"
+        )
+
+
+class TestRound39RevalidateLeaseDuringAdoptionToken:
+    """Round-39 P2 fix: after the O_EXCL adoption-token
+    creation, the controller must re-read the lease and
+    abort if the owner_run_id or lock_version_chain has
+    changed (a concurrent recover_stale has moved the
+    lease). The adoption path does not hold the scope
+    sentinel, so without this revalidation the loser's
+    token could race the recoverer's lease write."""
+
+    def test_lease_moved_during_adoption_aborts(
+        self, tmp_path, isolated_lock_dir, monkeypatch
+    ):
+        """Verify the adoption block re-reads the lease
+        after creating the O_EXCL token and aborts if
+        the lease has changed."""
+        import scripts.local.autocoder_run_controller as ctrl
+        src = open(ctrl.__file__).read()
+        # Both adoption branches must re-validate the
+        # lease after O_EXCL token creation and before
+        # publishing the state.
+        assert src.count("revalidate.get(") >= 2, (
+            "Round-39 P2 fix missing: adoption block must "
+            "re-read the lease and check owner_run_id/"
+            "lock_version_chain after O_EXCL token "
+            "creation"
+        )
+        assert src.count("lease moved to another run") >= 2, (
+            "Round-39 P2 fix missing: must include the "
+            "'lease moved to another run' diagnostic "
+            "for the FileNotFoundError path"
+        )
+        # Both branches must include
+        # `(FileExistsError, FileNotFoundError)` to
+        # catch both race outcomes.
+        assert (
+            src.count("except (FileExistsError, FileNotFoundError) as e:")
+            >= 2
+        ), (
+            "Round-39 P2 fix missing: adoption blocks must "
+            "catch both FileExistsError (token race) and "
+            "FileNotFoundError (lease moved)"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.

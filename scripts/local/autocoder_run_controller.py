@@ -765,9 +765,39 @@ def _init(args: argparse.Namespace) -> None:
                     0o600,
                 )
                 os.close(fd)
-            except FileExistsError:
-                # Another init won the race. Set lock_outcome
-                # to ok=False and return; do NOT adopt.
+                # Round-39 P2 fix (Revalidate the lease while
+                # consuming the adoption token): the adoption
+                # path does not hold the scope sentinel. A
+                # concurrent recover_stale could replace the
+                # lease between the try_acquire return and the
+                # O_EXCL create. Re-read the lease and abort
+                # if the owner_run_id or the lock_version_chain
+                # has changed — the lease has moved to
+                # another run and the adoption token is stale.
+                revalidate = _supervisor_lock._read_lock(
+                    lock_outcome.path
+                )
+                if revalidate is None:
+                    raise FileNotFoundError(
+                        "lease disappeared during adoption"
+                    )
+                if (
+                    revalidate.get("owner_run_id")
+                    != existing_owner.get("owner_run_id")
+                    or revalidate.get("lock_version_chain")
+                    != existing_owner.get("lock_version_chain")
+                ):
+                    raise FileNotFoundError(
+                        "lease moved to another run during "
+                        "adoption token consumption"
+                    )
+            except (FileExistsError, FileNotFoundError) as e:
+                # Another init won the race (FileExistsError
+                # on the adoption token), or a concurrent
+                # recover_stale moved the lease out from
+                # under us (FileNotFoundError from the
+                # Round-39 P2 revalidation). Both must
+                # abort: do NOT adopt.
                 # Round-32 P1 fix (Preserve the failed adoption
                 # outcome): the previous Round-31 fix had a
                 # bug where the unconditional
@@ -777,10 +807,18 @@ def _init(args: argparse.Namespace) -> None:
                 # fix is to return immediately here so the
                 # caller sees the FileExistsError as a
                 # terminal failure for this init.
+                # Round-39 P2 fix (continued): the
+                # FileNotFoundError path reports the lease
+                # moved to another run. Include both reasons
+                # in the diagnostic.
+                if isinstance(e, FileExistsError):
+                    diag = "another init process won the adoption race"
+                else:
+                    diag = "lease moved to another run during adoption token consumption"
                 print(
-                    "ERROR: cannot authorize init: another "
-                    "init process won the adoption race for "
-                    f"the recovery lease at {out_path!r}",
+                    "ERROR: cannot authorize init: "
+                    f"{diag} for the recovery lease at "
+                    f"{out_path!r}",
                     file=sys.stderr,
                 )
                 sys.exit(15)
@@ -871,14 +909,47 @@ def _init(args: argparse.Namespace) -> None:
                     0o600,
                 )
                 os.close(fd)
-            except FileExistsError:
+                # Round-39 P2 fix (Revalidate the lease while
+                # consuming the adoption token): the adoption
+                # path does not hold the scope sentinel. A
+                # concurrent recover_stale could replace the
+                # lease between the try_acquire return and the
+                # O_EXCL create. Re-read the lease and abort
+                # if the owner_run_id or the lock_version_chain
+                # has changed — the lease has moved to
+                # another run and the adoption token is stale.
+                revalidate = _supervisor_lock._read_lock(
+                    lock_outcome.path
+                )
+                if revalidate is None:
+                    raise FileNotFoundError(
+                        "lease disappeared during adoption"
+                    )
+                if (
+                    revalidate.get("owner_run_id")
+                    != existing_owner.get("owner_run_id")
+                    or revalidate.get("lock_version_chain")
+                    != existing_owner.get("lock_version_chain")
+                ):
+                    raise FileNotFoundError(
+                        "lease moved to another run during "
+                        "adoption token consumption"
+                    )
+            except (FileExistsError, FileNotFoundError) as e:
                 # Round-32 P1 fix: return immediately on the
                 # indeterminate branch too (see the live
-                # branch above).
+                # branch above). Round-39 P2 fix: the
+                # FileNotFoundError path indicates a
+                # concurrent recover_stale moved the lease
+                # out from under us.
+                if isinstance(e, FileExistsError):
+                    diag = "another init process won the adoption race"
+                else:
+                    diag = "lease moved to another run during adoption token consumption"
                 print(
-                    "ERROR: cannot authorize init: another "
-                    "init process won the adoption race for "
-                    f"the recovery lease at {out_path!r}",
+                    "ERROR: cannot authorize init: "
+                    f"{diag} for the recovery lease at "
+                    f"{out_path!r}",
                     file=sys.stderr,
                 )
                 sys.exit(15)
@@ -3813,9 +3884,21 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         # _state_file_live to immediately classify the new
         # lease as stale, blocking the replacement init from
         # adopting it because the output path differs.
+        #
+        # Round-39 P1 fix (Derive a replacement path for
+        # legacy recovery): if --recovered-state-path is NOT
+        # given but --workspace IS, use
+        # <workspace>/CONTROLLER_STATE.json as the
+        # replacement path. This mirrors the bootstrap
+        # branch's Round-38 P1 fix. Otherwise fall back to
+        # the predecessor's --state path.
         if getattr(args, "recovered_state_path", None):
             recovered_state_path = str(
                 Path(args.recovered_state_path).resolve()
+            )
+        elif getattr(args, "workspace", None):
+            recovered_state_path = str(
+                Path(args.workspace).resolve() / "CONTROLLER_STATE.json"
             )
         else:
             recovered_state_path = str(Path(args.state).resolve())
