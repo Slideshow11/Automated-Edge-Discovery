@@ -666,17 +666,23 @@ def recover_stale(
         if evidence.is_indeterminate:
             # Round-9 P1 fix: when the operator explicitly opts
             # into inline recovery (bypass_indeterminate_state),
-            # allow state_path_missing and similar "indeterminate
-            # because we can't read the state file" cases to
-            # proceed. The operator has explicitly accepted that
-            # the predecessor's state file is missing or
-            # unreadable; refusing here would force an
-            # unrecoverable lock.
-            if bypass_indeterminate_state and "state_path" in evidence.reason:
+            # allow state_path_missing, state_unreadable, and
+            # similar "indeterminate because we can't read the
+            # state file" cases to proceed. The operator has
+            # explicitly accepted that the predecessor's state
+            # file is missing or unreadable; refusing here would
+            # force an unrecoverable lock. Round-10 fix: include
+            # state_unreadable in the bypass set.
+            if bypass_indeterminate_state and (
+                "state_path" in evidence.reason
+                or "state_unreadable" in evidence.reason
+            ):
                 pass  # proceed with recovery
             else:
                 return LockOutcome(
-                    ok=False, path=path, owner=existing,
+                    ok=False,
+                    path=path,
+                    owner=existing,
                     reason=f"indeterminate_liveness:{evidence.reason}",
                     indeterminate=True,
                 )
@@ -738,7 +744,10 @@ def recover_stale(
                     reason="recheck_found_lock_live",
                 )
             if live2.is_indeterminate:
-                if bypass_indeterminate_state and "state_path" in live2.reason:
+                if bypass_indeterminate_state and (
+                    "state_path" in live2.reason
+                    or "state_unreadable" in live2.reason
+                ):
                     liveness_reason = live2.reason  # proceed
                 else:
                     return LockOutcome(

@@ -172,6 +172,15 @@ def _append_record(workspace: Path, record: dict) -> None:
         0o600,
     )
     try:
+        # Round-10 P2 fix: when the journal already exists with
+        # broader perms (e.g. 0o644 left over from a prior partial
+        # write), O_CREAT with 0o600 preserves the existing mode.
+        # Explicitly fchmod so re-opening cannot leak the journal
+        # contents to other local users.
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            pass
         _write_full(fd, payload)
     finally:
         os.close(fd)
@@ -218,7 +227,7 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
         raise
 
 
-def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcome:
+def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[int] = None) -> AuthorizationOutcome:
     """
     Authorize a one-time mutation. Returns ok=False and a clear
     reason when:
@@ -233,6 +242,11 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
     two concurrent executors cannot both succeed in authorizing the
     same scope, AND so a crashed executor's sentinel is auto-released
     by the kernel.
+
+    Round-10 fix: callers may pre-acquire the sentinel and pass
+    `sentinel_fd` to share the lock with surrounding operations
+    (e.g. authorize-mutation's state and lease checks). When
+    provided, the internal acquire is skipped.
     """
     from scripts.local.aed_supervisor_lock import (
         _acquire_sentinel_fd,
@@ -241,8 +255,10 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
 
     path = mutations_path(workspace)
     sentinel_path = path.with_suffix(path.suffix + ".auth-sentinel")
-
-    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    own_sentinel = False
+    if sentinel_fd is None:
+        sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+        own_sentinel = True
     if sentinel_fd is None:
         return AuthorizationOutcome(
             ok=False,
@@ -309,7 +325,8 @@ def authorize(workspace: Path, req: AuthorizationRequest) -> AuthorizationOutcom
         _append_record(workspace, record)
         return AuthorizationOutcome(ok=True, mutation_id=mutation_id, record=record)
     finally:
-        _release_sentinel_fd(sentinel_fd, sentinel_path)
+        if own_sentinel:
+            _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def record_result(
@@ -321,6 +338,7 @@ def record_result(
     actual_main_sha: Optional[str] = None,
     actual_target_sha: Optional[str] = None,
     error_detail: Optional[str] = None,
+    sentinel_fd: Optional[int] = None,
 ) -> dict:
     """
     Record the terminal result of an authorized mutation.
@@ -335,6 +353,9 @@ def record_result(
     sentinel file used by `authorize` so a concurrent `authorize`
     and `record_result` cannot race, AND so a crashed caller is
     auto-released by the kernel.
+
+    Round-10 fix: callers may pre-acquire the sentinel and pass
+    `sentinel_fd` to share the lock with surrounding operations.
     """
     from scripts.local.aed_supervisor_lock import (
         _acquire_sentinel_fd,
@@ -346,7 +367,10 @@ def record_result(
 
     path = mutations_path(workspace)
     sentinel_path = path.with_suffix(path.suffix + ".auth-sentinel")
-    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    own_sentinel = False
+    if sentinel_fd is None:
+        sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+        own_sentinel = True
     if sentinel_fd is None:
         raise RuntimeError("mutation_journal_lock_busy")
 
@@ -437,7 +461,8 @@ def record_result(
             f"duplicate_non_identical_result:existing={existing_result};new={new_result}"
         )
     finally:
-        _release_sentinel_fd(sentinel_fd, sentinel_path)
+        if own_sentinel:
+            _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 
 def _results_equal(a: dict, b: dict) -> bool:

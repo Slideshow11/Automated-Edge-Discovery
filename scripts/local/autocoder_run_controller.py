@@ -563,6 +563,19 @@ def _init(args: argparse.Namespace) -> None:
     lock_dir_arg: Optional[str] = getattr(args, "lock_dir", None)
     lock_base: Optional[Path] = None
     if getattr(args, "repository", None) or getattr(args, "target_pr_number", None):
+        # Round-10 P2 fix: refuse a PR-scoped lock without an
+        # explicit repository. The previous code accepted
+        # --target-pr-number N without --repository, built a
+        # scope with empty repository, and skipped
+        # ownership-validation checks downstream. Reject this
+        # partial scope here.
+        if getattr(args, "target_pr_number", None) and not getattr(args, "repository", None):
+            print(
+                "ERROR: --target-pr-number requires --repository "
+                "(a partial scope is not permitted for lock ownership)",
+                file=sys.stderr,
+            )
+            sys.exit(14)
         scope = {
             "repository": getattr(args, "repository", None) or "",
             "target_pr_number": getattr(args, "target_pr_number", None),
@@ -604,6 +617,7 @@ def _init(args: argparse.Namespace) -> None:
             and (
                 lock_outcome.reason.startswith("stale_lock_detected:")
                 or lock_outcome.reason.startswith("indeterminate_liveness:indeterminate:state_path_missing")
+                or lock_outcome.reason.startswith("indeterminate_liveness:indeterminate:state_unreadable")
                 or lock_outcome.reason.startswith("corrupt_existing_lease_recovery_required")
             )
         ):
@@ -653,10 +667,24 @@ def _init(args: argparse.Namespace) -> None:
                 bypass_indeterminate_state=True,
             )
             if not recovered.ok:
-                # Roll back the stub state file so the failed init
-                # leaves no orphan.
+                # Round-10 P1 fix: roll back the stub state file
+                # ONLY if it still belongs to this run. Two
+                # concurrent init --replace-stale-lock processes
+                # may share an output path; the loser can reach
+                # this rollback after the winner has recovered
+                # the lease and written its complete state. The
+                # loser's stub would have our run_id; the winner's
+                # full state has the winner's run_id. Read the
+                # file's run_id and only unlink if it matches.
                 try:
-                    os.unlink(out_path)
+                    if Path(out_path).exists():
+                        try:
+                            with open(out_path) as f:
+                                existing_state = json.load(f)
+                            if (existing_state.get("run_identity") or {}).get("run_id") == args.run_id:
+                                os.unlink(out_path)
+                        except (OSError, json.JSONDecodeError):
+                            pass
                 except OSError:
                     pass
                 print(
@@ -2885,7 +2913,39 @@ def _state_mutation_target(state: dict) -> Optional[str]:
 
 
 def _authorize_mutation(args: argparse.Namespace) -> None:
-    state = _load_state(args.state)
+    # Round-10 P1 fix: acquire the mutation-journal sentinel
+    # BEFORE loading state, checking lease, or any other read.
+    # Hold the sentinel through the append. This closes the
+    # remaining TOCTOU window where authorize reads RUN_ACTIVE
+    # then finalize persists RUN_COMPLETE; finalize's
+    # outstanding-mutations check runs under the sentinel so
+    # authorize cannot append after finalize completes.
+    workspace_path = Path(args.workspace)
+    mutations_path_file = workspace_path / _mutation_auth.MUTATIONS_FILENAME
+    sentinel_path = mutations_path_file.with_suffix(
+        mutations_path_file.suffix + ".auth-sentinel"
+    )
+    from scripts.local.aed_supervisor_lock import (
+        _acquire_sentinel_fd,
+        _release_sentinel_fd,
+    )
+    sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+    if sentinel_fd is None:
+        print(
+            "ERROR: cannot authorize mutation: mutation journal lock busy",
+            file=sys.stderr,
+        )
+        sys.exit(12)
+    try:
+        state = _load_state(args.state)
+        _authorize_mutation_locked(args, state, sentinel_fd)
+    finally:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+
+
+def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_fd: int) -> None:
+    """Body of _authorize_mutation, executed while holding the
+    mutation-journal sentinel."""
     # Round-120 P1 fix (round 7): verify the launch receipt
     # exists and matches the current run before authorizing. The
     # receipt is the documented precondition for any repository
@@ -3055,7 +3115,7 @@ def _authorize_mutation(args: argparse.Namespace) -> None:
         expected_target_sha=args.expected_target_sha,
         pending_action=args.pending_action,
     )
-    outcome = _mutation_auth.authorize(Path(args.workspace), req)
+    outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
     if not outcome.ok:
         print(
             f"ERROR: mutation authorization rejected: {outcome.reason}; "
