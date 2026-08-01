@@ -1397,6 +1397,12 @@ def _init(args: argparse.Namespace) -> None:
         # rejection through a dedicated SystemExit catcher
         # that performs the rollback + lock release.
 
+        # Round-43 P2 fix (Release the supervisor lease
+        # when workspace ownership is busy): also route
+        # the rc=17 path (workspace-already-owned) through
+        # the same SystemExit catcher so the lease is
+        # released on rollback.
+
         # Patch sys.exit inside this scope so the
         # ownership rejection raises _OwnershipRejectedError
         # (defined at function scope above), which is
@@ -1404,7 +1410,7 @@ def _init(args: argparse.Namespace) -> None:
         # and triggers the rollback + lock release below.
         _orig_sys_exit = sys.exit
         def _patched_sys_exit(code=0):
-            if code == 16:
+            if code in (16, 17):
                 raise _OwnershipRejectedError(code)
             _orig_sys_exit(code)
         sys.exit = _patched_sys_exit
@@ -1425,9 +1431,23 @@ def _init(args: argparse.Namespace) -> None:
                 str(receipt_md_path) if receipt_md_path else None
             )
             _save_state(state, out_path)
+            # Round-43 P2 fix (Remove the workspace sentinel
+            # after successful publication): the sentinel
+            # was created above to serialize concurrent
+            # initializers. After all three artifacts are
+            # durably published, the sentinel is no longer
+            # needed; remove it so a future successor init
+            # (e.g. after finalization, with
+            # --replace-stale-state) does not see a stale
+            # sentinel and report that "another
+            # initialization is currently running".
+            try:
+                os.unlink(workspace_owned_path)
+            except OSError:
+                pass
         except _OwnershipRejectedError:
             # The ownership guard raised _OwnershipRejectedError
-            # via the patched sys.exit(16). Re-raise to
+            # via the patched sys.exit(16) or (17). Re-raise to
             # trigger the outer except (and the rollback).
             raise
         finally:
