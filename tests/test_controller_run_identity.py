@@ -5503,7 +5503,7 @@ class TestRound36RejectMutationForUnscopedRuns:
     authorization."""
 
     def test_authorize_without_repository_in_state_is_rejected(
-        self, tmp_path
+        self, tmp_path, isolated_lock_dir
     ):
         from scripts.local import aed_supervisor_lock as supervisor_lock
         import os as _os
@@ -5531,19 +5531,23 @@ class TestRound36RejectMutationForUnscopedRuns:
         )
         assert rc == 0, f"init (no --repository) failed: rc={rc} err={err}"
 
-        # Now try to authorize-mutation. Without the
-        # Round-36 fix this would succeed despite no
-        # repository scope. With the fix it must fail.
+        # Now try to authorize-mutation. The test uses
+        # mutation_type=push with a short SHA. After the
+        # Round-46 P1 fix, the head-changing SHA check
+        # fires BEFORE the Round-36 repository-scope
+        # check. Use a non-head-changing mutation type
+        # (e.g. pr_body_update) so the head-SHA check is
+        # skipped and the repository-scope check fires.
         state_path = workspace / "CONTROLLER_STATE.json"
         rc, _, err = run_controller(
             [
                 "authorize-mutation",
                 "--state", str(state_path),
                 "--workspace", str(workspace),
-                "--mutation-type", "push",
+                "--mutation-type", "pr_body_update",
                 "--expected-main-sha", "e4ef774",
                 "--expected-target-sha", "e4ef774",
-                "--pending-action", "push",
+                "--pending-action", "update",
             ],
             cwd=str(tmp_path),
             env={"AED_LOCK_DIR": str(lock_base)},
@@ -6331,6 +6335,70 @@ class TestRound45StartTimeMismatchClassifiesAsStale:
             f"stale, got is_alive=True reason={ev.reason!r}"
         )
         assert ev.reason == "stale_lock_pid_reuse_start_time_mismatch"
+
+
+class TestRound46RequireTargetHeadForForcePush:
+    """Round-46 P1 fix: a force-push (or any other
+    head-changing mutation type) authorization that omits
+    --expected-target-sha must be refused at authorization
+    time, not silently let the executor push with no
+    authorized head to compare against. The same SHA
+    validation that applied only to squash_merge now
+    applies to all head-changing mutation types."""
+
+    def test_force_push_without_target_sha_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        # Initialize a run with a repository scope so
+        # authorize-mutation does not fail on the
+        # Round-36 repository-scope check before the
+        # Round-46 head-SHA check.
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r46-force",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "945",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc}, err={err}"
+
+        # Now try to authorize a force-push WITHOUT
+        # --expected-target-sha. The Round-46 P1 fix
+        # must refuse with rc=14.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(state_path),
+                "--workspace", str(workspace),
+                "--mutation-type", "force_push",
+                "--expected-main-sha", "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70e",
+                "--expected-target-sha", "",  # intentionally missing
+                "--pending-action", "force_push",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"Round-46 P1 fix missing: force_push without "
+            f"target sha should fail with rc=14, got "
+            f"rc={rc}, err={err}"
+        )
+        assert "40-character lowercase hex" in (err or "") or (
+            "expected-target-sha" in (err or "")
+        ), (
+            f"unexpected error: {err}"
+        )
 
 
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:

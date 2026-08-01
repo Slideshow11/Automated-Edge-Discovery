@@ -186,7 +186,7 @@ def _save_state(state: dict, path: str) -> None:
         # publishes the new state with restrictive perms.
         try:
             os.fchmod(fd, 0o600)
-        except (OSError, NotImplementedError):
+        except (OSError, NotImplementedError, AttributeError):
             pass
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
@@ -3867,13 +3867,32 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # let an executor merge a PR whose head changed between
     # authorization and execution. Fail closed at authorization
     # time so the executor can compare against an exact head.
-    if args.mutation_type == "squash_merge":
+    # Round-46 P1 fix (Require target heads for force-push
+    # authorization): the squash_merge branch above
+    # requires a full 40-character lowercase hex
+    # expected_target_sha. The same requirement must
+    # apply to ANY mutation type that changes a ref —
+    # `force_push`, `push`, `branch_delete`, etc. The
+    # external executor compares the actual remote head
+    # against the authorized head before pushing; without
+    # an authorized head, the executor has nothing to
+    # compare and may overwrite concurrent commits.
+    # Build a list of head-changing mutation types and
+    # require the same SHA validation for each.
+    HEAD_CHANGING_MUTATION_TYPES = {
+        "squash_merge",
+        "force_push",
+        "push",
+        "branch_delete",
+        "branch_create_force",
+    }
+    if args.mutation_type in HEAD_CHANGING_MUTATION_TYPES:
         target_sha = args.expected_target_sha or ""
         if not _is_full_sha(target_sha):
             print(
                 "ERROR: cannot authorize mutation: --expected-target-sha "
                 "must be a full 40-character lowercase hex SHA for "
-                f"squash_merge, got {target_sha!r}",
+                f"{args.mutation_type}, got {target_sha!r}",
                 file=sys.stderr,
             )
             sys.exit(14)

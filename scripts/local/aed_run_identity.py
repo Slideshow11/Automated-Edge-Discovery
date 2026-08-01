@@ -315,14 +315,14 @@ def safe_restrictive_open(path: Path, mode: str = "w"):
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
         try:
             os.fchmod(fd, 0o600)
-        except (OSError, NotImplementedError):
+        except (OSError, NotImplementedError, AttributeError):
             pass
         return os.fdopen(fd, mode)
     # Fallback for non-POSIX (Windows): write then chmod.
     f = open(path, mode)
     try:
         os.chmod(path, 0o600)
-    except (OSError, NotImplementedError):
+    except (OSError, NotImplementedError, AttributeError):
         pass
     return f
 

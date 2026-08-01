@@ -224,7 +224,7 @@ def _append_record(workspace: Path, record: dict) -> None:
         # other local users.
         try:
             os.fchmod(fd, 0o600)
-        except (OSError, NotImplementedError):
+        except (OSError, NotImplementedError, AttributeError):
             pass
         try:
             _write_full(fd, payload)
@@ -315,7 +315,7 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
         # publish the rewritten journal with broader perms.
         try:
             os.fchmod(fd, 0o600)
-        except (OSError, NotImplementedError):
+        except (OSError, NotImplementedError, AttributeError):
             pass
         with os.fdopen(fd, "w") as f:
             for line in new_lines:
@@ -342,7 +342,7 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except (OSError, NotImplementedError):
+        except (OSError, NotImplementedError, AttributeError):
             pass
     except Exception:
         try:
