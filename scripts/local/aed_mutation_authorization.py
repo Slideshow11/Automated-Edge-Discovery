@@ -74,6 +74,7 @@ from scripts.local.aed_run_identity import (
     safe_restrictive_open,
     assert_no_secrets,
     file_mode,
+    posix_cloexec_flag,
 )
 
 
@@ -188,7 +189,7 @@ def _append_record(workspace: Path, record: dict) -> None:
             prev_size = 0
     fd = os.open(
         str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | posix_cloexec_flag(),
         0o600,
     )
     try:
@@ -227,7 +228,7 @@ def _append_record(workspace: Path, record: dict) -> None:
         # fsync can still leave the directory without the
         # journal, recreating the crash-after-authorization gap.
         if not journal_existed_before:
-            dir_fd = os.open(str(path.parent), os.O_RDONLY | os.O_CLOEXEC)
+            dir_fd = os.open(str(path.parent), os.O_RDONLY | posix_cloexec_flag())
             try:
                 os.fsync(dir_fd)
             finally:
@@ -259,7 +260,7 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(
         str(tmp_path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | posix_cloexec_flag(),
         0o600,
     )
     try:
@@ -290,7 +291,7 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
         # journal's parent directory before returning.
         try:
             dir_fd = os.open(
-                str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                str(path.parent), os.O_RDONLY | posix_cloexec_flag()
             )
             try:
                 os.fsync(dir_fd)

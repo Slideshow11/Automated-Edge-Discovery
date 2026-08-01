@@ -4644,3 +4644,50 @@ class TestRound27WindowsSafeSentinelFlags:
         else:
             # On Windows, the helper returns 0.
             assert supervisor_lock._posix_cloexec_flag() == 0
+
+
+# ---------------------------------------------------------------------------
+# Round-28 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound28WindowsSafeMutationJournalFlags:
+    """Round-28 P2 fix: mutation journal's _append_record and
+    _rewrite_record open sites must use posix_cloexec_flag()
+    instead of os.O_CLOEXEC directly, so first
+    `authorize-mutation` calls work on Windows where
+    os.O_CLOEXEC raises AttributeError."""
+
+    def test_mutation_journal_works_on_windows(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_mutation_authorization as ma
+        import os as _os
+
+        # Simulate Windows: O_CLOEXEC unavailable.
+        real = getattr(ma.os, "O_CLOEXEC", None)
+        if hasattr(ma.os, "O_CLOEXEC"):
+            delattr(ma.os, "O_CLOEXEC")
+
+        try:
+            # _append_record must not raise AttributeError when
+            # the journal does not exist (first-ever append
+            # creates it).
+            ma._append_record(
+                tmp_path,
+                {"mutation_id": "m-r28-win", "kind": "test", "x": 1},
+            )
+            assert (tmp_path / "MUTATIONS.jsonl").exists()
+        finally:
+            if real is not None:
+                ma.os.O_CLOEXEC = real
+
+    def test_posix_cloexec_flag_is_importable(
+        self
+    ):
+        from scripts.local.aed_run_identity import posix_cloexec_flag
+        import os as _os
+        if hasattr(_os, "O_CLOEXEC"):
+            assert posix_cloexec_flag() != 0
+        else:
+            assert posix_cloexec_flag() == 0

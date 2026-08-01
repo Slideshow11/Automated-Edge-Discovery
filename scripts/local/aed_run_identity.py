@@ -354,3 +354,18 @@ def file_mode(path: Path) -> Optional[int]:
         return Path(path).stat().st_mode & 0o777
     except (FileNotFoundError, OSError):
         return None
+
+
+def posix_cloexec_flag() -> int:
+    """Return os.O_CLOEXEC when available, else 0.
+
+    Round-28 P2 fix (Build mutation-journal flags
+    conditionally on Windows): the mutation journal's
+    _append_record and _rewrite_record open sites use
+    os.O_CLOEXEC unconditionally, which raises
+    AttributeError on Windows. The controller's _save_state
+    and the supervisor lock's sentinel acquisitions already
+    use this same helper pattern. Add it to aed_run_identity
+    so aed_mutation_authorization can import it.
+    """
+    return getattr(os, "O_CLOEXEC", 0)
