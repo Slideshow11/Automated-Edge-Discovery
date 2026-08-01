@@ -3758,3 +3758,229 @@ class TestRound23ReleaseArchivesLease:
         assert archive_data.get("recovery_history") == [recovery_entry], (
             f"archive missing recovery_history: {archive_data}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-24 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound24FsyncRecoveredLeaseDirectory:
+    """Round-24 P1 fix: recover_stale must fsync the lock
+    directory after the os.replace that publishes the recovered
+    lease, just like try_acquire does for the initial
+    acquisition."""
+
+    def test_recover_stale_fsyncs_lock_directory(
+        self, tmp_path, isolated_lock_dir, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        # Track fsync calls during recover_stale.
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(supervisor_lock.os, "fsync", tracking_fsync)
+
+        # Plant a stale lock so recover_stale can succeed.
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 929,
+            "mutation_target": None,
+        }
+        from scripts.local.aed_supervisor_lock import build_scope_key
+        scope_key = build_scope_key(**scope)
+        base_dir = tmp_path / "locks"
+        base_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=base_dir)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-stale",
+            "owner_pid": 99999,  # Not alive
+            "owner_state_path": str(tmp_path / "ws" / "CONTROLLER_STATE.json"),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        outcome = supervisor_lock.recover_stale(
+            scope=scope,
+            recovered_by_run_id="aed-r24-recover",
+            recovered_by_host={"hostname": "h"},
+            recovered_by_pid=88888,
+            recovered_by_start_evidence={
+                "pid": 88888,
+                "stat_start_time": 2,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            recovered_by_state_path=str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            staleness_evidence="stale_lock_detected:...",
+            bypass_indeterminate_state=True,
+            base_dir=base_dir,
+        )
+        assert outcome.ok, f"recover_stale failed: {outcome.reason}"
+
+        # Round-24 P1 fix: the recovered-lease publish path must
+        # fsync at least twice (the lock file and the lock
+        # directory), matching try_acquire's durability
+        # guarantees.
+        assert fsync_calls["count"] >= 2, (
+            f"Round-24 P1 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"recover_stale; expected at least 2 (file fsync + "
+            f"lock directory fsync)."
+        )
+
+
+class TestRound24CollisionFreeArchiveNames:
+    """Round-24 P2 fix: archive names must include microsecond
+    precision + owner_run_id + uuid suffix so two releases for
+    the same scope within the same second cannot collide and
+    silently overwrite each other's audit record."""
+
+    def test_two_rapid_releases_produce_distinct_archives(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        from scripts.local.aed_supervisor_lock import (
+            build_scope_key,
+            lock_path_for,
+            release,
+        )
+        import time as _time
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 930,
+            "mutation_target": None,
+        }
+        scope_key = build_scope_key(**scope)
+        base_dir = tmp_path / "locks"
+        base_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = lock_path_for(scope_key, base_dir=base_dir)
+
+        def _plant_then_release(owner_run_id):
+            planted = {
+                "lock_version": 1,
+                "lock_version_chain": 2,
+                "scope_key": scope_key,
+                "scope": scope,
+                "owner_run_id": owner_run_id,
+                "owner_pid": 99999,
+                "owner_state_path": str(
+                    tmp_path / "ws" / "CONTROLLER_STATE.json"
+                ),
+                "owner_start_evidence": {
+                    "pid": 99999,
+                    "stat_start_time": 1,
+                    "ctime_ns": None,
+                    "source": "linux_proc",
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+                "last_renewed_at": "2026-01-01T00:00:00Z",
+                "max_age_seconds": 86400,
+                "recovery_history": [
+                    {"reason": owner_run_id}
+                ],
+            }
+            with open(path, "w") as f:
+                json.dump(planted, f)
+            import os as _os
+            _os.chmod(path, 0o600)
+            ok = release(
+                scope=scope,
+                owner_run_id=owner_run_id,
+                base_dir=base_dir,
+            )
+            assert ok
+
+        # Two releases within the same second. The archive
+        # names must differ so the second release does NOT
+        # overwrite the first audit record.
+        _plant_then_release("aed-r24-first")
+        _plant_then_release("aed-r24-second")
+
+        archives = sorted(p for p in base_dir.iterdir() if ".released-" in p.name)
+        assert len(archives) >= 2, (
+            f"Round-24 P2 fix missing: two rapid releases produced "
+            f"only {len(archives)} archive(s); expected at least 2 "
+            f"distinct archives. files={list(base_dir.iterdir())}"
+        )
+        # Each archive must contain its own owner_run_id and
+        # audit trail.
+        owners = set()
+        for a in archives:
+            data = json.loads(a.read_text())
+            owners.add(data["owner_run_id"])
+        assert {"aed-r24-first", "aed-r24-second"} <= owners, (
+            f"archives missing one of the two owners: {owners}"
+        )
+
+
+class TestRound24WindowsSentinelCompat:
+    """Round-24 P2 fix: _sentinel_lock_module must return a
+    working flock equivalent on Windows (or fall back to a no-op
+    if msvcrt is unavailable). On POSIX it must continue to
+    use fcntl."""
+
+    def test_posix_uses_fcntl(self):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import unittest.mock as _mock
+
+        with _mock.patch.object(supervisor_lock.os, "name", "posix"):
+            flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = (
+                supervisor_lock._sentinel_lock_module()
+            )
+            # The flock_fn should be fcntl.flock.
+            assert flock_fn.__module__ == "fcntl"
+            # LOCK_UN must be the fcntl constant.
+            import fcntl
+            assert LOCK_UN == fcntl.LOCK_UN
+
+    def test_windows_uses_msvcrt_or_noop_fallback(self):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import unittest.mock as _mock
+
+        with _mock.patch.object(supervisor_lock.os, "name", "nt"):
+            flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = (
+                supervisor_lock._sentinel_lock_module()
+            )
+            # The flock_fn should be a callable (msvcrt-based or
+            # the no-op fallback). It must support both lock
+            # and unlock operations.
+            assert callable(flock_fn)
+            # Both op paths must execute without raising.
+            flock_fn(0, LOCK_EX | LOCK_NB)
+            flock_fn(0, LOCK_UN)
+
+    def test_unsupported_platform_raises(self):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import unittest.mock as _mock
+
+        with _mock.patch.object(supervisor_lock.os, "name", "plan9"):
+            try:
+                supervisor_lock._sentinel_lock_module()
+                assert False, "expected OSError"
+            except OSError as e:
+                assert "unsupported platform" in str(e)

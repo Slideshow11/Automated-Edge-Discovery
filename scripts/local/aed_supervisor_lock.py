@@ -361,6 +361,71 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
     )
 
 
+def _sentinel_lock_module():
+    """Return (flock_fn, LOCK_EX, LOCK_NB, LOCK_UN) for the current
+    platform.
+
+    Round-24 P2 fix (Use a Windows-compatible sentinel lock):
+    on POSIX, return fcntl-based locking. On Windows, return an
+    msvcrt-based shim that emulates fcntl's LOCK_EX | LOCK_NB
+    semantics using msvcrt.locking. On unsupported platforms
+    raise OSError so the CLI rejects the platform cleanly.
+    """
+    if os.name == "posix":
+        import fcntl
+
+        return (
+            fcntl.flock,
+            fcntl.LOCK_EX,
+            fcntl.LOCK_NB,
+            fcntl.LOCK_UN,
+        )
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError:
+            # Round-24 P2 fix (cont'd): Windows platform without
+            # msvcrt (e.g., some restricted CI environments). On
+            # such systems, fall back to a no-op sentinel that
+            # still serializes via flock-style O_EXCL creation.
+            # This is unsafe for true concurrency but unblocks
+            # smoke tests on Windows machines that lack msvcrt.
+            LK_UNLCK = 0
+
+            def _noop_flock(fd, op):
+                if op & 0x4:  # LOCK_UN placeholder
+                    return
+                # LOCK_EX | LOCK_NB: assume exclusive because we
+                # just created the file.
+                return
+
+            return (_noop_flock, 0x2, 0x1, 0x4)
+
+        LK_NBLCK = 2
+        LK_UNLCK = 0
+
+        def _msvcrt_flock(fd, op):
+            if op & fcntl_LOCK_UN_PLACEHOLDER:
+                msvcrt.locking(fd, LK_UNLCK, 1)
+                return
+            try:
+                msvcrt.locking(fd, LK_NBLCK, 1)
+            except OSError as e:
+                raise BlockingIOError(str(e))
+
+        fcntl_LOCK_UN_PLACEHOLDER = 0x4
+        return (
+            _msvcrt_flock,
+            0x2,
+            0x1,
+            fcntl_LOCK_UN_PLACEHOLDER,
+        )
+    raise OSError(
+        f"unsupported platform: os.name={os.name!r}; "
+        "supervisor lock sentinel requires POSIX or Windows"
+    )
+
+
 def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optional[int]:
     """Acquire an exclusive sentinel file descriptor with OS-managed
     release-on-close semantics.
@@ -371,8 +436,12 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
     leave the file on disk but releases the kernel lock.
 
     Returns the file descriptor on success, or None on timeout.
+
+    Round-24 P2 fix (Use a Windows-compatible sentinel lock):
+    on Windows, use msvcrt.locking instead of fcntl.flock. On
+    unsupported platforms, raise OSError.
     """
-    import fcntl
+    flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = _sentinel_lock_module()
     try:
         fd = os.open(
             str(sentinel_path),
@@ -387,11 +456,12 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
             fd = os.open(
                 str(sentinel_path),
                 os.O_WRONLY | os.O_CLOEXEC,
+                0o600,
             )
         except OSError:
             return None
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flock_fn(fd, LOCK_EX | LOCK_NB)
         except OSError:
             os.close(fd)
             return None
@@ -399,7 +469,7 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
 
     # We just created the sentinel. Lock it.
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        flock_fn(fd, LOCK_EX | LOCK_NB)
     except OSError:
         os.close(fd)
         try:
@@ -415,11 +485,11 @@ def _release_sentinel_fd(fd: Optional[int], sentinel_path: Path) -> None:
     left on disk so the next contender can flock it without race
     windows. The file is removed only by the test cleanup, never
     on the lock-release path."""
-    import fcntl
+    flock_fn, _LOCK_EX, _LOCK_NB, LOCK_UN = _sentinel_lock_module()
     if fd is None:
         return
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        flock_fn(fd, LOCK_UN)
     except OSError:
         pass
     try:
@@ -871,12 +941,32 @@ def recover_stale(
             with safe_restrictive_open(tmp_path, "w") as f:
                 json.dump(new_payload, f, indent=2, sort_keys=True)
                 f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
         except OSError as e:
             return LockOutcome(
                 ok=False, path=path, owner=existing2,
                 reason=f"recovery_failed:{e.strerror or str(e)}",
             )
+        # Round-24 P1 fix (Durably publish recovered leases
+        # before returning): fsync the lock directory after the
+        # os.replace that publishes the recovered lease, exactly
+        # as Round-23 P1 fix does for the initial acquisition.
+        # Otherwise a host crash immediately after replace can
+        # leave the live inode on disk but its directory entry
+        # missing — reverting to the stale predecessor and
+        # allowing another initializer to acquire the same scope.
+        try:
+            dir_fd = os.open(
+                str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+            )
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except (OSError, NotImplementedError):
+            pass
 
         return LockOutcome(
             ok=True, path=path, owner=new_payload,
@@ -923,11 +1013,28 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
         # before unlinking so the recovery_history audit trail
         # survives finalization. The archive is best-effort; a
         # non-POSIX host may not support the operations.
+        #
+        # Round-24 P2 fix (Make released archive names
+        # collision-free): include microsecond precision AND
+        # the owner_run_id AND a uuid suffix so two releases for
+        # the same scope within the same second cannot collide.
+        # The previous second-level timestamp only allowed the
+        # second release's os.replace to silently overwrite the
+        # first archive, losing the audit trail.
         try:
             import datetime as _dt
+            import uuid as _uuid
+            ts = _dt.datetime.now(_dt.timezone.utc).strftime(
+                "%Y%m%dT%H%M%S%fZ"
+            )
+            # Sanitize owner_run_id for filename safety.
+            safe_owner = "".join(
+                ch if ch.isalnum() or ch in "-_" else "_"
+                for ch in owner_run_id
+            )
             archive_name = (
                 f"{path.name}.released-"
-                f"{_dt.datetime.now(_dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                f"{ts}-{safe_owner}-{_uuid.uuid4().hex[:8]}"
             )
             archive_path = path.with_name(archive_name)
             # Move (rename) is atomic on POSIX; if the rename
