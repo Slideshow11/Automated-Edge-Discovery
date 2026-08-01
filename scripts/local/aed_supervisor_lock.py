@@ -58,7 +58,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from scripts.local.aed_run_identity import (
     _utcnow,
@@ -583,8 +583,31 @@ def _check_cross_scope_conflict(
             try:
                 with open(entry) as f:
                     data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
+            except (OSError, json.JSONDecodeError) as e:
+                # Round-34 P2 fix (Fail closed on unreadable
+                # cross-scope leases): an unreadable or
+                # malformed .lock.json for the same
+                # repository may represent an interrupted or
+                # damaged active lease. The same-scope path
+                # already treats a corrupt lease as
+                # `corrupt_existing_lease_recovery_required`;
+                # bypassing that check only during the
+                # cross-scope scan admits overlapping
+                # repository mutations, including an
+                # already-authorized operation from the
+                # narrower run. Return an indeterminate
+                # conflict that requires explicit recovery
+                # instead of continuing.
+                return LockOutcome(
+                    ok=False,
+                    path=entry,
+                    owner=None,
+                    reason=(
+                        f"corrupt_cross_scope_lease_recovery_required:"
+                        f"{type(e).__name__}"
+                    ),
+                    indeterminate=True,
+                )
             entry_scope = data.get("scope") or {}
             if (entry_scope.get("repository") or "").lower() != repository.lower():
                 continue
@@ -1225,6 +1248,44 @@ def is_lease_held_by_run(
     This acquires the recovery sentinel so the check is
     race-free with respect to recover_stale and release.
     """
+    held, sentinel_fd, sentinel_path = check_lease_held_keeping_sentinel(
+        scope=scope, owner_run_id=owner_run_id, base_dir=base_dir,
+    )
+    if sentinel_fd is not None:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+    return held
+
+
+def check_lease_held_keeping_sentinel(
+    *,
+    scope: dict,
+    owner_run_id: str,
+    base_dir: Optional[Path] = None,
+) -> Tuple[bool, Optional[int], Optional[Path]]:
+    """Same as is_lease_held_by_run but returns the sentinel fd
+    so the caller can keep it held through a subsequent
+    authorize-mutation. The caller is responsible for
+    releasing the sentinel when done.
+
+    Returns (held, sentinel_fd, sentinel_path). If held is
+    True, sentinel_fd is non-None and must be released. If
+    held is False, sentinel_fd may still be non-None (the
+    sentinel was acquired to perform the check) and must
+    also be released.
+
+    Round-34 P1 fix (Hold the scope sentinel through
+    authorization): the previous is_lease_held_by_run
+    released the recovery sentinel before the caller
+    called _mutation_auth.authorize. A concurrent
+    recover_stale could transfer the lease in that gap,
+    allowing this invocation to continue using its
+    previously-loaded active state and durably authorize a
+    mutation for the former owner. By keeping the
+    sentinel held through the journal append, the
+    authorize-mutation and recover_stale paths become
+    mutually exclusive — exactly the property the
+    recovery sentinel was designed to provide.
+    """
     scope_key = build_scope_key(
         repository=scope["repository"],
         target_pr_number=scope.get("target_pr_number"),
@@ -1234,19 +1295,24 @@ def is_lease_held_by_run(
     sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
     sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
     if sentinel_fd is None:
-        return False
-    try:
-        existing = _read_lock(path)
-        if existing is None:
-            return False
-        if existing.get("owner_run_id") != owner_run_id:
-            return False
-        live = assess_liveness(existing)
-        if live.is_indeterminate:
-            return False
-        return bool(live.is_alive)
-    finally:
+        return False, None, sentinel_path
+    existing = _read_lock(path)
+    if existing is None:
         _release_sentinel_fd(sentinel_fd, sentinel_path)
+        return False, None, None
+    if existing.get("owner_run_id") != owner_run_id:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+        return False, None, None
+    live = assess_liveness(existing)
+    if live.is_indeterminate:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+        return False, None, None
+    if not live.is_alive:
+        _release_sentinel_fd(sentinel_fd, sentinel_path)
+        return False, None, None
+    # Held — return the sentinel so the caller can keep it
+    # held through authorize-mutation.
+    return True, sentinel_fd, sentinel_path
 
 
 def read(path: Path) -> Optional[dict]:
