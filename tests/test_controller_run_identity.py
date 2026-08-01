@@ -1741,18 +1741,28 @@ class TestRound8PreInitRecovery:
             base_dir=lock_base,
         )
         path.write_text("")
+        # Round-38 P1 fix: --workspace is now required for
+        # standalone recovery (the replacement state path
+        # is derived from it).
+        from pathlib import Path as _P
+        workspace = _P(__file__).parent.parent / ".hermes" / "r38-tmp-ws"
+        workspace.mkdir(parents=True, exist_ok=True)
         rc, out, err = run_controller([
             "recover-stale-lock",
             "--staleness-evidence", "PID 999999 dead",
             "--recovered-run-id", "r-new-replacement",
             "--repository", scope["repository"],
             "--target-pr-number", str(scope["target_pr_number"]),
+            "--workspace", str(workspace),
         ])
         assert rc == 0, f"unexpected rc={rc}, stderr={err}, stdout={out}"
         assert "Recovered stale lock" in out
         payload = json.loads(path.read_text())
         assert payload["owner_run_id"] == "r-new-replacement"
-        assert payload.get("owner_state_path") is None
+        # The recovered_state_path is now derived from
+        # --workspace (Round-38 P1 fix).
+        assert payload.get("owner_state_path") is not None
+        assert payload["owner_state_path"].endswith("CONTROLLER_STATE.json")
 
     def test_recover_without_scope_flags_fails(self, scope, lock_base, isolated_lock_dir):
         self._plant_stale_lock(scope, lock_base)
@@ -1760,6 +1770,12 @@ class TestRound8PreInitRecovery:
             "recover-stale-lock",
             "--staleness-evidence", "PID 999999 dead",
             "--recovered-run-id", "r-new",
+            # Round-38 P1 fix: --workspace is now required
+            # for standalone recovery. Without --repository
+            # (or --state) the controller fails with rc=6
+            # "no repository scope available" before
+            # reaching the workspace-derived path check.
+            "--workspace", "/tmp/aed-r38-no-scope",
         ])
         assert rc == 6, f"expected exit 6 (no scope), got {rc}: {err}"
 
@@ -5604,6 +5620,88 @@ class TestRound37FailClosedOnAdoptionTokenOSError:
             "sys.exit(15) call (should be >=4: two OSError "
             "+ two FileExistsError)"
         )
+
+
+class TestRound38StandaloneRecoveryDerivesFromWorkspace:
+    """Round-38 P1 fix: recover-stale-lock without --state
+    AND without --recovered-state-path must derive the
+    replacement state path from --workspace (or fail with
+    rc=8 if no workspace is given either). The previous
+    behavior left recovered_state_path=None, and
+    assess_liveness immediately classified the replacement
+    lease as stale after recovery."""
+
+    def test_standalone_recovery_uses_workspace_for_state_path(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Plant a stale lock.
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 941,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r38-predecessor",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "predecessor" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        workspace = tmp_path / "replacement-ws"
+        rc, _, err = run_controller(
+            [
+                "recover-stale-lock",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "941",
+                "--recovered-run-id", "aed-r38-replacement",
+                "--workspace", str(workspace),
+                "--staleness-evidence", "stale_lock_detected:...",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, (
+            f"Round-38 P1 fix missing: standalone recovery "
+            f"failed, got rc={rc}, err={err}"
+        )
+        # The recovered lease must bind to
+        # <workspace>/CONTROLLER_STATE.json (NOT None).
+        with open(path) as f:
+            recovered = json.load(f)
+        assert recovered.get("owner_state_path") is not None, (
+            "Round-38 P1 fix missing: owner_state_path is None; "
+            "Round-38 should derive it from --workspace"
+        )
+        assert recovered["owner_state_path"].endswith(
+            "CONTROLLER_STATE.json"
+        )
+        assert str(workspace) in recovered["owner_state_path"]
 
 
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:

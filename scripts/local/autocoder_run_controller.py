@@ -3836,6 +3836,28 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         recovered_run_id = args.recovered_run_id
         if getattr(args, "recovered_state_path", None):
             recovered_state_path = str(Path(args.recovered_state_path).resolve())
+        # Round-38 P1 fix (Require a state path for standalone
+        # recovery): if neither --state nor --recovered-state-path
+        # is given, derive the replacement state path from the
+        # --workspace flag (the operator-supplied replacement
+        # workspace). Without this fallback, recovered_state_path
+        # remains None, and assess_liveness classifies the
+        # replacement lease as stale immediately after recovery,
+        # while ordinary init cannot adopt it. Require the
+        # fallback OR fail with rc=8 if no workspace was given
+        # either.
+        elif getattr(args, "workspace", None):
+            recovered_state_path = str(
+                Path(args.workspace).resolve() / "CONTROLLER_STATE.json"
+            )
+        else:
+            print(
+                "ERROR: recover-stale-lock without --state requires "
+                "either --recovered-state-path or --workspace to "
+                "derive the replacement state path.",
+                file=sys.stderr,
+            )
+            sys.exit(8)
 
     # Apply CLI overrides for scope (in case legacy state scope
     # was empty but CLI flags give us the scope).
