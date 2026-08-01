@@ -698,6 +698,20 @@ def _init(args: argparse.Namespace) -> None:
             and lock_outcome.reason.startswith("live_lock_held_by:")
             and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
             and str((lock_outcome.owner or {}).get("owner_state_path") or "") == str(Path(out_path).resolve())
+            # Round-27 P1 fix (Require recovery provenance
+            # before adopting a live lease): only adopt a
+            # lease that is demonstrably from the recovery
+            # workflow. A live lease held by the same run_id
+            # could be a regular `init`-created lease (in
+            # which case the second init is a re-initialization
+            # attempt that would overwrite progress) or a
+            # `recover-stale-lock`-created lease (in which
+            # case adoption is the documented recovery
+            # workflow). Distinguish them by checking
+            # recovery_history: recover_stale always populates
+            # it; normal try_acquire leaves it empty (or
+            # absent).
+            and ((lock_outcome.owner or {}).get("recovery_history") or [])
         ):
             # Round-21 P2 fix (Adopt leases created by the recovery
             # command): when an operator has previously run
@@ -745,6 +759,9 @@ def _init(args: argparse.Namespace) -> None:
             )
             and (lock_outcome.owner or {}).get("owner_run_id") == args.run_id
             and str((lock_outcome.owner or {}).get("owner_state_path") or "") == str(Path(out_path).resolve())
+            # Round-27 P1 fix: also require recovery provenance
+            # for the indeterminate-state branch.
+            and ((lock_outcome.owner or {}).get("recovery_history") or [])
         ):
             # Round-21 P2 fix (continued): when the recovery
             # command leaves the lease in the indeterminate

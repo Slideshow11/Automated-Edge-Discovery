@@ -361,6 +361,21 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
     )
 
 
+def _posix_cloexec_flag() -> int:
+    """Return os.O_CLOEXEC when available, else 0.
+
+    Round-27 P2 fix (Omit the Unix-only flag from Windows
+    sentinel opens): os.O_CLOEXEC is Unix-only and raises
+    AttributeError on Windows. The sentinel lock open sites
+    previously used os.O_CLOEXEC unconditionally; the Round-24
+    Windows lock report fixed the locking backend but left
+    the open flags unrepaired. This helper mirrors the
+    conditional inclusion that _save_state now does in the
+    controller.
+    """
+    return getattr(os, "O_CLOEXEC", 0)
+
+
 def _sentinel_lock_module():
     """Return (flock_fn, LOCK_EX, LOCK_NB, LOCK_UN) for the current
     platform.
@@ -442,10 +457,11 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
     unsupported platforms, raise OSError.
     """
     flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = _sentinel_lock_module()
+    cloexec = _posix_cloexec_flag()
     try:
         fd = os.open(
             str(sentinel_path),
-            os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC,
+            os.O_WRONLY | os.O_CREAT | cloexec,
             0o600,
         )
     except FileExistsError:
@@ -455,7 +471,7 @@ def _acquire_sentinel_fd(sentinel_path: Path, max_attempts: int = 20) -> Optiona
         try:
             fd = os.open(
                 str(sentinel_path),
-                os.O_WRONLY | os.O_CLOEXEC,
+                os.O_WRONLY | cloexec,
                 0o600,
             )
         except OSError:
@@ -660,7 +676,7 @@ def try_acquire(
                 # lock directory before reporting acquisition.
                 try:
                     dir_fd = os.open(
-                        str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                        str(path.parent), os.O_RDONLY | _posix_cloexec_flag()
                     )
                     try:
                         os.fsync(dir_fd)
@@ -959,7 +975,7 @@ def recover_stale(
         # allowing another initializer to acquire the same scope.
         try:
             dir_fd = os.open(
-                str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                str(path.parent), os.O_RDONLY | _posix_cloexec_flag()
             )
             try:
                 os.fsync(dir_fd)
@@ -1062,7 +1078,7 @@ def release(*, scope: dict, owner_run_id: str, base_dir: Optional[Path] = None) 
             # fsync the parent directory before returning.
             try:
                 dir_fd = os.open(
-                    str(path.parent), os.O_RDONLY | os.O_CLOEXEC
+                    str(path.parent), os.O_RDONLY | _posix_cloexec_flag()
                 )
                 try:
                     os.fsync(dir_fd)

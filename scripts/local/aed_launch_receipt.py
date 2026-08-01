@@ -13,6 +13,7 @@ and contain no secrets.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -60,6 +61,22 @@ def build_machine_readable(
 def write_machine_readable(path: Path, payload: dict) -> None:
     assert_no_secrets(payload, context=str(path))
     write_restrictive_json(path, payload)
+    # Round-27 P1 fix (Durably publish the machine launch
+    # receipt, continued): fsync the parent directory so the
+    # directory entry update is durable across a host crash.
+    # Without this, a power loss immediately after the
+    # descriptor fsync can leave the file on disk but its
+    # directory entry missing.
+    try:
+        dir_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, NotImplementedError, AttributeError):
+        pass
 
 
 def build_human_readable(

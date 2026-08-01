@@ -333,6 +333,19 @@ def write_restrictive_json(path: Path, payload: Any) -> None:
     with safe_restrictive_open(path, "w") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write("\n")
+        f.flush()
+        # Round-27 P1 fix (Durably publish the machine launch
+        # receipt): fsync the file descriptor before
+        # closing. The write_restrictive_json path is used by
+        # the launch receipt's write_machine_readable, and
+        # authorize-mutation later requires a readable
+        # LAUNCH_RECEIPT.json to gate mutations. If the file
+        # does not survive a host crash, the recovered state
+        # cannot authorize any mutation and there is no
+        # command to recreate the receipt without
+        # reinitializing the run. Fsync the descriptor here
+        # so the file's contents are durable on disk.
+        os.fsync(f.fileno())
 
 
 def file_mode(path: Path) -> Optional[int]:

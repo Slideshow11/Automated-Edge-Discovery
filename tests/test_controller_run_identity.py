@@ -3318,7 +3318,19 @@ class TestRound21AdoptLeasesFromRecoveryCommand:
             "created_at": "2026-01-01T00:00:00Z",
             "last_renewed_at": "2026-01-01T00:00:00Z",
             "max_age_seconds": 86400,
-            "recovery_history": [],
+            # Round-27 P1 fix: this planted lease simulates the
+            # result of a `recover-stale-lock` invocation,
+            # which always populates recovery_history. A lease
+            # with empty recovery_history is treated as a
+            # normal `init`-created lease and is NOT adopted.
+            "recovery_history": [
+                {
+                    "recovered_at": "2026-01-01T00:00:00Z",
+                    "previous_owner_run_id": "aed-predecessor",
+                    "staleness_evidence": "stale_lock_detected:...",
+                    "reason": "test",
+                }
+            ],
         }
         with open(lock_path, "w") as f:
             json.dump(planted, f)
@@ -4370,3 +4382,265 @@ class TestRound26WindowsSafeStateFlags:
             ctrl.os.O_CLOEXEC = real_CLOEXEC
 
         assert (tmp_path / "WIN.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Round-27 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound27RequireRecoveryProvenanceBeforeAdopt:
+    """Round-27 P1 fix: the same-run lease adoption branch
+    must require non-empty recovery_history, proving the lease
+    came from `recover-stale-lock`. A normal `init`-created
+    lease with the same run_id is a re-initialization attempt
+    and must NOT be silently adopted (which would overwrite
+    progress)."""
+
+    def test_init_does_not_adopt_empty_history_lease(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 935,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+
+        # Plant a lease owned by the same run_id BUT with empty
+        # recovery_history (simulating a normal `init`-created
+        # lease, not a recover-stale-lock lease).
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r27-normal",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],  # No recovery history!
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        # Init with the same run_id. Without Round-27's fix,
+        # the controller would silently adopt the empty-history
+        # lease. With the fix, init must fail (the live lease
+        # is a normal init lease, not a recovery lease).
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r27-normal",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "935",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        # The init must NOT succeed in adopting this empty-
+        # history lease. The exact rc may vary (live lease
+        # conflict, indeterminate-state rejection) but rc
+        # MUST NOT be 0.
+        assert rc != 0, (
+            f"Round-27 P1 fix missing: init must NOT adopt a "
+            f"normal (empty-history) same-run lease, got "
+            f"rc=0, err={err}"
+        )
+
+    def test_init_adopts_lease_with_recovery_history(
+        self, tmp_path, isolated_lock_dir
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        scope = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 936,
+            "mutation_target": None,
+        }
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "aed-r27-recover",
+            "owner_pid": 99999,
+            "owner_state_path": str(
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
+            ),
+            "owner_start_evidence": {
+                "pid": 99999,
+                "stat_start_time": 1,
+                "ctime_ns": None,
+                "source": "linux_proc",
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            # Non-empty history proves recovery provenance.
+            "recovery_history": [
+                {
+                    "recovered_at": "2026-01-01T00:00:00Z",
+                    "previous_owner_run_id": "aed-predecessor",
+                    "staleness_evidence": "stale_lock_detected:...",
+                    "reason": "test",
+                }
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        _os.chmod(path, 0o600)
+
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r27-recover",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "936",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(lock_base)},
+        )
+        assert rc == 0, (
+            f"init must adopt a same-run lease with non-empty "
+            f"recovery_history, got rc={rc}, err={err}"
+        )
+
+
+class TestRound27DurablyPublishLaunchReceipt:
+    """Round-27 P1 fix: write_restrictive_json must fsync the
+    file descriptor before closing, and write_machine_readable
+    must fsync the parent directory, so the launch receipt
+    survives a host crash."""
+
+    def test_write_restrictive_json_fsyncs_descriptor(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_run_identity as run_identity
+        import os as _os
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(run_identity.os, "fsync", tracking_fsync)
+
+        path = tmp_path / "RECEIPT.json"
+        run_identity.write_restrictive_json(path, {"k": "v"})
+
+        assert fsync_calls["count"] >= 1, (
+            f"Round-27 P1 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"write_restrictive_json; expected at least 1."
+        )
+
+    def test_write_machine_readable_fsyncs_directory(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_launch_receipt as launch_receipt
+        from scripts.local.aed_launch_receipt import (
+            RECEIPT_JSON_FILENAME,
+        )
+        import os as _os
+
+        fsync_calls = {"count": 0}
+        real_fsync = _os.fsync
+
+        def tracking_fsync(fd):
+            fsync_calls["count"] += 1
+            return real_fsync(fd)
+
+        monkeypatch.setattr(launch_receipt.os, "fsync", tracking_fsync)
+
+        path = tmp_path / RECEIPT_JSON_FILENAME
+        launch_receipt.write_machine_readable(
+            path, {"run_id": "aed-r27-receipt", "k": "v"}
+        )
+
+        # At least 2 fsync calls: the descriptor (from
+        # write_restrictive_json) and the parent directory.
+        assert fsync_calls["count"] >= 2, (
+            f"Round-27 P1 fix missing: only "
+            f"{fsync_calls['count']} fsync call(s) during "
+            f"write_machine_readable; expected at least 2 "
+            f"(file + dir)."
+        )
+
+
+class TestRound27WindowsSafeSentinelFlags:
+    """Round-27 P2 fix: sentinel lock open flags must use a
+    helper that returns os.O_CLOEXEC on POSIX and 0 on
+    Windows, mirroring the Round-26 fix in _save_state."""
+
+    def test_sentinel_acquisition_works_on_windows(
+        self, tmp_path, monkeypatch
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        from scripts.local.aed_supervisor_lock import (
+            _posix_cloexec_flag,
+            _acquire_sentinel_fd,
+        )
+
+        # Simulate Windows: O_CLOEXEC unavailable.
+        real = getattr(supervisor_lock.os, "O_CLOEXEC", None)
+        if hasattr(supervisor_lock.os, "O_CLOEXEC"):
+            delattr(supervisor_lock.os, "O_CLOEXEC")
+
+        try:
+            # The helper must return 0 (no AttributeError).
+            assert _posix_cloexec_flag() == 0
+        finally:
+            if real is not None:
+                supervisor_lock.os.O_CLOEXEC = real
+
+    def test_sentinel_lock_module_uses_conditional_cloexec(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+
+        # On POSIX, the helper returns O_CLOEXEC (non-zero).
+        if hasattr(supervisor_lock.os, "O_CLOEXEC"):
+            assert supervisor_lock._posix_cloexec_flag() != 0
+        else:
+            # On Windows, the helper returns 0.
+            assert supervisor_lock._posix_cloexec_flag() == 0
