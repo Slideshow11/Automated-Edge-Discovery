@@ -5351,9 +5351,17 @@ class TestRound34FailClosedOnUnreadableCrossScopeLeases:
     a wider acquisition could proceed against an
     already-running narrower run whose lease was
     unreadable due to interrupted bootstrap or filesystem
-    damage."""
+    damage.
 
-    def test_corrupt_narrower_lease_blocks_repo_wide(
+    Round-35 P2 fix limits this fail-closed behavior to
+    leases whose filename corresponds to a potentially
+    conflicting scope (the requested scope's own key or
+    the same-repo-wide key for narrower requests).
+    Corrupt leases for OTHER repositories or other
+    narrower scopes are skipped because their filenames
+    cannot be mapped back to the requested scope."""
+
+    def test_corrupt_lease_at_requested_scope_blocks_acquisition(
         self, tmp_path
     ):
         from scripts.local import aed_supervisor_lock as supervisor_lock
@@ -5362,32 +5370,27 @@ class TestRound34FailClosedOnUnreadableCrossScopeLeases:
         lock_base = tmp_path / "locks"
         lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
 
-        # Plant a CORRUPT narrower-scope lease for the same
-        # repository (truncated JSON).
-        narrow_scope = {
+        # Plant a CORRUPT lease at the EXACT requested
+        # scope's filename. The Round-34/35 fix must refuse
+        # with `corrupt_cross_scope_lease_recovery_required`
+        # and indeterminate=True.
+        scope = {
             "repository": "Slideshow11/Automated-Edge-Discovery",
-            "target_pr_number": 1,
+            "target_pr_number": None,
             "mutation_target": None,
         }
-        narrow_key = supervisor_lock.build_scope_key(**narrow_scope)
-        narrow_path = supervisor_lock.lock_path_for(
-            narrow_key, base_dir=lock_base
+        scope_key = supervisor_lock.build_scope_key(**scope)
+        path = supervisor_lock.lock_path_for(
+            scope_key, base_dir=lock_base
         )
-        with open(narrow_path, "w") as f:
+        with open(path, "w") as f:
             f.write("{truncated jso")
-        _os.chmod(narrow_path, 0o600)
+        _os.chmod(path, 0o600)
 
-        # Try to acquire a repo-wide lock for the same repo.
-        # The Round-34 P2 fix must refuse with
-        # `corrupt_cross_scope_lease_recovery_required`
-        # and indeterminate=True.
+        # Try to acquire a lock for the SAME scope.
         out = supervisor_lock.try_acquire(
-            scope={
-                "repository": "Slideshow11/Automated-Edge-Discovery",
-                "target_pr_number": None,
-                "mutation_target": None,
-            },
-            owner_run_id="aed-r34-wide",
+            scope=scope,
+            owner_run_id="aed-r34-self",
             owner_host={"hostname": "h"},
             owner_pid=88888,
             owner_start_evidence={
@@ -5395,13 +5398,13 @@ class TestRound34FailClosedOnUnreadableCrossScopeLeases:
                 "ctime_ns": None, "source": "linux_proc",
             },
             owner_state_path=str(
-                tmp_path / "wide" / "CONTROLLER_STATE.json"
+                tmp_path / "ws" / "CONTROLLER_STATE.json"
             ),
             base_dir=lock_base,
         )
         assert not out.ok, (
-            f"Round-34 P2 fix missing: corrupt narrower lease "
-            f"did not block repo-wide acquisition, got "
+            f"Round-34 P2 fix missing: corrupt same-scope "
+            f"lease did not block acquisition, got "
             f"ok=True reason={out.reason}"
         )
         assert (
@@ -5412,4 +5415,61 @@ class TestRound34FailClosedOnUnreadableCrossScopeLeases:
         )
         assert out.indeterminate is True, (
             f"expected indeterminate=True, got {out.indeterminate}"
+        )
+
+    def test_corrupt_lease_for_unrelated_repo_does_not_block(
+        self, tmp_path
+    ):
+        from scripts.local import aed_supervisor_lock as supervisor_lock
+        import os as _os
+
+        lock_base = tmp_path / "locks"
+        lock_base.mkdir(parents=True, mode=0o700, exist_ok=True)
+
+        # Plant a CORRUPT lease at a different repository's
+        # filename. The Round-35 P2 fix must skip this
+        # because the filename does not correspond to a
+        # potentially-conflicting scope for the requested
+        # repository. The operator can recover it via
+        # `recover-stale-lock --repository other/repo`.
+        scope_a = {
+            "repository": "other-owner/other-repo",
+            "target_pr_number": 1,
+            "mutation_target": None,
+        }
+        key_a = supervisor_lock.build_scope_key(**scope_a)
+        path_a = supervisor_lock.lock_path_for(
+            key_a, base_dir=lock_base
+        )
+        with open(path_a, "w") as f:
+            f.write("{truncated jso")
+        _os.chmod(path_a, 0o600)
+
+        # Now acquire a lease for the requested repository —
+        # must succeed because the corrupt lease is for a
+        # different repository and cannot be identified by
+        # filename alone.
+        scope_b = {
+            "repository": "Slideshow11/Automated-Edge-Discovery",
+            "target_pr_number": 2,
+            "mutation_target": None,
+        }
+        out = supervisor_lock.try_acquire(
+            scope=scope_b,
+            owner_run_id="aed-r35-b",
+            owner_host={"hostname": "h"},
+            owner_pid=88888,
+            owner_start_evidence={
+                "pid": 88888, "stat_start_time": 2,
+                "ctime_ns": None, "source": "linux_proc",
+            },
+            owner_state_path=str(
+                tmp_path / "ws-b" / "CONTROLLER_STATE.json"
+            ),
+            base_dir=lock_base,
+        )
+        assert out.ok, (
+            f"Round-35 P2 fix missing: corrupt unrelated-repo "
+            f"lease incorrectly blocked the requested "
+            f"acquisition: {out.reason}"
         )

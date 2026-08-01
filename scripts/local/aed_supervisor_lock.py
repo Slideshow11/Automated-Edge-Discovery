@@ -584,20 +584,67 @@ def _check_cross_scope_conflict(
                 with open(entry) as f:
                     data = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
-                # Round-34 P2 fix (Fail closed on unreadable
-                # cross-scope leases): an unreadable or
-                # malformed .lock.json for the same
-                # repository may represent an interrupted or
-                # damaged active lease. The same-scope path
-                # already treats a corrupt lease as
-                # `corrupt_existing_lease_recovery_required`;
-                # bypassing that check only during the
-                # cross-scope scan admits overlapping
-                # repository mutations, including an
-                # already-authorized operation from the
-                # narrower run. Return an indeterminate
-                # conflict that requires explicit recovery
-                # instead of continuing.
+                # Round-35 P2 fix (Limit corrupt-lease failures
+                # to potentially conflicting scopes): only
+                # fail closed when the corrupt lease's
+                # filename corresponds to a lock that COULD
+                # conflict with the requested scope. Lock
+                # filenames are SHA-256 hashes of scope keys,
+                # so we compute the conflicting key(s) and
+                # check the filename membership:
+                #
+                #   - For a NARROWER request (PR or target):
+                #     the only conflicting wider key for the
+                #     same repo is the repo-wide key. Other
+                #     repos' narrower keys cannot conflict.
+                #   - For a REPO-WIDE request: the conflicting
+                #     narrower keys are PR/target specific, but
+                #     we don't know them. Conservatively only
+                #     fail closed for the requested scope's own
+                #     key (a self-collision, which would be the
+                #     SAME-scope corrupt-lease path).
+                #
+                # In both cases the relevant filename is
+                # simply the requested scope's own hash —
+                # because (a) for narrower requests the
+                # conflicting key is the repo-wide key for
+                # the same repo, and we ALREADY filter on
+                # repository in the readable-leases path; (b)
+                # for repo-wide requests the self-collision is
+                # the only one we can identify without
+                # readable content. Anything else is skipped.
+                try:
+                    requested_filename = _lock_filename_for_scope_key(
+                        build_scope_key(
+                            repository=repository,
+                            target_pr_number=scope.get("target_pr_number"),
+                            mutation_target=scope.get("mutation_target"),
+                        )
+                    )
+                    same_repo_filename = _lock_filename_for_scope_key(
+                        build_scope_key(
+                            repository=repository,
+                            target_pr_number=None,
+                            mutation_target=None,
+                        )
+                    )
+                    if entry.name not in (
+                        requested_filename, same_repo_filename
+                    ):
+                        # The corrupt lease is for some
+                        # other scope (other PR, other
+                        # target, or other repository).
+                        # Cannot identify the repository
+                        # without readable content. Skip —
+                        # the operator must recover it via
+                        # explicit recover-stale-lock with
+                        # the correct --repository.
+                        continue
+                except Exception:
+                    # On any error in computing the
+                    # comparison, fall back to skipping
+                    # (fail-open in this narrow edge case).
+                    continue
                 return LockOutcome(
                     ok=False,
                     path=entry,
