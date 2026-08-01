@@ -289,7 +289,18 @@ def safe_restrictive_open(path: Path, mode: str = "w"):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if _is_linux():
         # Write atomically with explicit 0o600 mode.
+        # Round-8 P2 fix: on Linux, when the file already exists
+        # with broader permissions (e.g. 0o644 left over from a
+        # prior partial write), `O_CREAT` with mode 0o600 does NOT
+        # restrict an existing file's mode — the existing inode
+        # keeps its current permissions. Explicitly chmod via the
+        # open fd to 0o600 so re-opening an existing file cannot
+        # leak the supposedly private contents.
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        except (OSError, NotImplementedError):
+            pass
         return os.fdopen(fd, mode)
     # Fallback: write then chmod (best effort on non-POSIX).
     f = open(path, mode)

@@ -1378,6 +1378,7 @@ class TestControllerStaleLockRecovery:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
             "--workspace", str(workspace),
             "--staleness-evidence", "PID 999999 not running per os.kill signal 0",
+            "--recovered-run-id", "aed-stale-1",
         ])
         assert rc == 0, f"unexpected rc={rc}, stderr={err}, stdout={out}"
         assert "Recovered stale lock" in out
@@ -1466,3 +1467,244 @@ class TestControllerStaleLockRecovery:
         ])
         assert rc == 10
         assert "not active" in err.lower() or "RUN_COMPLETE" in err
+
+
+# ---------------------------------------------------------------------------
+# Round-8 hardening regression tests.
+# ---------------------------------------------------------------------------
+
+
+class TestRound8ReopenRestrictivePerms:
+    """Finding A: fchmod after open so existing-file perms are restricted."""
+
+    def test_fchmod_restricts_existing_file(self, workspace):
+        from scripts.local import aed_run_identity as ri
+        p = workspace / "rewrite_me.json"
+        p.write_text("old content")
+        os.chmod(p, 0o644)
+        with ri.safe_restrictive_open(p, "w") as f:
+            f.write("new content")
+        mode = p.stat().st_mode & 0o777
+        assert mode == 0o600, f"expected 0o600, got {oct(mode)}"
+        assert p.read_text() == "new content"
+
+
+class TestRound8AtomicLeasePublish:
+    """Finding C: atomic lease publication via tmp + os.replace."""
+
+    def test_try_acquire_publishes_atomically(self, scope, proc_evidence_self, host_self, lock_base):
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r1",
+            owner_host=host_self,
+            owner_pid=proc_evidence_self["pid"],
+            owner_start_evidence=proc_evidence_self,
+            base_dir=lock_base,
+        )
+        assert outcome.ok
+        path = supervisor_lock.lock_path_for(
+            supervisor_lock.build_scope_key(
+                repository=scope["repository"],
+                target_pr_number=scope["target_pr_number"],
+                mutation_target=scope["mutation_target"],
+            ),
+            base_dir=lock_base,
+        )
+        data = json.loads(path.read_text())
+        assert data["owner_run_id"] == "r1"
+        assert not path.with_suffix(path.suffix + ".new").exists()
+
+    def test_corrupt_existing_lease_refuses_try_acquire(self, scope, host_self, lock_base, tmp_path):
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        path.write_text("{truncated jso")
+        outcome = supervisor_lock.try_acquire(
+            scope=scope,
+            owner_run_id="r-new",
+            owner_host=host_self,
+            owner_pid=99999,
+            owner_start_evidence={
+                "pid": 99999, "stat_start_time": None, "ctime_ns": None, "source": "unknown"
+            },
+            base_dir=lock_base,
+        )
+        assert not outcome.ok
+        assert "corrupt_existing_lease" in outcome.reason
+        assert path.exists()
+
+    def test_recover_stale_replaces_corrupt_lease(
+        self, scope, host_self, lock_base, tmp_path, proc_evidence_self
+    ):
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        # Empty file = corrupt lease from interrupted bootstrap.
+        path.write_text("")
+        outcome = supervisor_lock.recover_stale(
+            scope=scope,
+            recovered_by_run_id="r-new",
+            recovered_by_host=host_self,
+            recovered_by_pid=proc_evidence_self["pid"],
+            recovered_by_start_evidence=proc_evidence_self,
+            recovered_by_state_path=None,
+            staleness_evidence="corrupt lease from interrupted bootstrap",
+            base_dir=lock_base,
+        )
+        assert outcome.ok, f"recovery failed: {outcome.reason}"
+        payload = json.loads(path.read_text())
+        assert payload["owner_run_id"] == "r-new"
+
+
+class TestRound8JournalShortWrite:
+    def test_append_record_succeeds(self, workspace):
+        from scripts.local import aed_mutation_authorization as ma
+        rec = {"mutation_id": "m1", "kind": "test", "x": 1}
+        ma._append_record(workspace, rec)
+        path = workspace / ma.MUTATIONS_FILENAME
+        assert path.exists()
+        lines = [json.loads(line) for line in path.read_text().splitlines()]
+        assert any(r.get("mutation_id") == "m1" for r in lines)
+
+
+class TestRound8ReceiptStatePathBinding:
+
+    def _init_run(self, tmp_path, run_id):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        rc, _, _ = run_controller([
+            "init",
+            "--run-id", run_id,
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "901",
+            "--current-main-sha", "e4ef774",
+            "--starting-target-sha", "c973fa6c",
+        ])
+        assert rc == 0
+        return workspace
+
+    def test_authorize_via_copied_state_at_different_path_is_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        workspace = self._init_run(tmp_path, "aed-r8-copy")
+        copied = tmp_path / "ws-copy" / "CONTROLLER_STATE.json"
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        copied.write_text((workspace / "CONTROLLER_STATE.json").read_text())
+        rc, _, err = run_controller([
+            "authorize-mutation",
+            "--state", str(copied),
+            "--workspace", str(workspace),
+            "--mutation-type", "squash_merge",
+            "--expected-main-sha", "e4ef774",
+            "--expected-target-sha", "c973fa6c",
+            "--pending-action", "merge",
+        ])
+        assert rc == 13, f"expected exit 13 (receipt-state-path binding), got {rc}: {err}"
+        assert "state_path" in err.lower()
+
+
+class TestRound8PreInitRecovery:
+
+    def _plant_stale_lock(self, scope, lock_base):
+        scope_key = supervisor_lock.build_scope_key(
+            repository=scope["repository"],
+            target_pr_number=scope["target_pr_number"],
+            mutation_target=scope["mutation_target"],
+        )
+        path = supervisor_lock.lock_path_for(scope_key, base_dir=lock_base)
+        planted = {
+            "lock_version": 1,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": "r-old",
+            "owner_pid": 999999,
+            "owner_state_path": "/tmp/old.json",
+            "owner_start_evidence": {
+                "pid": 999999, "stat_start_time": 1, "ctime_ns": None, "source": "linux_proc"
+            },
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_renewed_at": "2026-01-01T00:00:00Z",
+            "max_age_seconds": 86400,
+            "recovery_history": [],
+        }
+        with open(path, "w") as f:
+            json.dump(planted, f)
+        return path
+
+    def test_recover_without_state_file_uses_cli_flags(
+        self, scope, host_self, lock_base, isolated_lock_dir
+    ):
+        # Plant a stale lock whose state_path is absent. We use
+        # a corrupt file so the recovery's "skip liveness for
+        # corrupt leases" branch applies, ensuring the test
+        # exercises the bootstrap-recovery path without a state
+        # file at all.
+        path = supervisor_lock.lock_path_for(
+            supervisor_lock.build_scope_key(
+                repository=scope["repository"],
+                target_pr_number=scope["target_pr_number"],
+                mutation_target=scope["mutation_target"],
+            ),
+            base_dir=lock_base,
+        )
+        path.write_text("")
+        rc, out, err = run_controller([
+            "recover-stale-lock",
+            "--staleness-evidence", "PID 999999 dead",
+            "--recovered-run-id", "r-new-replacement",
+            "--repository", scope["repository"],
+            "--target-pr-number", str(scope["target_pr_number"]),
+        ])
+        assert rc == 0, f"unexpected rc={rc}, stderr={err}, stdout={out}"
+        assert "Recovered stale lock" in out
+        payload = json.loads(path.read_text())
+        assert payload["owner_run_id"] == "r-new-replacement"
+        assert payload.get("owner_state_path") is None
+
+    def test_recover_without_scope_flags_fails(self, scope, lock_base, isolated_lock_dir):
+        self._plant_stale_lock(scope, lock_base)
+        rc, _, err = run_controller([
+            "recover-stale-lock",
+            "--staleness-evidence", "PID 999999 dead",
+            "--recovered-run-id", "r-new",
+        ])
+        assert rc == 6, f"expected exit 6 (no scope), got {rc}: {err}"
+
+
+class TestRound8BootstrapRollback:
+
+    def test_init_rollback_when_receipt_md_write_fails(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + "\n")
+        workspace = tmp_path / "ws"
+        receipt_md_dir = workspace / "LAUNCH_RECEIPT.md"
+        receipt_md_dir.mkdir(parents=True, exist_ok=True)
+        rc, _, err = run_controller([
+            "init",
+            "--run-id", "aed-r8-rollback",
+            "--tasks-jsonl", str(tasks),
+            "--workspace", str(workspace),
+            "--integration-branch", "feat/x",
+            "--repository", "Slideshow11/Automated-Edge-Discovery",
+            "--target-pr-number", "902",
+        ])
+        assert rc != 0, f"expected non-zero exit on MD failure, got rc={rc}"
+        assert (workspace / "CONTROLLER_STATE.json").exists() is False, (
+            "state file was not rolled back after MD receipt write failure"
+        )
+        assert (workspace / "LAUNCH_RECEIPT.json").exists() is False, (
+            "JSON receipt was not rolled back after MD receipt write failure"
+        )

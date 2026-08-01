@@ -134,19 +134,45 @@ def _read_all_records(workspace: Path) -> list[dict]:
     return out
 
 
+def _write_full(fd: int, payload: bytes) -> None:
+    """Write the entire payload to fd, retrying as needed and
+    failing closed on short writes.
+
+    Round-8 P2 fix: `os.write` returns the number of bytes
+    written and may be less than the buffer length under
+    disk/quota pressure or with very large payloads. The previous
+    code ignored the return value, leaving a truncated JSON line
+    on disk that the next journal scan fails to parse. Loop
+    until the buffer is exhausted or raise.
+    """
+    view = memoryview(payload)
+    total = 0
+    while total < len(payload):
+        written = os.write(fd, view[total:])
+        if written is None or written <= 0:
+            # 0 indicates nothing written on this call. Try again
+            # in a tight loop bounded by a few attempts to avoid
+            # spinning forever on a pathological fd.
+            raise OSError(
+                f"short_write_progress:fd_returned_{written}_of_{len(payload) - total}"
+            )
+        total += written
+
+
 def _append_record(workspace: Path, record: dict) -> None:
     path = mutations_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     assert_no_secrets(record, context=str(path))
     # Append a single line atomically with restrictive permissions.
     line = json.dumps(record, sort_keys=True) + "\n"
+    payload = line.encode("utf-8")
     fd = os.open(
         str(path),
         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
         0o600,
     )
     try:
-        os.write(fd, line.encode("utf-8"))
+        _write_full(fd, payload)
     finally:
         os.close(fd)
 
@@ -181,6 +207,8 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
         with os.fdopen(fd, "w") as f:
             for line in new_lines:
                 f.write(line + "\n")
+                f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
     except Exception:
         try:

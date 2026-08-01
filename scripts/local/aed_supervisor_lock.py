@@ -144,6 +144,27 @@ def _read_lock(path: Path) -> Optional[dict]:
         return None
 
 
+def _is_corrupt_lock(path: Path) -> bool:
+    """Return True iff `path` exists but its content is not valid JSON.
+
+    Round-8 P1 fix: provides a serialized, fail-closed recovery
+    path for corrupt existing leases. A truncated or empty lock
+    file from a crashed bootstrap is treated as a corrupt lease
+    that recover_stale can replace. Without this, a corrupt file
+    blocks the scope permanently because both _read_lock (returns
+    None) and recover_stale (refuses because existing is None)
+    fail to act.
+    """
+    if not path.exists():
+        return False
+    try:
+        with open(path) as f:
+            json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return True
+    return False
+
+
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -433,28 +454,56 @@ def try_acquire(
     assert_no_secrets(payload, context=str(path))
 
     existing = _read_lock(path)
+    if existing is None and _is_corrupt_lock(path):
+        # Round-8 P1 fix: a corrupt existing lease cannot be
+        # treated as "no lock" — the file exists, was created by
+        # an interrupted prior bootstrap, and would let a new
+        # acquirer overwrite an in-progress lease. Refuse and
+        # require explicit recover_stale() so the operator's
+        # intent is recorded.
+        return LockOutcome(
+            ok=False,
+            path=path,
+            owner=None,
+            reason="corrupt_existing_lease_recovery_required",
+        )
     if existing is None:
-        # No existing lock. Atomically create with O_EXCL.
+        # No existing lock. Round-8 P1 fix: publish atomically.
+        # The previous code did O_EXCL then `json.dump` into the
+        # live fd; a kill between create and close would leave an
+        # empty or truncated lock file that subsequent acquirers
+        # cannot recover. Now: write the complete payload to a
+        # sibling tmp file, then os.replace to publish atomically.
+        # If anything fails, the tmp file is removed and the
+        # scope is left untouched.
+        tmp_path = path.with_suffix(path.suffix + ".new")
         try:
-            fd = os.open(
-                str(path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                0o600,
-            )
-        except FileExistsError:
-            # Race: another process beat us between _read_lock and
-            # open. Re-read and treat as conflict.
-            existing = _read_lock(path)
-            assert existing is not None
+            with safe_restrictive_open(tmp_path, "w") as f:
+                json.dump(payload, f, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.replace(tmp_path, path)
+            except OSError as e:
+                # Failed to atomically publish. Clean up tmp.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return LockOutcome(
+                    ok=False,
+                    path=path,
+                    owner=None,
+                    reason=f"atomic_publish_failed:{e.strerror or str(e)}",
+                )
+        except OSError as e:
             return LockOutcome(
                 ok=False,
                 path=path,
-                owner=existing,
-                reason="lock_exists_after_race",
+                owner=None,
+                reason=f"write_tmp_failed:{e.strerror or str(e)}",
             )
-        with os.fdopen(fd, "w") as f:
-            json.dump(payload, f, indent=2, sort_keys=True)
-            f.write("\n")
         return LockOutcome(ok=True, path=path, owner=payload, reason="acquired")
 
     # Existing lock present. Determine if it's alive.
@@ -529,25 +578,48 @@ def recover_stale(
     sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
 
     existing = _read_lock(path)
+    corrupt_lease = False
     if existing is None:
-        return LockOutcome(
-            ok=False, path=path, owner=None,
-            reason="no_lock_to_recover",
-        )
+        if _is_corrupt_lock(path):
+            # Round-8 P1 fix: a corrupt lease from an interrupted
+            # bootstrap is treated as a stale lease that may be
+            # recovered. Treat the missing owner as the
+            # "previous_owner_run_id" so the recovery_history
+            # records what little we know about the predecessor.
+            existing = {
+                "owner_run_id": "<corrupt_predecessor>",
+                "owner_pid": 0,
+                "owner_host": {},
+                "created_at": "unknown",
+                "lock_version_chain": 0,
+                "recovery_history": [],
+            }
+            corrupt_lease = True
+        else:
+            return LockOutcome(
+                ok=False, path=path, owner=None,
+                reason="no_lock_to_recover",
+            )
+    # After this point existing is always a dict.
 
-    # Verify staleness one more time before reclaiming.
-    evidence = assess_liveness(existing)
-    if evidence.is_indeterminate:
-        return LockOutcome(
-            ok=False, path=path, owner=existing,
-            reason=f"indeterminate_liveness:{evidence.reason}",
-            indeterminate=True,
-        )
-    if evidence.is_alive:
-        return LockOutcome(
-            ok=False, path=path, owner=existing,
-            reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
-        )
+    # Verify staleness one more time before reclaiming. Skip
+    # this for corrupt leases — there is no liveness evidence to
+    # verify; the operator is explicitly reclaiming via this
+    # command, so the staleness evidence they supplied is the
+    # only signal we need.
+    if not corrupt_lease:
+        evidence = assess_liveness(existing)
+        if evidence.is_indeterminate:
+            return LockOutcome(
+                ok=False, path=path, owner=existing,
+                reason=f"indeterminate_liveness:{evidence.reason}",
+                indeterminate=True,
+            )
+        if evidence.is_alive:
+            return LockOutcome(
+                ok=False, path=path, owner=existing,
+                reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
+            )
 
     # Strict CAS: acquire an exclusive sentinel file lock using
     # fcntl.flock so the sentinel self-releases on process death.
@@ -563,13 +635,21 @@ def recover_stale(
             reason="recovery_in_progress_by_other_worker",
         )
     try:
-        # Inside the sentinel, re-read to detect a winner.
+        # Inside the sentinel, re-read to detect a winner. For a
+        # corrupt lease we already know the predecessor is
+        # corrupt; don't re-check is_corrupt_lock here because
+        # the sentinel already serializes access.
         existing2 = _read_lock(path)
         if existing2 is None:
-            return LockOutcome(
-                ok=False, path=path, owner=None,
-                reason="lock_disappeared_during_recovery",
-            )
+            if corrupt_lease:
+                # The corrupt file disappeared entirely. Use the
+                # placeholder we constructed before the sentinel.
+                existing2 = existing
+            else:
+                return LockOutcome(
+                    ok=False, path=path, owner=None,
+                    reason="lock_disappeared_during_recovery",
+                )
         # If the existing lock's version chain advanced (because a
         # winner replaced it), we lose.
         if existing2.get("lock_version_chain", 0) > existing.get("lock_version_chain", 0):
@@ -582,19 +662,23 @@ def recover_stale(
         # the chain to 1 when overwriting a stale lock). Re-assess
         # liveness of existing2 under the sentinel to confirm the
         # predecessor is still stale; otherwise we would overwrite a
-        # live lease.
-        live2 = assess_liveness(existing2)
-        if live2.is_alive:
-            return LockOutcome(
-                ok=False, path=path, owner=existing2,
-                reason="recheck_found_lock_live",
-            )
-        if live2.is_indeterminate:
-            return LockOutcome(
-                ok=False, path=path, owner=existing2,
-                reason=f"recheck_indeterminate:{live2.reason}",
-                indeterminate=True,
-            )
+        # live lease. Skip for corrupt leases (no liveness evidence
+        # available).
+        liveness_reason = "skip_for_corrupt_lease"
+        if not corrupt_lease:
+            live2 = assess_liveness(existing2)
+            if live2.is_alive:
+                return LockOutcome(
+                    ok=False, path=path, owner=existing2,
+                    reason="recheck_found_lock_live",
+                )
+            if live2.is_indeterminate:
+                return LockOutcome(
+                    ok=False, path=path, owner=existing2,
+                    reason=f"recheck_indeterminate:{live2.reason}",
+                    indeterminate=True,
+                )
+            liveness_reason = live2.reason
 
         observed_version = existing2.get("lock_version_chain", 0) + 1
         now_iso = _utcnow()
@@ -624,7 +708,7 @@ def recover_stale(
                     "previous_owner_created_at": existing2.get("created_at"),
                     "previous_version": existing2.get("lock_version_chain", 0),
                     "staleness_evidence": staleness_evidence,
-                    "assess_liveness_reason": evidence.reason,
+                    "assess_liveness_reason": liveness_reason,
                 }
             ],
         }

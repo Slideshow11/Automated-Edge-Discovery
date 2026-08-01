@@ -636,17 +636,30 @@ def _init(args: argparse.Namespace) -> None:
         run_identity["lock_dir"] = str(Path(lock_dir_persisted).resolve())
 
     state["run_identity"] = run_identity
-    # P1 fix (round 5): wrap state and receipt writes in cleanup
-    # so that if a write fails (e.g. disk full), the newly
-    # acquired supervisor lock is released. Otherwise the
-    # controller exits leaving an orphan lock whose state path is
-    # missing or unwritable, blocking the scope until manual
-    # cleanup. On failure, exit before reporting success.
+    # Round-8 P1 fix: bootstrap artifacts must be published as a
+    # transaction. The previous flow wrote state, then the
+    # machine receipt, then the markdown receipt, but a failure
+    # in any step left earlier artifacts on disk. For unscoped
+    # runs (the explicitly supported flow), authorize-mutation
+    # performs no lease check and would accept a state file
+    # whose receipt write failed. Now: track each artifact and
+    # roll back ALL of them on any failure before reporting
+    # finalization to the operator.
+    workspace = Path(args.workspace)
+    receipt_json_path_predicted = workspace / _launch_receipt.RECEIPT_JSON_FILENAME
+    receipt_md_path_predicted = workspace / _launch_receipt.RECEIPT_MD_FILENAME
+    bootstrap_artifacts = {
+        "state_path": out_path,
+        "receipt_json_path": str(receipt_json_path_predicted),
+        "receipt_md_path": str(receipt_md_path_predicted),
+        "lock_dir": (str(Path(lock_dir_arg).resolve())
+                     if lock_dir_arg else None),
+    }
     lock_to_release_on_failure = lock_outcome
     try:
         _save_state(state, out_path)
         receipt_json_path, receipt_md_path = _launch_receipt.emit(
-            Path(args.workspace),
+            workspace,
             run_identity=run_identity,
             state_path=out_path,
             lock_path=lock_path_str,
@@ -654,7 +667,7 @@ def _init(args: argparse.Namespace) -> None:
             current_phase=str(state["overall_status"]),
             merge_policy=getattr(args, "merge_policy", "stop_before_merge"),
         )
-    except Exception:
+    except Exception as exc:
         # P1 fix (round 6): confirm the cleanup release actually
         # released the lock. release() can return False when the
         # recovery sentinel is briefly held by another worker;
@@ -682,6 +695,26 @@ def _init(args: argparse.Namespace) -> None:
                     "Manual recovery required.",
                     file=sys.stderr,
                 )
+        # Round-8 P1 fix: roll back every bootstrap artifact that
+        # was successfully persisted before the failure. Without
+        # this, a partially-published state+receipt is left on
+        # disk for an unscoped run; authorize-mutation has no
+        # lease check and would happily authorize mutations even
+        # though init exited with an error.
+        try:
+            for key in ("receipt_md_path", "receipt_json_path", "state_path"):
+                path = bootstrap_artifacts.get(key)
+                if not path:
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+        except Exception:
+            # Never let rollback errors mask the original failure.
+            pass
         raise
 
     # Past this point, the lock is intentionally held for the
@@ -2543,12 +2576,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "recover-stale-lock",
         help="Atomically reclaim a stale supervisor lock after recording the prior owner",
     )
-    p_recover.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
-    p_recover.add_argument("--workspace", required=True, help="Run workspace directory")
+    # Round-8 P1 fix: --state and --workspace are no longer
+    # required. A replacement run that has not yet completed
+    # init can recover a stale lease before its state file
+    # exists. The caller MUST supply the bootstrap identity
+    # flags below instead.
+    p_recover.add_argument("--state", help="Path to CONTROLLER_STATE.json (optional when --recovered-run-id is given)")
+    p_recover.add_argument("--workspace", help="Run workspace directory (optional when scope flags are given)")
     p_recover.add_argument("--lock-dir",
                            help="Override the supervisor-lock directory (default: host-wide)")
     p_recover.add_argument("--staleness-evidence", required=True,
                            help="One-line description of the evidence declaring the lock stale")
+    p_recover.add_argument("--recovered-run-id", required=True,
+                           help="The replacement run's run_id (used as the recovered lease owner)")
+    p_recover.add_argument("--recovered-state-path",
+                           help="Path to the replacement run's CONTROLLER_STATE.json (optional; "
+                                "if provided, must NOT exist yet OR will be written by init)")
+    p_recover.add_argument("--repository",
+                           help="Repository scope for the recovered lease (e.g. Slideshow11/Automated-Edge-Discovery)")
+    p_recover.add_argument("--target-pr-number",
+                           help="Target PR number for the recovered lease (optional)")
+    p_recover.add_argument("--mutation-target",
+                           help="Mutation target identifier for the recovered lease (optional)")
 
     p_outstanding = sub.add_parser(
         "list-outstanding-mutations",
@@ -2782,6 +2831,29 @@ def _authorize_mutation(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(13)
+    # Round-8 P1 fix: bind receipt validation to the selected
+    # state file. A copied state file at a different path would
+    # otherwise pass the run_id + workspace checks above (which
+    # only compare against state contents, not the caller-
+    # supplied --state path). Require receipt['state_path'] to
+    # resolve to args.state so the receipt is bound to the state
+    # file the operator actually passed to authorize-mutation.
+    receipt_state_path = receipt.get("state_path")
+    if not receipt_state_path:
+        print(
+            "ERROR: cannot authorize mutation: launch receipt "
+            "missing state_path field",
+            file=sys.stderr,
+        )
+        sys.exit(13)
+    if str(Path(receipt_state_path).resolve()) != str(Path(args.state).resolve()):
+        print(
+            f"ERROR: cannot authorize mutation: launch receipt "
+            f"state_path={receipt_state_path!r} does not match "
+            f"--state={args.state!r}",
+            file=sys.stderr,
+        )
+        sys.exit(13)
     # Round-120 P2 fix: validate that the caller's --workspace
     # matches the workspace recorded in the state file. A path
     # mix-up could authorize a mutation to a journal the
@@ -2979,16 +3051,65 @@ def _inspect_lock(args: argparse.Namespace) -> None:
 
 
 def _recover_stale_lock(args: argparse.Namespace) -> None:
-    state = _load_state(args.state)
-    rid = state.get("run_identity") or {}
-    scope = {
-        "repository": rid.get("repository") or "",
-        "target_pr_number": rid.get("target_pr_number"),
-        "mutation_target": rid.get("mutation_target"),
-    }
-    if not scope["repository"]:
-        print("ERROR: state has no repository scope; cannot recover lock", file=sys.stderr)
+    # Round-8 P1 fix: allow recovery before the replacement
+    # run's state file exists. The caller now supplies bootstrap
+    # identity directly via CLI flags. The previous behavior of
+    # loading args.state is preserved when --state IS provided
+    # so existing operators/scripts continue to work.
+    scope: dict = {}
+    recovered_run_id: str
+    recovered_state_path: Optional[str] = None
+    lock_dir_override: Optional[Path] = None
+    if getattr(args, "lock_dir", None):
+        lock_dir_override = Path(args.lock_dir)
+
+    if args.state and os.path.exists(args.state):
+        # Legacy path: load the predecessor/replacement state.
+        state = _load_state(args.state)
+        rid = state.get("run_identity") or {}
+        scope = {
+            "repository": rid.get("repository") or "",
+            "target_pr_number": rid.get("target_pr_number"),
+            "mutation_target": rid.get("mutation_target"),
+        }
+        recovered_run_id = getattr(args, "recovered_run_id", None) or state.get("run_id", "unknown")
+        recovered_state_path = str(Path(args.state).resolve())
+        # The legacy path allows the state to provide the scope,
+        # but the recovered run_id MUST come from CLI so the
+        # replacement is bound to its own identity.
+        if not scope.get("repository") and not getattr(args, "repository", None):
+            print("ERROR: state has no repository scope and --repository not given; cannot recover lock",
+                  file=sys.stderr)
+            sys.exit(6)
+    else:
+        # Bootstrap path: caller supplies scope and identity directly.
+        scope = {
+            "repository": getattr(args, "repository", None) or "",
+            "target_pr_number": getattr(args, "target_pr_number", None),
+            "mutation_target": getattr(args, "mutation_target", None),
+        }
+        recovered_run_id = args.recovered_run_id
+        if getattr(args, "recovered_state_path", None):
+            recovered_state_path = str(Path(args.recovered_state_path).resolve())
+
+    # Apply CLI overrides for scope (in case legacy state scope
+    # was empty but CLI flags give us the scope).
+    if not scope.get("repository") and getattr(args, "repository", None):
+        scope["repository"] = args.repository
+    if scope.get("target_pr_number") is None and getattr(args, "target_pr_number", None):
+        scope["target_pr_number"] = args.target_pr_number
+    if not scope.get("mutation_target") and getattr(args, "mutation_target", None):
+        scope["mutation_target"] = args.mutation_target
+
+    if not scope.get("repository"):
+        print("ERROR: no repository scope available; pass --repository, --state, or scope via run_identity",
+              file=sys.stderr)
         sys.exit(6)
+    if not scope.get("target_pr_number") and not scope.get("mutation_target"):
+        print("ERROR: scope is missing both target_pr_number and mutation_target; cannot compute lock key",
+              file=sys.stderr)
+        sys.exit(6)
+
     proc_evidence = _run_identity.capture_process_start_evidence() or {
         "pid": os.getpid(),
         "stat_start_time": None,
@@ -2997,15 +3118,28 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         "source": "unknown",
     }
     host_identity = _run_identity.capture_host_identity()
+    # Compute base_dir using the same precedence as try_acquire:
+    # CLI --lock-dir, then run_identity.lock_dir (from state when
+    # available), then the host-wide default (None).
+    base_dir = lock_dir_override
+    if base_dir is None and recovered_state_path:
+        # Legacy state-provided path may include lock_dir.
+        try:
+            legacy_state = _load_state(args.state)
+            legacy_rid = legacy_state.get("run_identity") or {}
+            if legacy_rid.get("lock_dir"):
+                base_dir = Path(legacy_rid["lock_dir"])
+        except Exception:
+            pass
     outcome = _supervisor_lock.recover_stale(
         scope=scope,
-        recovered_by_run_id=state.get("run_id", "unknown"),
+        recovered_by_run_id=recovered_run_id,
         recovered_by_host=host_identity,
         recovered_by_pid=proc_evidence["pid"],
         recovered_by_start_evidence=proc_evidence,
-        recovered_by_state_path=str(Path(args.state).resolve()),
+        recovered_by_state_path=recovered_state_path,
         staleness_evidence=args.staleness_evidence,
-        base_dir=_resolve_lock_base(args, Path(args.workspace)),
+        base_dir=base_dir,
     )
     if not outcome.ok:
         print(
@@ -3016,6 +3150,7 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
         sys.exit(7)
     print(f"Recovered stale lock for scope {scope}")
     print(f"  reason: {outcome.reason}")
+    print(f"  recovered_by_run_id: {recovered_run_id}")
 
 
 def _list_outstanding_mutations(args: argparse.Namespace) -> None:
