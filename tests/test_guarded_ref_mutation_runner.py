@@ -51,6 +51,7 @@ def _make_bare_with_clone(tmp_path: Path):
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
     _git(tmp_path, "init", "--bare", str(bare))
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare), str(clone))
     _git(clone, "config", "user.email", "test@local")
     _git(clone, "config", "user.name", "Test")

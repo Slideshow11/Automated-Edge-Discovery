@@ -69,6 +69,7 @@ def _make_bare_with_clone(
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
     _git(tmp_path, "init", "--bare", str(bare), "-q")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
     _git(clone, "config", "user.name", "Test")
@@ -884,7 +885,9 @@ def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
     bare_upstream = tmp_path / "bare_upstream.git"
     clone = tmp_path / "clone"
     _git(tmp_path, "init", "--bare", str(bare_origin), "-q")
+    _git(bare_origin, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "init", "--bare", str(bare_upstream), "-q")
+    _git(bare_upstream, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare_origin), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
     _git(clone, "config", "user.name", "Test")
@@ -1217,3 +1220,231 @@ def test_mutate_ref_rejects_plan_from_different_workspace(tmp_path):
         f"exit 25; got {r.returncode}"
     )
     assert "workspace" in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# Round-55 Codex repair regression tests
+# ---------------------------------------------------------------------------
+
+def test_authorize_mutation_emits_durable_plan_for_branch_create_force(tmp_path):
+    """Repair 1 (3698194474): branch_create_force is excluded
+    from the HEAD_CHANGING_MUTATION_TYPES existing-head
+    requirement because a CREATE cannot provide a current
+    --expected-target-sha (the ref must not exist yet). The
+    durable plan emission path must succeed for
+    branch_create_force with only --desired-after-sha and
+    --mutation-target.
+    """
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Create a real commit on a different branch so the desired
+    # SHA exists locally.
+    _git(clone, "checkout", "-q", "-b", "feat/new")
+    _git(clone, "commit", "--allow-empty", "-m", "new_branch", "-q")
+    desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    state = json.loads((workspace / "CONTROLLER_STATE.json").read_text())
+    state["workspace"] = str(workspace)
+    state["next_action"] = {"action": "branch_create_force"}
+    state["overall_status"] = "RUN_READY_FOR_SUMMARY"
+    state["mutation_target"] = "feat/new"
+    (workspace / "CONTROLLER_STATE.json").write_text(json.dumps(state))
+
+    # Local imports for the assertion below.
+    from scripts.local.guarded_ref_mutation import GuardedMutationPlan
+
+    # Write a launch receipt (required by authorize-mutation).
+    receipt = {
+        "schema_version": 1,
+        "run_id": "r-end2end",
+        "controller_version": "test",
+        "created_at": "2026-08-01T00:00:00Z",
+        "workspace": str(workspace),
+        "state_path": str(workspace / "CONTROLLER_STATE.json"),
+        "run_identity": {
+            "run_id": "r-end2end",
+            "workspace": str(workspace),
+            "machine_identity": {
+                "hostname": "test", "user": "test", "pid": 1,
+            },
+        },
+        "repository": "owner/name",
+        "main_sha": "0" * 40,
+        "next_action": {"action": "force_push"},
+        "overall_status": "RUN_READY_FOR_SUMMARY",
+    }
+    (workspace / "LAUNCH_RECEIPT.json").write_text(json.dumps(receipt))
+
+    # Acquire the supervisor lock for authorize-mutation.
+    import os
+    from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
+    lock_outcome = _try_acquire(
+        scope={
+            "repository": "owner/name",
+            "target_pr_number": 416,
+            "mutation_target": "feat/new",
+        },
+        owner_run_id="r-end2end",
+        owner_host={"hostname": "test", "user": "test"},
+        owner_pid=os.getpid(),
+        owner_start_evidence={
+            "pid": os.getpid(),
+            "start_time": "2026-08-01T00:00:00Z",
+        },
+        owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+        base_dir=workspace / "L",
+    )
+    assert lock_outcome.ok
+
+    # Invoke authorize-mutation for branch_create_force WITHOUT
+    # --expected-target-sha (because the ref must not exist).
+    result = _run_cli(
+        "authorize-mutation",
+        "--state", str(workspace / "CONTROLLER_STATE.json"),
+        "--workspace", str(workspace),
+        "--mutation-type", "branch_create_force",
+        "--mutation-target", "feat/new",
+        "--expected-main-sha", "0" * 40,
+        "--desired-after-sha", desired,
+        "--pending-action", "branch_create_force",
+    )
+    assert result.returncode == 0, (
+        f"authorize-mutation for branch_create_force failed: "
+        f"rc={result.returncode} "
+        f"stdout={result.stdout} stderr={result.stderr}"
+    )
+
+    # The durable plan MUST exist for branch_create_force.
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_files = list(plan_dir.iterdir())
+    assert len(plan_files) == 1
+    plan = GuardedMutationPlan.from_json(plan_files[0].read_text())
+    assert plan.operation == "CREATE_LOCAL"
+    assert plan.expected_before_sha is None
+    assert plan.desired_after_sha == desired
+
+
+def test_authorize_mutation_rollback_uses_existing_sentinel_fd(tmp_path):
+    """Repair 2 (3698194477): when plan publication fails,
+    the rollback record_result MUST pass sentinel_fd so it
+    shares the existing flock. Without this, the rollback
+    would try to acquire a second descriptor on the same
+    flock and exhaust retries.
+
+    This test simulates the failure by making the plan
+    directory unwritable.
+    """
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
+    initial = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+    state = json.loads((workspace / "CONTROLLER_STATE.json").read_text())
+    state["workspace"] = str(workspace)
+    state["next_action"] = {"action": "force_push"}
+    state["overall_status"] = "RUN_READY_FOR_SUMMARY"
+    state["mutation_target"] = "main"
+    (workspace / "CONTROLLER_STATE.json").write_text(json.dumps(state))
+
+    # Write a launch receipt (required by authorize-mutation).
+    receipt = {
+        "schema_version": 1,
+        "run_id": "r-end2end",
+        "controller_version": "test",
+        "created_at": "2026-08-01T00:00:00Z",
+        "workspace": str(workspace),
+        "state_path": str(workspace / "CONTROLLER_STATE.json"),
+        "run_identity": {
+            "run_id": "r-end2end",
+            "workspace": str(workspace),
+            "machine_identity": {
+                "hostname": "test", "user": "test", "pid": 1,
+            },
+        },
+        "repository": "owner/name",
+        "main_sha": "0" * 40,
+        "next_action": {"action": "force_push"},
+        "overall_status": "RUN_READY_FOR_SUMMARY",
+    }
+    (workspace / "LAUNCH_RECEIPT.json").write_text(json.dumps(receipt))
+
+    import os
+    from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
+    lock_outcome = _try_acquire(
+        scope={
+            "repository": "owner/name",
+            "target_pr_number": 416,
+            "mutation_target": None,
+        },
+        owner_run_id="r-end2end",
+        owner_host={"hostname": "test", "user": "test"},
+        owner_pid=os.getpid(),
+        owner_start_evidence={
+            "pid": os.getpid(),
+            "start_time": "2026-08-01T00:00:00Z",
+        },
+        owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+        base_dir=workspace / "L",
+    )
+    assert lock_outcome.ok
+
+    # Pre-create the GUARDED_REF_MUTATIONS directory with
+    # a file at the destination path so the plan creation
+    # fails with EEXIST or similar.
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    # Make plan_dir read-only so open() for write fails.
+    os.chmod(plan_dir, 0o555)
+
+    _git(clone, "commit", "--allow-empty", "-m", "next", "-q")
+    desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+    try:
+        result = _run_cli(
+            "authorize-mutation",
+            "--state", str(workspace / "CONTROLLER_STATE.json"),
+            "--workspace", str(workspace),
+            "--mutation-type", "force_push",
+            "--mutation-target", "main",
+            "--expected-target-sha", initial,
+            "--expected-main-sha", "0" * 40,
+            "--desired-after-sha", desired,
+            "--pending-action", "force_push",
+        )
+        # The authorize-mutation fails with rc=24 (durable plan
+        # emission failed).
+        assert result.returncode == 24, (
+            f"authorize-mutation must fail when plan directory "
+            f"is unwritable; rc={result.returncode} "
+            f"stderr={result.stderr}"
+        )
+        # The journal MUST NOT contain a stranded outstanding
+        # record (the rollback record_result succeeded via
+        # shared sentinel_fd).
+        mutations_file = workspace / "MUTATIONS.jsonl"
+        records = [
+            json.loads(line)
+            for line in mutations_file.read_text().splitlines()
+            if line.strip()
+        ]
+        # The authorization record was rolled back; no
+        # outstanding records.
+        from scripts.local.aed_mutation_authorization import (
+            outstanding_mutations as _outstanding,
+        )
+        outstanding = _outstanding(workspace)
+        assert outstanding == [], (
+            f"outstanding records must be empty after rollback; "
+            f"got {outstanding}"
+        )
+    finally:
+        os.chmod(plan_dir, 0o755)

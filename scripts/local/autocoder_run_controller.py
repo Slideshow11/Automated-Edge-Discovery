@@ -4032,11 +4032,16 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # Build a list of head-changing mutation types and
     # require the same SHA validation for each.
     HEAD_CHANGING_MUTATION_TYPES = {
+        # Repair 1 (round-55): branch_create_force is
+        # excluded because it represents a CREATE
+        # (the ref must not exist yet) and so cannot provide
+        # a current --expected-target-sha. Its full-SHA
+        # validation is performed by mutation_policy.derive_plan
+        # for the desired_after_sha.
         "squash_merge",
         "force_push",
         "push",
         "branch_delete",
-        "branch_create_force",
     }
     if args.mutation_type in HEAD_CHANGING_MUTATION_TYPES:
         target_sha = args.expected_target_sha or ""
@@ -4412,6 +4417,13 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         # by the outstanding record. Append a terminal
         # CANCELLED result to the journal so the
         # outstanding_mutations list returns an empty set.
+        #
+        # Repair 2 (round-55): the journal sentinel is still
+        # held by this controller invocation. Pass
+        # sentinel_fd=sentinel_fd so record_result shares the
+        # existing flock rather than re-acquiring it through
+        # a second descriptor (which would exhaust retries
+        # and leave the authorization stranded).
         try:
             _mutation_auth.record_result(
                 Path(args.workspace),
@@ -4424,6 +4436,7 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 actual_main_sha=None,
                 actual_target_sha=None,
                 error_detail=str(plan_err),
+                sentinel_fd=sentinel_fd,
             )
             print(
                 f"ERROR: durable plan emission failed: {plan_err}; "

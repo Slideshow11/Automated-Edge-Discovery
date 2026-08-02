@@ -53,6 +53,7 @@ def _setup_two_clones(tmp_path):
     """
     bare = tmp_path / "bare.git"
     _git(tmp_path, "init", "--bare", str(bare), "-q")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     clone_a = tmp_path / "clone_a"
     clone_b = tmp_path / "clone_b"
     _git(tmp_path, "clone", str(bare), str(clone_a), "-q")
