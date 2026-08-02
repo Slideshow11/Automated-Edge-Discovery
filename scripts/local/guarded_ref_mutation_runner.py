@@ -168,6 +168,7 @@ class GuardedMutationOrchestrator:
         *,
         local_repo: Path,
         remote_ref_path: Optional[Path] = None,
+        remote: str = "origin",
     ) -> grm.GuardedMutationPlan:
         """Execute the guarded mutation against `local_repo`.
 
@@ -176,6 +177,12 @@ class GuardedMutationOrchestrator:
         of the REMOTE repo (e.g. a local bare repo) used for
         reconciliation. If None, the local repo is used as
         the remote (useful for update_ref and delete_ref).
+
+        remote is the NAME of the remote (e.g. "origin",
+        "upstream") that the CAS-protected push targets. It is
+        threaded through to guarded_push so a clone configured
+        with multiple remotes pushes to the correct one.
+        Default: "origin".
 
         The plan transitions PREPARED -> EXECUTING -> RECONCILING
         -> terminal state. The plan is persisted at each
@@ -199,7 +206,7 @@ class GuardedMutationOrchestrator:
         op = grm.Operation(self.plan.operation)
         result: Optional[ops.RefMutationResult] = None
         try:
-            result = self._do_execute(local_repo, op)
+            result = self._do_execute(local_repo, op, remote=remote)
         except (ops.GuardedRefError, FileNotFoundError,
                 PermissionError, OSError,
                 subprocess.CalledProcessError) as e:
@@ -260,16 +267,18 @@ class GuardedMutationOrchestrator:
         return self.plan
 
     def _do_execute(
-        self, local_repo: Path, op: grm.Operation
+        self, local_repo: Path, op: grm.Operation,
+        remote: str = "origin",
     ) -> ops.RefMutationResult:
         """Perform the actual git operation."""
         if op == grm.Operation.PUSH_REMOTE:
-            # Push to the remote. The remote is the local_repo
-            # (used as a local bare repo for integration tests).
-            # In production, the controller passes a remote URL.
+            # Push to the selected remote. The remote is
+            # threaded from the caller so a clone with multiple
+            # remotes (origin vs upstream) mutates the correct
+            # one.
             return ops.guarded_push(
                 repo=local_repo,
-                remote="origin",
+                remote=remote,
                 ref=self.plan.target_ref,
                 expected_remote_sha=self.plan.expected_before_sha,
                 new_local_sha=self.plan.desired_after_sha,

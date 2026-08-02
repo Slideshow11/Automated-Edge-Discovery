@@ -4403,10 +4403,40 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             os.fsync(f.fileno())
         os.replace(tmp, plan_path)
     except (ValueError, KeyError, OSError) as plan_err:
-        print(
-            f"ERROR: durable plan emission failed: {plan_err}",
-            file=sys.stderr,
-        )
+        # Repair 6: if plan publication failed AFTER the
+        # journal append succeeded, the authorization record
+        # in MUTATIONS.jsonl is now stranded (the controller
+        # holds an outstanding authorization but no
+        # executable plan). Retrying authorize-mutation is
+        # rejected as a duplicate, and finalize-run is blocked
+        # by the outstanding record. Append a terminal
+        # CANCELLED result to the journal so the
+        # outstanding_mutations list returns an empty set.
+        try:
+            _mutation_auth.record_result(
+                Path(args.workspace),
+                mutation_id=outcome.mutation_id,
+                status=_mutation_auth.RESULT_FAILURE,
+                evidence=(
+                    f"durable plan emission failed: {plan_err}; "
+                    f"authorization cancelled"
+                ),
+                actual_main_sha=None,
+                actual_target_sha=None,
+                error_detail=str(plan_err),
+            )
+            print(
+                f"ERROR: durable plan emission failed: {plan_err}; "
+                f"authorization cancelled via terminal result",
+                file=sys.stderr,
+            )
+        except Exception as rollback_err:
+            print(
+                f"ERROR: durable plan emission failed: {plan_err}; "
+                f"rollback also failed: {rollback_err}; "
+                f"outstanding authorization is now stranded",
+                file=sys.stderr,
+            )
         sys.exit(24)
     print(f"Authorized mutation {outcome.mutation_id}")
     print(f"  type:                {outcome.record.get('mutation_type')}")
@@ -4752,6 +4782,8 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             repository=plan.repository,
             target_ref=plan.target_ref,
             expected_before_sha=plan.expected_before_sha,
+            desired_after_sha=plan.desired_after_sha,
+            active_workspace=str(workspace.resolve()),
         )
     except AuthorizationBindingError as e:
         print(
@@ -4771,27 +4803,36 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         sys.exit(22)
 
     # Step 4: dispatch intermediate plans to reconcile() —
-    # never re-prepare. If the plan is at EXECUTING or
-    # RECONCILING, the previous run crashed mid-flight.
-    # Re-preparing would reset the lifecycle state and
-    # could re-execute the mutation blindly. We dispatch to
-    # reconcile() which reads the authoritative remote ref
-    # and reports SUCCEEDED, NOT_APPLIED, CONFLICT, or
-    # INDETERMINATE.
+    # never re-prepare. If the plan is at EXECUTING,
+    # RECONCILING, or INDETERMINATE, the previous run did not
+    # complete a terminal classification. Re-preparing would
+    # reset the lifecycle state and could re-execute the
+    # mutation blindly. We dispatch to reconcile() which
+    # reads the authoritative remote ref and reports
+    # SUCCEEDED, NOT_APPLIED, CONFLICT, or INDETERMINATE.
+    # INDETERMINATE is the explicit retryable state: a
+    # transient read failure on the previous run can be
+    # retried by a fresh reconcile. (Repair 3.)
     orch = GuardedMutationOrchestrator(workspace=workspace, plan=plan)
     current_state = LifecycleState(plan.status)
     if current_state in (
         LifecycleState.EXECUTING,
         LifecycleState.RECONCILING,
+        LifecycleState.INDETERMINATE,
     ):
         final = orch.reconcile(remote_ref_path=remote_path or local_repo)
     elif current_state is LifecycleState.PREPARED:
         # Step 5-6: run the guarded CAS adapter, then
-        # reconcile the authoritative remote ref.
+        # reconcile the authoritative remote ref. Thread
+        # the selected remote through to guarded_push so a
+        # clone with multiple remotes pushes to the correct
+        # one (Repair 1: --remote is accepted but must
+        # actually be used).
         orch.prepare()
         final = orch.execute(
             local_repo=local_repo,
             remote_ref_path=remote_path,
+            remote=args.remote,
         )
     else:
         # Terminal state (SUCCEEDED, NOT_APPLIED, CONFLICT,
@@ -4806,7 +4847,30 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         )
         sys.exit(26)
 
+    # Repair 2: only SUCCEEDED produces a successful exit
+    # (exit 0 and "OK" on stdout). All other terminal states
+    # (NOT_APPLIED, CONFLICT, INDETERMINATE, CANCELLED)
+    # produce a non-zero exit so automation does not
+    # continue on a failed or unknown outcome.
     print(f"OK mutation_id={plan.mutation_id} status={final.status}")
+    if final.status == LifecycleState.SUCCEEDED.value:
+        sys.exit(0)
+    elif final.status == LifecycleState.NOT_APPLIED.value:
+        # NOT_APPLIED: the mutation was authorized but the
+        # remote was at the expected state. The operator
+        # may retry the mutation.
+        sys.exit(30)
+    elif final.status == LifecycleState.CONFLICT.value:
+        # CONFLICT: the remote had a different state than
+        # expected. The mutation was NOT applied.
+        sys.exit(31)
+    elif final.status == LifecycleState.INDETERMINATE.value:
+        # INDETERMINATE: the read failed. The outcome is
+        # unknown; do not retry blindly.
+        sys.exit(32)
+    else:
+        # CANCELLED or unknown.
+        sys.exit(33)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

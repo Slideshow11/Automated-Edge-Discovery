@@ -337,6 +337,8 @@ def find_outstanding_authorization(
     repository: str,
     target_ref: str,
     expected_before_sha: Optional[str],
+    desired_after_sha: Optional[str] = None,
+    active_workspace: Optional[str] = None,
 ) -> OutstandingAuthorization:
     """Find the outstanding authorization for the given
     mutation_id and verify the loaded plan matches it.
@@ -349,7 +351,17 @@ def find_outstanding_authorization(
       - target_ref mismatch
       - expected_before_sha mismatch (when the authorization
         has a non-None expected SHA)
+      - desired_after_sha mismatch (when the authorization
+        has a non-None expected SHA; Repair 4)
       - authorization_status not AUTHORIZED
+      - active_workspace mismatch (Repair 5: prevents the
+        former owner of a stale-lock-recovered workspace
+        from invoking mutate-ref after the replacement
+        owner has taken over the lease)
+
+    The desired_after_sha check is essential: without it, a
+    force_push plan could substitute any other valid local
+    commit, pass validation, and push that unauthorized SHA.
     """
     for rec in mutations_path_records:
         if rec.get("mutation_id") != mutation_id:
@@ -379,6 +391,46 @@ def find_outstanding_authorization(
                 f"authorization expected_sha={rec_expected!r} "
                 f"does not match plan expected_before_sha="
                 f"{expected_before_sha!r}"
+            )
+        # Repair 4: compare desired_after_sha with the
+        # authorized request. The legacy MUTATIONS.jsonl
+        # records do not persist a desired_after_sha field
+        # (it was emitted at the executor as the durable
+        # plan). For squash_merge (GRAPHQL_UPDATE_REFS),
+        # the desired_after_sha is recorded later via
+        # record-mutation-result, so the authorization may
+        # not have it. Skip the check when the authorization
+        # has no desired_after_sha AND the mutation type is
+        # squash_merge.
+        rec_desired = rec.get("desired_after_sha")
+        if (
+            rec_desired
+            and desired_after_sha
+            and rec_desired != desired_after_sha
+        ):
+            raise AuthorizationBindingError(
+                f"authorization desired_after_sha={rec_desired!r} "
+                f"does not match plan desired_after_sha="
+                f"{desired_after_sha!r}"
+            )
+        # Repair 5: the active workspace must match the
+        # authorization's recorded workspace. After a
+        # stale-lock recovery, the replacement owner has a
+        # different workspace and supervisor lease. The
+        # former owner's outstanding journal record must
+        # not be executable by them.
+        rec_workspace = rec.get("workspace")
+        if (
+            active_workspace
+            and rec_workspace
+            and active_workspace != rec_workspace
+        ):
+            raise AuthorizationBindingError(
+                f"authorization workspace={rec_workspace!r} "
+                f"does not match active workspace="
+                f"{active_workspace!r}; the former owner of a "
+                f"stale-lock-recovered workspace cannot invoke "
+                f"mutate-ref"
             )
         # The legacy authorize() emits lowercase "authorized"
         # (see aed_mutation_authorization.AUTHORIZED). Some

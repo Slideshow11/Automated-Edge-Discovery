@@ -854,7 +854,9 @@ def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
         "--local-repo", str(clone),
         "--remote-path", str(bare),
     )
-    assert result.returncode == 0
+    # CONFLICT is a non-zero exit (Repair 2): the mutation was
+    # not applied and the executor reports the outcome.
+    assert result.returncode == 31
     assert "CONFLICT" in result.stdout
 
     # Verify the plan's state was persisted as CONFLICT (not
@@ -866,3 +868,352 @@ def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
     # retry pushed the desired_after).
     actual_remote = _git(bare, "rev-parse", "refs/heads/feat/c").stdout.strip()
     assert actual_remote == third_party
+
+
+# ---------------------------------------------------------------------------
+# Round-54 Codex repair regression tests
+# ---------------------------------------------------------------------------
+
+def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
+    """Repair 1: --remote is accepted by mutate-ref and
+    threaded through to guarded_push. A clone configured
+    with both 'origin' and 'upstream' remotes pushes to
+    the correct one."""
+    # Create two bare repos.
+    bare_origin = tmp_path / "bare_origin.git"
+    bare_upstream = tmp_path / "bare_upstream.git"
+    clone = tmp_path / "clone"
+    _git(tmp_path, "init", "--bare", str(bare_origin), "-q")
+    _git(tmp_path, "init", "--bare", str(bare_upstream), "-q")
+    _git(tmp_path, "clone", str(bare_origin), str(clone), "-q")
+    _git(clone, "config", "user.email", "test@local")
+    _git(clone, "config", "user.name", "Test")
+    _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
+    initial = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/main", "-q")
+
+    # Add the upstream bare as a second remote.
+    _git(clone, "remote", "add", "upstream", str(bare_upstream))
+
+    # Also push the initial main to upstream so the force-push
+    # CAS check has a known initial state on the remote.
+    _git(clone, "push", "upstream", "refs/heads/main", "-q")
+
+    # Create a real commit for the desired_after_sha. The
+    # executor's guarded_push verifies the SHA exists locally
+    # before pushing.
+    _git(clone, "commit", "--allow-empty", "-m", "remote_test", "-q")
+    desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+    # The lease expects the remote ref to currently point
+    # to `initial`. The desired after-SHA is the new commit
+    # (`desired`). The executor will force-push the new
+    # commit, but only if the remote is at `initial`.
+    _seed_mutation_authorization(
+        workspace=tmp_path / "workspace",
+        mutation_id="m_remote",
+        mutation_type="force_push",
+        mutation_target="main",
+        expected_main_sha=initial,
+        expected_target_sha=initial,
+        pending_action="force_push",
+        desired_after_sha=desired,
+    )
+
+    # Reset the local ref to `initial` so the executor's
+    # force-push CAS check matches.
+    subprocess.run(
+        ["git", "update-ref", "refs/heads/main", initial],
+        cwd=clone, check=True, capture_output=True,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Run mutate-ref with --remote=upstream. The push MUST go
+    # to upstream, not origin.
+    result = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_remote",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare_upstream),
+        "--remote", "upstream",
+    )
+    assert result.returncode == 0, (
+        f"mutate-ref failed: rc={result.returncode} "
+        f"stdout={result.stdout} stderr={result.stderr}"
+    )
+
+    # Verify upstream was updated, origin was NOT.
+    upstream_ref = _git(bare_upstream, "rev-parse", "refs/heads/main").stdout.strip()
+    origin_ref = _git(bare_origin, "rev-parse", "refs/heads/main").stdout.strip()
+    assert upstream_ref == desired, (
+        f"upstream ref should be at desired; got {upstream_ref}"
+    )
+    assert origin_ref == initial, (
+        f"origin ref should NOT be changed; got {origin_ref}"
+    )
+
+
+def test_mutate_ref_exit_code_distinguishes_terminal_states(tmp_path):
+    """Repair 2: only SUCCEEDED produces exit 0. All other
+    terminal states produce distinct non-zero exits."""
+    # Test SUCCEEDED -> 0
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+    _seed_branch(clone, "feat/s")
+    initial = _git(clone, "rev-parse", "refs/heads/feat/s").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/s", "-q")
+    _git(clone, "checkout", "-q", "feat/s")
+    _git(clone, "commit", "--allow-empty", "-m", "s2", "-q")
+    desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+    _seed_mutation_authorization(
+        workspace, "m_ok", "force_push", "feat/s",
+        initial, initial, "force_push", desired,
+    )
+    r = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_ok",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert r.returncode == 0, f"SUCCEEDED should be exit 0, got {r.returncode}"
+    assert "SUCCEEDED" in r.stdout
+
+    # Test CONFLICT -> 31
+    workspace2 = tmp_path / "workspace2"
+    workspace2.mkdir()
+    _create_minimal_state(workspace2)
+    (workspace2 / "L").mkdir()
+    _seed_branch(clone, "feat/c")
+    
+    # Third party advances feat/c to a different SHA.
+    _git(clone, "checkout", "-q", "feat/c")
+    _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
+    tp = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "update-ref", "refs/heads/feat/c", tp)
+    _git(clone, "push", "--force", "origin", "refs/heads/feat/c:refs/heads/feat/c", "-q")
+    _git(clone, "checkout", "-q", "main")
+    _seed_mutation_authorization(
+        workspace2, "m_conflict", "force_push", "feat/c",
+        initial, initial, "force_push", "b" * 40,
+    )
+    r = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace2),
+        "--mutation-id", "m_conflict",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert r.returncode == 31, f"CONFLICT should be exit 31, got {r.returncode}"
+
+
+def test_mutate_ref_dispatches_indeterminate_to_reconcile(tmp_path):
+    """Repair 3: a plan at INDETERMINATE is dispatched to
+    reconcile(), not refused with exit 26."""
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+    _seed_branch(clone, "feat/i")
+    initial = _git(clone, "rev-parse", "refs/heads/feat/i").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/i", "-q")
+    # Third party advances feat/i.
+    _git(clone, "checkout", "-q", "feat/i")
+    _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
+    tp = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "update-ref", "refs/heads/feat/i", tp)
+    _git(clone, "push", "--force", "origin", "refs/heads/feat/i:refs/heads/feat/i", "-q")
+    _git(clone, "checkout", "-q", "main")
+    _seed_mutation_authorization(
+        workspace, "m_indet", "force_push", "feat/i",
+        initial, initial, "force_push", "b" * 40,
+    )
+    # Overwrite the plan to be at INDETERMINATE.
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_path = workspace / "GUARDED_REF_MUTATIONS" / "m_indet.json"
+    plan = GuardedMutationPlan(
+        mutation_id="m_indet",
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref="refs/heads/feat/i",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial,
+        desired_after_sha="b" * 40,
+        status=LifecycleState.INDETERMINATE.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    plan_path.write_text(plan.to_json())
+
+    r = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_indet",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    # INDETERMINATE is a non-SUCCEEDED state. The dispatcher
+    # reconciles and may report CONFLICT (third-party
+    # advanced) or INDETERMINATE (read failure). The exit
+    # code is 31 (CONFLICT) or 32 (INDETERMINATE), not 26
+    # (terminal refusal).
+    assert r.returncode != 26, (
+        f"INDETERMINATE plan must not exit 26; got {r.returncode}"
+    )
+    assert r.returncode in (31, 32), (
+        f"INDETERMINATE plan must exit 31 (CONFLICT) or 32 "
+        f"(INDETERMINATE); got {r.returncode}"
+    )
+
+
+def test_mutate_ref_rejects_plan_with_mismatched_desired_after_sha(tmp_path):
+    """Repair 4: binding compares desired_after_sha with
+    the authorized request. A plan with a different
+    desired_after_sha is rejected with exit 25."""
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+    _seed_branch(clone, "feat/d")
+    initial = _git(clone, "rev-parse", "refs/heads/feat/d").stdout.strip()
+    initial = _git(clone, "rev-parse", "refs/heads/feat/d").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/d", "-q")
+    _git(clone, "checkout", "-q", "feat/d")
+    _git(clone, "commit", "--allow-empty", "-m", "d2", "-q")
+    desired_authorized = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "commit", "--allow-empty", "-m", "d3", "-q")
+    desired_plan = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    # Seed the authorization with desired_after_sha = desired_authorized.
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    auth_record = {
+        "mutation_id": "m_d",
+        "run_id": "r-end2end",
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_type": "force_push",
+        "mutation_target": "feat/d",
+        "expected_main_sha": initial,
+        "expected_target_sha": initial,
+        "pending_action": "force_push",
+        "created_at": "2026-08-01T00:00:00Z",
+        "authorization_status": "authorized",
+        "desired_after_sha": desired_authorized,
+    }
+    mutations_file.write_text(json.dumps(auth_record))
+
+    # Write a plan with a DIFFERENT desired_after_sha.
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_dir.mkdir(exist_ok=True)
+    plan = GuardedMutationPlan(
+        mutation_id="m_d",
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref="refs/heads/feat/d",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial,
+        desired_after_sha="c" * 40,
+        status=LifecycleState.PREPARED.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    (plan_dir / "m_d.json").write_text(plan.to_json())
+
+    r = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_d",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert r.returncode == 25, (
+        f"mismatched desired_after_sha must be refused with "
+        f"exit 25; got {r.returncode}"
+    )
+    assert "desired_after_sha" in r.stderr or "binding" in r.stderr
+
+
+def test_mutate_ref_rejects_plan_from_different_workspace(tmp_path):
+    """Repair 5: a plan whose authorization records a
+    different workspace than the active mutate-ref workspace
+    is rejected. This prevents the former owner of a
+    stale-lock-recovered workspace from invoking mutate-ref
+    after the replacement owner has taken over the lease."""
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+    _seed_branch(clone, "feat/w")
+    initial = _git(clone, "rev-parse", "refs/heads/feat/w").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/w", "-q")
+    _git(clone, "checkout", "-q", "feat/w")
+    _git(clone, "commit", "--allow-empty", "-m", "w2", "-q")
+    desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    # Seed an authorization with a DIFFERENT workspace.
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    auth_record = {
+        "mutation_id": "m_w",
+        "run_id": "r-end2end",
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_type": "force_push",
+        "mutation_target": "feat/w",
+        "expected_main_sha": initial,
+        "expected_target_sha": initial,
+        "pending_action": "force_push",
+        "created_at": "2026-08-01T00:00:00Z",
+        "authorization_status": "authorized",
+        "workspace": "/some/other/workspace",
+    }
+    mutations_file.write_text(json.dumps(auth_record))
+
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_dir.mkdir(exist_ok=True)
+    plan = GuardedMutationPlan(
+        mutation_id="m_w",
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref="refs/heads/feat/w",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial,
+        desired_after_sha=desired,
+        status=LifecycleState.PREPARED.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    (plan_dir / "m_w.json").write_text(plan.to_json())
+
+    r = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_w",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert r.returncode == 25, (
+        f"plan from different workspace must be refused with "
+        f"exit 25; got {r.returncode}"
+    )
+    assert "workspace" in r.stderr
