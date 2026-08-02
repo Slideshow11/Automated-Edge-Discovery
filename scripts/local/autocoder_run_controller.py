@@ -4074,6 +4074,57 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     # state scope (including the None case where the scope has
     # no target).
     state_mutation_target = _state_mutation_target(state)
+    # Round-52 P1 fix (Allow PR-scoped pushes to obtain the
+    # target lease): for a PR-scoped run authorizing an
+    # executor-pushed mutation (force_push, push,
+    # branch_delete, branch_create_force), the operator
+    # supplies --mutation-target to identify the head
+    # branch. The Round-20 check below would reject the
+    # target because state_mutation_target is None (PR
+    # runs reject combining PR + target scopes at init
+    # time). The fix: when the mutation is executor-
+    # pushed AND args.mutation_target is supplied AND
+    # state_mutation_target is None, accept the target
+    # and treat the scope as if it were PR + target for
+    # this authorization. The cross-scope conflict check
+    # then picks up the additional target-scoped lock and
+    # two controllers cannot simultaneously authorize
+    # ref-changing mutations on the same head branch.
+    EXECUTOR_PUSHED_MUTATION_TYPES = {
+        "force_push",
+        "push",
+        "branch_delete",
+        "branch_create_force",
+    }
+    if (
+        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+        and not state_mutation_target
+        and not args.mutation_target
+    ):
+        print(
+            "ERROR: cannot authorize mutation: "
+            f"{args.mutation_type} on a PR-scoped run requires "
+            "--mutation-target. The cross-scope lease conflict "
+            "check uses --mutation-target to identify the head "
+            "branch; without it, two controllers can mutate the "
+            "same ref concurrently.",
+            file=sys.stderr,
+        )
+        sys.exit(14)
+    # Allow the supplied --mutation-target to upgrade a
+    # PR-scoped run to a PR+target scope for this
+    # authorization. The previous Round-20 strict check
+    # would reject this; the Round-52 fix removes the
+    # restriction for executor-pushed mutations.
+    if (
+        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+        and not state_mutation_target
+        and args.mutation_target
+    ):
+        # Override the scope mismatch: state the target
+        # matches the supplied one (the operator is
+        # upgrading the scope).
+        state_mutation_target = args.mutation_target
     if args.mutation_target and args.mutation_target != state_mutation_target:
         print(
             f"ERROR: --mutation-target={args.mutation_target} does not "
