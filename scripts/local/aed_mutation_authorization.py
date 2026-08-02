@@ -126,6 +126,7 @@ class AuthorizationRequest:
     expected_main_sha: Optional[str]
     expected_target_sha: Optional[str]
     pending_action: str
+    desired_after_sha: Optional[str] = None
 
 
 @dataclass
@@ -500,6 +501,7 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
             "mutation_type": req.mutation_type,
             "expected_main_sha": req.expected_main_sha,
             "expected_target_sha": req.expected_target_sha,
+            "desired_after_sha": req.desired_after_sha,
             "pending_action": req.pending_action,
             "created_at": _utcnow(),
             "authorization_status": AUTHORIZED,

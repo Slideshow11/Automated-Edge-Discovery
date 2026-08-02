@@ -392,9 +392,16 @@ class GuardedMutationOrchestrator:
             read_result = _read_remote_ref_via_query(
                 remote_ref_path, self.plan.target_ref
             )
-        elif self.plan.operation == grm.Operation.PUSH_REMOTE.value or (
-            self.plan.operation == grm.Operation.DELETE_LOCAL.value
-            and is_url_backed
+        elif (
+            self.plan.operation == grm.Operation.PUSH_REMOTE.value
+            or (
+                self.plan.operation == grm.Operation.DELETE_LOCAL.value
+                and is_url_backed
+            )
+            or (
+                self.plan.operation == grm.Operation.CREATE_LOCAL.value
+                and is_url_backed
+            )
         ):
             clone_remote_url = None
             try:

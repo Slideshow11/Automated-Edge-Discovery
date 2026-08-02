@@ -409,6 +409,17 @@ def find_outstanding_authorization(
         # workspace and verify the plan's desired_after_sha
         # matches the caller's. This binds the durable plan
         # to the journal record.
+        # Round-78 P1 fix (V0J-B continuation): persist
+        # desired_after_sha in the journal record. The
+        # authorize-mutation path now records
+        # `desired_after_sha` in MUTATIONS.jsonl, so the
+        # binding check can use it as the durable source
+        # of truth (NOT the mutable plan file). The plan
+        # file is read only as a fallback for older
+        # journals (pre-Round-78 records that did not
+        # include the field). Use the journal's value
+        # directly; if missing, fall back to the plan
+        # file (still the case for older records).
         rec_desired = rec.get("desired_after_sha")
         if rec_desired is None and desired_after_sha is not None and workspace is not None:
             from scripts.local.guarded_ref_mutation import (
