@@ -3227,14 +3227,25 @@ def _finalize_run(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(8)
-            state["overall_status"] = "RUN_COMPLETE"
-            state["updated_at"] = _utcnow()
-            state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
-            state["human_action_required"] = False
+            # Round-67 P2 fix (Defer RUN_COMPLETE until the
+            # lease can be released): do NOT mark the state
+            # RUN_COMPLETE here. The lease release is
+            # performed below, AFTER the journal sentinel
+            # is held. Persist RUN_COMPLETE only after the
+            # lease release actually succeeded; otherwise
+            # the state would be marked complete while the
+            # lease remains held, leaving an orphan that
+            # blocks the next run for up to seven days.
             _save_state(state, args.state)
         finally:
             _release_sentinel_fd(sentinel_fd, sentinel_path)
     else:
+        # workspace is NOT a directory; the earlier
+        # guard already printed the error and exited.
+        # This branch is reached only if workspace is
+        # empty (no workspace state was loaded). The
+        # main path above already persisted RUN_COMPLETE;
+        # this branch is a defensive no-op.
         state["overall_status"] = "RUN_COMPLETE"
         state["updated_at"] = _utcnow()
         state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
@@ -3243,6 +3254,18 @@ def _finalize_run(args: argparse.Namespace) -> None:
 
     # Round-120: release the supervisor lock if we own it.
     rid = state.get("run_identity") or {}
+    if not rid.get("repository"):
+        # No repository scope — no supervisor lease to
+        # release. Persist RUN_COMPLETE so the state is
+        # durably complete. (The lease-acquired branch
+        # below defers the save until AFTER the release per
+        # the Round-67 P2 fix.)
+        state["overall_status"] = "RUN_COMPLETE"
+        state["updated_at"] = _utcnow()
+        state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
+        state["human_action_required"] = False
+        _save_state(state, args.state)
+        return
     if rid.get("repository"):
         scope = {
             "repository": rid.get("repository") or "",
@@ -3348,6 +3371,16 @@ def _finalize_run(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(13)
+        # Round-67 P2 fix (continued): the lease release
+        # succeeded; persist the RUN_COMPLETE state now.
+        # Doing this AFTER the release (rather than before)
+        # ensures we never leave the state marked complete
+        # while the lease is still held.
+        state["overall_status"] = "RUN_COMPLETE"
+        state["updated_at"] = _utcnow()
+        state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}
+        state["human_action_required"] = False
+        _save_state(state, args.state)
 
     print(f"Run finalized: {state.get('run_id', 'unknown')}")
     print(f"  final status: RUN_COMPLETE")

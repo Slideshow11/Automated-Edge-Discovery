@@ -173,9 +173,22 @@ def _repo_sentinel_path(repository: str, base_dir) -> Path:
         base_dir = default_lock_dir(repository=repository)
     base_dir = Path(base_dir)
     base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Round-67 P1 fix (Canonicalize repository forms in
+    # cross-scope checks): use the canonical identity
+    # (owner/name) so two controllers expressing the same
+    # repository in different forms (e.g. `owner/repo` and
+    # `https://github.com/owner/repo.git`) produce the same
+    # per-repository sentinel filename and the same
+    # cross-scope conflict comparison.
+    from scripts.local.aed_run_identity import canonical_repository_identity
+    ident = canonical_repository_identity(repository or "")
+    canonical_repo = (
+        (ident.shorthand if ident is not None else (repository or ""))
+        .lower()
+    )
     # Replace slashes in the repository string so the
     # sentinel filename is a single path component.
-    safe_repo = repository.replace("/", "_")
+    safe_repo = canonical_repo.replace("/", "_")
     sentinel = base_dir / f"{safe_repo}.repo.recovery-sentinel"
     # Ensure the parent directory exists (single
     # component, so it's just base_dir, but be defensive).
@@ -726,6 +739,22 @@ def _check_cross_scope_conflict(
         )
         + "|"
     )
+    # Round-67 P1 fix (Canonicalize repository forms in
+    # cross-scope checks): compute the canonical
+    # (owner/name) identity for the requested scope and
+    # for each entry's stored scope, so the comparison
+    # below matches `owner/repo` against
+    # `https://github.com/owner/repo.git` (they refer to
+    # the same GitHub repository).
+    from scripts.local.aed_run_identity import (
+        canonical_repository_identity as _canonical_repo,
+    )
+    requested_ident = _canonical_repo(repository or "")
+    requested_canonical = (
+        (requested_ident.shorthand if requested_ident is not None
+         else (repository or ""))
+        .lower()
+    )
     narrower_locks = []
     repo_wide_lock = None
     try:
@@ -784,8 +813,18 @@ def _check_cross_scope_conflict(
                     repo_index_path = _repo_index_path(entry)
                     if repo_index_path.is_file():
                         with open(repo_index_path) as _idx_f:
-                            index_repo = _idx_f.read().strip().lower()
-                        if index_repo == repository.lower():
+                            index_repo_raw = _idx_f.read().strip()
+                        # Round-67 P1 fix: compare the
+                        # canonical identity of the index's
+                        # repository to the canonical identity
+                        # of the requested scope.
+                        index_ident = _canonical_repo(index_repo_raw)
+                        index_canonical = (
+                            (index_ident.shorthand if index_ident is not None
+                             else index_repo_raw)
+                            .lower()
+                        )
+                        if index_canonical == requested_canonical:
                             # Corrupt narrower lease for
                             # the SAME repository —
                             # fail closed.
@@ -840,7 +879,21 @@ def _check_cross_scope_conflict(
                     indeterminate=True,
                 )
             entry_scope = data.get("scope") or {}
-            if (entry_scope.get("repository") or "").lower() != repository.lower():
+            # Round-67 P1 fix: compare canonical
+            # (owner/name) identity rather than raw
+            # repository strings, so the conflict check
+            # recognizes that `owner/repo` and
+            # `https://github.com/owner/repo.git` refer to
+            # the same repository.
+            entry_ident = _canonical_repo(
+                entry_scope.get("repository") or ""
+            )
+            entry_canonical = (
+                (entry_ident.shorthand if entry_ident is not None
+                 else (entry_scope.get("repository") or ""))
+                .lower()
+            )
+            if entry_canonical != requested_canonical:
                 continue
             entry_scope_key = data.get("scope_key") or ""
             entry_is_repo_wide = (
