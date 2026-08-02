@@ -3247,6 +3247,13 @@ def _finalize_run(args: argparse.Namespace) -> None:
     # mutation lacks a terminal result. The caller can either record
     # the missing result or mark the run as not-finalizable.
     workspace = Path(state.get("workspace", "")).resolve()
+    # Round-76 P1 fix: journal sentinel bookkeeping. The
+    # sentinel is acquired at the top of the workspace
+    # branch and held through the outstanding-mutations
+    # check, the lease release, and the terminal state
+    # save. It is released at the END of the function.
+    sentinel_fd = None
+    sentinel_path = None
     # P1 fix (round 7): refuse finalization when the recorded
     # workspace is unavailable. If the workspace does not exist
     # (deleted, unmounted), we cannot read MUTATIONS.jsonl and a
@@ -3270,6 +3277,18 @@ def _finalize_run(args: argparse.Namespace) -> None:
         # finalization completes its "no outstanding" check, and
         # leave the controller finalized while a mutation was
         # authorized.
+        #
+        # Round-76 P1 fix (Hold the journal sentinel through
+        # lease release): the journal sentinel is held through
+        # the outstanding-mutations check, the lease release,
+        # AND the terminal state save. Without this, an
+        # authorize-mutation that starts AFTER the
+        # outstanding-mutations check but BEFORE the lease
+        # release can append a new authorization while the run
+        # is being finalized; finalize would persist
+        # RUN_COMPLETE without re-checking the journal, leaving
+        # an outstanding executable mutation on a completed
+        # run.
         _mutation_auth_path = workspace / _mutation_auth.MUTATIONS_FILENAME
         sentinel_path = _mutation_auth_path.with_suffix(
             _mutation_auth_path.suffix + ".auth-sentinel"
@@ -3305,7 +3324,14 @@ def _finalize_run(args: argparse.Namespace) -> None:
             # blocks the next run for up to seven days.
             _save_state(state, args.state)
         finally:
-            _release_sentinel_fd(sentinel_fd, sentinel_path)
+            # Round-76 P1 fix: the sentinel is released
+            # here at the END of the function (after the
+            # lease release and the terminal state save
+            # in the post-finally block below). The
+            # post-finally block (lines after this function)
+            # performs the lease release; we want the
+            # sentinel to be held through that release.
+            pass
     else:
         # workspace is NOT a directory; the earlier
         # guard already printed the error and exited.
@@ -3451,6 +3477,21 @@ def _finalize_run(args: argparse.Namespace) -> None:
 
     print(f"Run finalized: {state.get('run_id', 'unknown')}")
     print(f"  final status: RUN_COMPLETE")
+    # Round-76 P1 fix (continued): release the journal
+    # sentinel at the END of the function, AFTER the lease
+    # release and the terminal state save. The sentinel is
+    # held from the start of the function (acquired at
+    # the top of the workspace.is_dir() branch) through
+    # the outstanding-mutations check, the lease release,
+    # and the terminal state save. authorize-mutation
+    # cannot append a new journal record during this
+    # window, so the post-finalize journal is the
+    # authoritative source.
+    if sentinel_fd is not None and sentinel_path is not None:
+        from scripts.local.aed_supervisor_lock import (
+            _release_sentinel_fd as _release_journal_sentinel,
+        )
+        _release_journal_sentinel(sentinel_fd, sentinel_path)
 
 
 # ---------------------------------------------------------------------------
