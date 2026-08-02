@@ -100,7 +100,21 @@ def build_scope_key(*, repository: str, target_pr_number: Optional[int] = None,
     # but POSIX file paths are case-sensitive. Normalize to
     # lowercase so `Owner/Repo` and `owner/repo` map to the same
     # lock key.
-    repo = (repository or "").lower()
+    #
+    # Round-66 P1 fix (Canonicalize repository identities before
+    # building lock keys): two controllers identifying the same
+    # repository using different accepted forms (e.g.
+    # `owner/repo` vs `https://github.com/owner/repo.git`) would
+    # produce different lock keys even though they refer to the
+    # same GitHub repository. Use the canonical identity
+    # (owner/name) so the scope key is independent of the
+    # transport form.
+    from scripts.local.aed_run_identity import canonical_repository_identity
+    ident = canonical_repository_identity(repository or "")
+    repo = (
+        (ident.shorthand if ident is not None else (repository or ""))
+        .lower()
+    )
     if target_pr_number is not None:
         return f"repo:{repo}|pr:{int(target_pr_number)}"
     if mutation_target:

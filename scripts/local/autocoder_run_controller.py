@@ -1467,10 +1467,14 @@ def _init(args: argparse.Namespace) -> None:
                         "RUN_TERMINAL_FAILED",
                         "RUN_TERMINAL_ABORTED",
                     }
-                    if existing_status in terminal_statuses:
+                    if existing_status in terminal_statuses or existing_status == "RUN_ACTIVE":
+                        status_label = (
+                            "ACTIVE" if existing_status == "RUN_ACTIVE"
+                            else "COMPLETED"
+                        )
                         print(
                             f"ERROR: {kind} at {artifact_path!r} "
-                            f"already belongs to a COMPLETED run "
+                            f"already belongs to a {status_label} run "
                             f"(run_id={existing_run_id!r}, "
                             f"overall_status={existing_status!r}). "
                             f"Refusing to overwrite. Pass "

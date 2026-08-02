@@ -228,7 +228,18 @@ class GuardedMutationOrchestrator:
                 grm.LifecycleState.PREPARED,
             )
         self.plan.status = grm.LifecycleState.PREPARED.value
-        self.plan.created_at = _utcnow_iso()
+        # Round-66 P2 fix (Preserve the plan creation timestamp
+        # during prepare): only set created_at if not already
+        # set. The previous code overwrote it on every
+        # prepare() call, which contradicts the method's
+        # idempotency contract (a retried prepare must not
+        # change the plan's identity attributes). The
+        # controller's authorize-mutation emits the durable
+        # plan with the initial created_at; subsequent
+        # prepare() calls (e.g. after NOT_APPLIED retry)
+        # preserve that timestamp.
+        if not self.plan.created_at:
+            self.plan.created_at = _utcnow_iso()
         _persist_plan(self.plan, self.workspace)
         return self.plan
 
