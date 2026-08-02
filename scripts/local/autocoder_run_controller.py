@@ -4206,6 +4206,78 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             and not state_mutation_target
             and args.mutation_target
         ):
+            # Round-73 P1 fix (Enforce target exclusion
+            # before PR-to-target upgrade): the previous
+            # Round-52 fix allowed a PR-scoped run to upgrade
+            # its scope to PR+target without checking that
+            # another controller already holds the target
+            # scope. _check_cross_scope_conflict only
+            # conflicts repository-wide leases with
+            # narrower leases (PR < repo, target < repo); it
+            # does NOT conflict PR and target scopes
+            # (because they have different scope_keys).
+            # Another controller can therefore hold the
+            # target-scoped lock while this PR-scoped run
+            # authorizes a mutation of the same head
+            # branch. Fix: explicitly check that no other
+            # run holds the target-scoped lock for the
+            # same (repository, target_pr_number,
+            # mutation_target) tuple. If another run
+            # holds it, refuse the upgrade (fail closed).
+            target_pr = _state_target_pr_number(state)
+            target_scope = {
+                "repository": (
+                    (state.get("run_identity") or {}).get("repository")
+                    or args.repository
+                ),
+                "target_pr_number": target_pr,
+                "mutation_target": args.mutation_target,
+            }
+            if target_scope["repository"]:
+                existing_target_outcome = _supervisor_lock.try_acquire(
+                    scope=target_scope,
+                    owner_run_id=(
+                        "__round73_check__"
+                    ),
+                    owner_host={"hostname": "check", "pid": 0},
+                    owner_pid=0,
+                    owner_start_evidence={"start_time": 0},
+                    owner_state_path="__check__",
+                    base_dir=_resolve_lock_base(
+                        args, Path(args.workspace)
+                    ),
+                )
+                if existing_target_outcome.ok:
+                    # We acquired the target scope. That
+                    # means no other run held it. Release
+                    # our sentinel and proceed with the
+                    # upgrade.
+                    _supervisor_lock.release(
+                        scope=target_scope,
+                        owner_run_id="__round73_check__",
+                        base_dir=_resolve_lock_base(
+                            args, Path(args.workspace)
+                        ),
+                    )
+                else:
+                    # Another run holds the target scope.
+                    # Refuse the upgrade (fail closed).
+                    holder_owner = (
+                        existing_target_outcome.owner.get("owner_run_id")
+                        if isinstance(existing_target_outcome.owner, dict)
+                        else None
+                    )
+                    print(
+                        f"ERROR: cannot authorize mutation: "
+                        f"target {args.mutation_target!r} on PR "
+                        f"{target_pr} is already held by another "
+                        f"controller (owner_run_id={holder_owner!r}). "
+                        "Refusing the PR-to-target upgrade to "
+                        "prevent concurrent mutations of the "
+                        "same head branch.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(11)
             # Override the scope mismatch: state the target
             # matches the supplied one (the operator is
             # upgrading the scope).

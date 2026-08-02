@@ -1337,13 +1337,19 @@ def test_authorize_mutation_emits_durable_plan_for_branch_create_force(tmp_path)
     (workspace / "LAUNCH_RECEIPT.json").write_text(json.dumps(receipt))
 
     # Acquire the supervisor lock for authorize-mutation.
+    # Round-74 fix: the scope key includes mutation_target
+    # when both target_pr_number and mutation_target are
+    # set, so the controller's lease check looks for the
+    # lock at the scope matching state.run_identity. The
+    # test state has run_identity with NO mutation_target
+    # (PR-only scope), so acquire the lease with
+    # mutation_target=None.
     import os
     from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
     lock_outcome = _try_acquire(
         scope={
             "repository": "owner/name",
             "target_pr_number": 416,
-            "mutation_target": "feat/new",
         },
         owner_run_id="r-end2end",
         owner_host={"hostname": "test", "user": "test"},

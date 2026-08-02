@@ -115,6 +115,20 @@ def build_scope_key(*, repository: str, target_pr_number: Optional[int] = None,
         (ident.shorthand if ident is not None else (repository or ""))
         .lower()
     )
+    if target_pr_number is not None and mutation_target:
+        # Round-74 P1 fix: when BOTH target_pr_number AND
+        # mutation_target are set, the scope key must include
+        # both components. The previous code returned
+        # `repo:<r>|pr:<pr>` for any scope with target_pr_number,
+        # ignoring mutation_target. This caused the PR-scoped
+        # lease and the (PR+target)-scoped lease to share
+        # the same key, making them indistinguishable on
+        # disk. Two controllers operating on the same PR
+        # would acquire the same lease when one intends
+        # PR+target and the other intends PR-only — defeating
+        # the per-target exclusion invariant. Include both
+        # in the key.
+        return f"repo:{repo}|pr:{int(target_pr_number)}|target:{mutation_target}"
     if target_pr_number is not None:
         return f"repo:{repo}|pr:{int(target_pr_number)}"
     if mutation_target:
