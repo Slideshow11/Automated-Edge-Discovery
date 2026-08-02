@@ -50,10 +50,18 @@ def _make_bare_with_clone(
     """Create a bare repo plus a clone that uses it as origin.
 
     Returns (bare_repo, clone_path).
+
+    The bare repo is initialized with --initial-branch=main
+    so the fixture is deterministic regardless of the
+    runner's init.defaultBranch setting. The symbolic-ref
+    HEAD assignment is kept as defense in depth: if the
+    caller's git is old and silently ignores
+    --initial-branch, the explicit HEAD assignment still
+    produces a main default.
     """
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
-    _git(tmp_path, "init", "--bare", str(bare))
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare))
     _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare), str(clone))
     _git(clone, "config", "user.email", "test@local")
@@ -310,8 +318,18 @@ def test_push_aborts_when_new_local_sha_does_not_exist(tmp_path):
     whatever the local ref happened to point to."""
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
-    subprocess.run(["git", "init", "--bare", str(bare), "-q"],
-                   check=True, capture_output=True)
+    # Use --initial-branch=main so this fixture is
+    # deterministic regardless of the runner's
+    # init.defaultBranch setting (the clean CI runner has
+    # master as the default initial branch, which would make
+    # the clone create refs/heads/master and cause
+    # `git push origin refs/heads/main` to fail with
+    # "src refspec refs/heads/main does not match any").
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main",
+         str(bare), "-q"],
+        check=True, capture_output=True,
+    )
     subprocess.run(["git", "clone", str(bare), str(clone), "-q"],
                    check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "t@l"],

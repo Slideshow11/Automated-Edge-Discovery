@@ -326,7 +326,8 @@ def _run_random_sequence(work_dir, seq):
         shutil.rmtree(bare)
     clone = work_dir / "clone"
     subprocess.run(
-        ["git", "init", "--bare", str(bare)],
+        ["git", "init", "--bare", "--initial-branch=main",
+         str(bare)],
         check=True, capture_output=True,
     )
     subprocess.run(
@@ -510,7 +511,8 @@ class GuardedRefStateMachine(RuleBasedStateMachine):
         self.workspace = self.tmp / "ws"
         self.workspace.mkdir(parents=True)
         subprocess.run(
-            ["git", "init", "--bare", str(self.bare), "-q"],
+            ["git", "init", "--bare", "--initial-branch=main",
+             str(self.bare), "-q"],
             check=True, capture_output=True,
         )
         subprocess.run(

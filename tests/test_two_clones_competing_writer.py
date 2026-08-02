@@ -50,9 +50,14 @@ def _setup_two_clones(tmp_path):
 
     Both clones start at the same HEAD on main. Both can
     push to the bare repo.
+
+    The bare repo is initialized with --initial-branch=main
+    so the fixture is deterministic regardless of the
+    runner's init.defaultBranch setting. The symbolic-ref
+    HEAD assignment is kept as defense in depth.
     """
     bare = tmp_path / "bare.git"
-    _git(tmp_path, "init", "--bare", str(bare), "-q")
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare), "-q")
     _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     clone_a = tmp_path / "clone_a"
     clone_b = tmp_path / "clone_b"

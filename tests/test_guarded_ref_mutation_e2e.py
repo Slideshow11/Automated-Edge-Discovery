@@ -65,10 +65,15 @@ def _make_bare_with_clone(
     """Create a bare repo plus a clone that uses it as origin.
 
     Returns (bare_repo, clone_path).
+
+    The bare repo is initialized with --initial-branch=main
+    so the fixture is deterministic regardless of the
+    runner's init.defaultBranch setting. The symbolic-ref
+    HEAD assignment is kept as defense in depth.
     """
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
-    _git(tmp_path, "init", "--bare", str(bare), "-q")
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare), "-q")
     _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
@@ -884,9 +889,9 @@ def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
     bare_origin = tmp_path / "bare_origin.git"
     bare_upstream = tmp_path / "bare_upstream.git"
     clone = tmp_path / "clone"
-    _git(tmp_path, "init", "--bare", str(bare_origin), "-q")
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare_origin), "-q")
     _git(bare_origin, "symbolic-ref", "HEAD", "refs/heads/main")
-    _git(tmp_path, "init", "--bare", str(bare_upstream), "-q")
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare_upstream), "-q")
     _git(bare_upstream, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare_origin), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")

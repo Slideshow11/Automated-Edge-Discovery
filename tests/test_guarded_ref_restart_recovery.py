@@ -49,9 +49,16 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
 
 
 def _setup_bare_with_clone(tmp_path: Path):
+    """Create a bare repo plus a clone that uses it as origin.
+
+    The bare repo is initialized with --initial-branch=main
+    so the fixture is deterministic regardless of the
+    runner's init.defaultBranch setting. The symbolic-ref
+    HEAD assignment is kept as defense in depth.
+    """
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
-    _git(tmp_path, "init", "--bare", str(bare), "-q")
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare), "-q")
     _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
     _git(tmp_path, "clone", str(bare), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
