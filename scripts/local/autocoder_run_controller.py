@@ -4081,6 +4081,50 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             file=sys.stderr,
         )
         sys.exit(12)
+    # Round-51 P1 fix (Require a target-scoped lease for
+    # ref-changing mutations): when a PR-scoped run
+    # authorizes force_push, push, or branch_delete with
+    # --mutation-target omitted, the previous condition
+    # passed and the authorization records no branch
+    # target. _check_cross_scope_conflict only conflicts
+    # repository-wide leases with narrower leases, so a
+    # second controller can hold a target-scoped lease for
+    # the same PR's head branch at the same time. Both
+    # leases are acquired and the PR-scoped force-push
+    # authorization succeeds, allowing two controllers to
+    # mutate the same ref concurrently. The fix: when
+    # authorizing an executor-pushed mutation
+    # (force_push, push, branch_delete, branch_create_force)
+    # on a PR-scoped run (no --mutation-target in state),
+    # REQUIRE --mutation-target on the CLI so the
+    # authorization records a target-scoped lock path.
+    # The target-scoped lease is then properly acquired
+    # and conflicts with other target-scoped leases via
+    # the existing cross-scope check. Note: squash_merge
+    # is NOT in this list — it is the controller's merge
+    # action, not an executor push, and the PR's head is
+    # already implicit in the PR's identity.
+    EXECUTOR_PUSHED_MUTATION_TYPES = {
+        "force_push",
+        "push",
+        "branch_delete",
+        "branch_create_force",
+    }
+    if (
+        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+        and not state_mutation_target
+        and not args.mutation_target
+    ):
+        print(
+            "ERROR: cannot authorize mutation: "
+            f"{args.mutation_type} on a PR-scoped run requires "
+            "--mutation-target. The cross-scope lease conflict "
+            "check uses --mutation-target to identify the head "
+            "branch; without it, two controllers can mutate the "
+            "same ref concurrently.",
+            file=sys.stderr,
+        )
+        sys.exit(14)
     # Round-120 P1 fix (round 6): canonicalize the repository
     # used in the authorization record. When the state has no
     # repository, two lexically different --workspace paths

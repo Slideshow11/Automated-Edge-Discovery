@@ -6624,6 +6624,67 @@ class TestRound49RejectReuseOfCompletedRunId:
         )
 
 
+class TestRound51RequireTargetForExecutorPushedMutations:
+    """Round-51 P1 fix: an executor-pushed mutation
+    (force_push, push, branch_delete, branch_create_force)
+    on a PR-scoped run (no --mutation-target in state) must
+    require --mutation-target on the CLI. Without it, the
+    cross-scope lease conflict check cannot identify the
+    head branch, and two controllers can hold concurrent
+    leases on the same ref."""
+
+    def test_force_push_on_pr_scoped_run_without_target_rejected(
+        self, tmp_path, isolated_lock_dir
+    ):
+        tasks = tmp_path / "TASKS.jsonl"
+        tasks.write_text(json.dumps({"task_id": "t1", "depends_on": []}) + chr(10) + "\n")
+        workspace = tmp_path / "ws"
+
+        # Initialize a PR-scoped run (no --mutation-target).
+        rc, _, err = run_controller(
+            [
+                "init",
+                "--run-id", "aed-r51-pr",
+                "--tasks-jsonl", str(tasks),
+                "--workspace", str(workspace),
+                "--integration-branch", "feat/x",
+                "--repository", "Slideshow11/Automated-Edge-Discovery",
+                "--target-pr-number", "950",
+                "--current-main-sha", "e4ef774",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 0, f"init failed: rc={rc}, err={err}"
+
+        # Try to authorize a force_push WITHOUT
+        # --mutation-target. The Round-51 fix must refuse
+        # with rc=14.
+        state_path = workspace / "CONTROLLER_STATE.json"
+        rc, _, err = run_controller(
+            [
+                "authorize-mutation",
+                "--state", str(state_path),
+                "--workspace", str(workspace),
+                "--mutation-type", "force_push",
+                "--expected-main-sha", "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+                "--expected-target-sha", "0f781d67a0c0a1b2c3d4e5f60718293a4b5c6d70",
+                # NO --mutation-target
+                "--pending-action", "force_push",
+            ],
+            cwd=str(tmp_path),
+            env={"AED_LOCK_DIR": str(tmp_path / "locks")},
+        )
+        assert rc == 14, (
+            f"Round-51 P1 fix missing: force_push without "
+            f"--mutation-target should fail with rc=14, got "
+            f"rc={rc}, err={err}"
+        )
+        assert "--mutation-target" in (err or ""), (
+            f"unexpected error: {err}"
+        )
+
+
 class TestRound37RepoIndexBlocksSameRepoCorruptNarrower:
     """Round-37 P2 fix: the cross-scope scan now consults
     a sibling `.repo` index file when a lock is unreadable.
