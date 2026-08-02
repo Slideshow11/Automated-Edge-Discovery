@@ -4814,6 +4814,18 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         clone_remote_url = cfg.stdout.strip() or None
     except (subprocess.CalledProcessError, FileNotFoundError):
         clone_remote_url = None
+    # Round-63 P2 fix (Keep file URLs on the URL
+    # reconciliation path): `file://...` URLs match none
+    # of the standard prefixes and would be incorrectly
+    # converted to Path("file:/..."). Treat `file://` as
+    # a URL transport: keep it as a URL string so the
+    # runner's `git ls-remote` can use it for
+    # reconciliation.
+    if clone_remote_url and clone_remote_url.startswith("file://"):
+        # Leave as a URL — the runner will use it via
+        # ls-remote on the same machine, or treat the
+        # underlying path if the runner can resolve it.
+        pass
     if remote_path is None:
         # Thread the configured URL into remote_path so the
         # runner's local-path code path runs unchanged.
@@ -4822,6 +4834,7 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             and not clone_remote_url.startswith("http")
             and not clone_remote_url.startswith("git@")
             and not clone_remote_url.startswith("ssh://")
+            and not clone_remote_url.startswith("file://")
         ):
             remote_path = Path(clone_remote_url)
             _early_block_ran = True

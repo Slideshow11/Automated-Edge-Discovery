@@ -410,18 +410,25 @@ class GuardedMutationOrchestrator:
             # remote_ref_path is supplied, fall back to
             # local delete via git update-ref (the previous
             # behavior).
-            if remote_ref_path is not None:
-                # The remote_ref_path is supplied by the
-                # caller (mutate-ref passes it for PUSH_REMOTE
-                # operations and explicitly via
-                # --remote-path). For DELETE_LOCAL it may
-                # not have been threaded through. We pass
-                # `remote` (the remote name, default
-                # "origin") and let guarded_push use the
-                # clone's remote.<name>.url as the actual
-                # push target. The reconcile() phase below
-                # will then read remote_ref_path to verify
-                # the deletion took effect on the remote.
+            #
+            # Round-63 P1 fix (Route URL-backed deletions
+            # through the remote CAS): the Round-59 fix
+            # only handled the locally-mounted-bare
+            # mirror case. For URL-backed remotes
+            # (HTTPS / SSH / file://) without a local
+            # bare mirror, resolve the configured remote
+            # URL and use push-delete against the URL. The
+            # push will fail if the local repo's remote
+            # URL is not actually a remote (network,
+            # auth); the runner treats that as
+            # INDETERMINATE. Local delete (the previous
+            # fallback) only happens when the configured
+            # remote URL is a local path (local-bare
+            # mirror without --remote-path) or when no
+            # remote URL can be resolved at all.
+            if remote_ref_path is not None and remote_ref_path != local_repo:
+                # Caller-supplied local bare path (CI
+                # integration test with --remote-path).
                 return ops.guarded_push(
                     repo=local_repo,
                     remote=remote,
@@ -430,6 +437,40 @@ class GuardedMutationOrchestrator:
                     new_local_sha=None,
                     delete_remote=True,
                 )
+            # Try to resolve the configured remote URL.
+            configured_url = None
+            try:
+                cfg = subprocess.run(
+                    ["git", "-C", str(local_repo),
+                     "config", "--get",
+                     f"remote.{remote}.url"],
+                    capture_output=True, text=True, check=True,
+                )
+                configured_url = cfg.stdout.strip() or None
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                configured_url = None
+            if configured_url and (
+                configured_url.startswith("http")
+                or configured_url.startswith("https")
+                or configured_url.startswith("git@")
+                or configured_url.startswith("ssh://")
+                or configured_url.startswith("file://")
+            ):
+                # URL-backed remote: use push-delete via
+                # the configured URL. The local clone's
+                # remote.<name>.url is the actual push
+                # target.
+                return ops.guarded_push(
+                    repo=local_repo,
+                    remote=remote,
+                    ref=self.plan.target_ref,
+                    expected_remote_sha=self.plan.expected_before_sha,
+                    new_local_sha=None,
+                    delete_remote=True,
+                )
+            # Fall back to local delete (the previous
+            # behavior for local-bare without --remote-path
+            # or no remote URL at all).
             return ops.guarded_delete_ref(
                 repo=local_repo,
                 ref=self.plan.target_ref,

@@ -149,14 +149,24 @@ def test_e_branch_delete_with_remote_path_uses_push_delete(tmp_path):
 
 
 def test_e_branch_delete_without_remote_path_uses_local_delete(tmp_path):
-    """E.2: branch_delete WITHOUT remote_ref_path falls back to
-    the local git-update-ref delete (the previous behavior).
+    """E.2: branch_delete WITHOUT remote_path AND with a
+    local-bare configured URL falls back to the local
+    git-update-ref delete (the previous behavior).
 
-    This is the original local-delete semantics; the remote is
-    not touched."""
+    This is the original local-delete semantics; the remote
+    is not touched. URL-backed remotes without --remote-path
+    are routed through the remote CAS (Round-63 P1 fix)."""
     bare, clone = _make_bare_with_clone(tmp_path)
+    # Override origin with the local-bare path so the
+    # runner uses the local-delete fallback (the
+    # URL-backed path would attempt a push).
+    import subprocess
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(bare)],
+        cwd=str(clone), capture_output=True, text=True, check=True,
+    )
     initial = _seed(clone, ref="refs/heads/feat/local")
-    _git(clone, "push", "bare", "refs/heads/feat/local:refs/heads/feat/local", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/local:refs/heads/feat/local", "-q")
     assert ops.read_ref(bare, "refs/heads/feat/local") == initial
 
     plan = grm.GuardedMutationPlan(
