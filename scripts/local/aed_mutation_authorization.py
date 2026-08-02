@@ -461,6 +461,28 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
                 # iteration may still hit heads_match with a
                 # SUCCESS status and reject.
                 continue
+            # Round-64 P2 fix (Permit repeatable mutations
+            # after head changes): for repeatable mutation
+            # types (e.g. `pr_body_update`) the caller may
+            # legitimately authorize a fresh mutation after
+            # a previous SUCCESS even when the expected
+            # main or target SHA has changed (new commits
+            # landed between two PR-body updates). The
+            # unconditional drift rejection below
+            # contradicts the repeatable-mutation
+            # exception above. Skip the drift rejection for
+            # repeatable types whose prior status is
+            # SUCCESS.
+            prior_result_drift = rec.get("result") or {}
+            prior_status_drift = (
+                prior_result_drift.get("status")
+                if isinstance(prior_result_drift, dict)
+                else None
+            )
+            if prior_status_drift == "success" and _is_repeatable_mutation_type(
+                rec.get("mutation_type")
+            ):
+                continue
             return AuthorizationOutcome(
                 ok=False,
                 mutation_id=None,
