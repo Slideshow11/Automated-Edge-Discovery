@@ -5079,9 +5079,40 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # UPDATE_LOCAL / CREATE_LOCAL / DELETE_LOCAL operations
     # the local clone IS authoritative, so the existing
     # fallback `remote_path or local_repo` remains correct.
-    is_push_remote = op is GrdOp.PUSH_REMOTE
+    # Round-68 P1 fix (Reconcile URL-backed deletions against
+    # the remote): the Round-61 P1 fix only treated
+    # PUSH_REMOTE as requiring the remote URL fallback.
+    # DELETE_LOCAL plans pushed to a URL-backed remote (the
+    # Round-63 path) also need the URL fallback so
+    # reconciliation reads the actual remote state, not the
+    # local clone's pre-deletion branch. Local-bare
+    # configurations still use the local_repo fallback
+    # because the runner uses local delete for them.
+    is_remote_reconcile = op is GrdOp.PUSH_REMOTE
+    if (
+        op is GrdOp.DELETE_LOCAL
+        and remote_path is None
+    ):
+        # Check if the configured remote is URL-backed.
+        try:
+            cfg_check = subprocess.run(
+                ["git", "-C", str(local_repo),
+                 "config", "--get",
+                 f"remote.{args.remote}.url"],
+                capture_output=True, text=True, check=True,
+            )
+            url_check = cfg_check.stdout.strip() or ""
+            if (
+                url_check.startswith("http")
+                or url_check.startswith("git@")
+                or url_check.startswith("ssh://")
+                or url_check.startswith("file://")
+            ):
+                is_remote_reconcile = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
     reconcile_remote_ref_path = (
-        None if is_push_remote and remote_path is None
+        None if is_remote_reconcile and remote_path is None
         else (remote_path or local_repo)
     )
     if current_state in (

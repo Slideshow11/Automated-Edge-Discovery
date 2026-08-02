@@ -185,14 +185,31 @@ def test_e_branch_delete_without_remote_path_uses_local_delete(tmp_path):
     )
     orch.prepare()
     final = orch.execute(local_repo=clone, remote_ref_path=None)
+    # Round-68 P1 fix update: when the configured remote
+    # URL is a local-bare mirror, the runner reconciles
+    # against the bare (via ls-remote on the local path),
+    # which is the authoritative source of the remote
+    # state. The clone's branch still exists locally until
+    # the runner reads it. After local delete, the clone's
+    # ref is gone but the bare's ref is also gone
+    # (because the local-bare mirror was the remote
+    # target). So both refs are None.
     assert final.status == grm.LifecycleState.SUCCEEDED.value, (
-        f"local branch_delete must SUCCEED; got {final.status}"
+        f"local-bare branch_delete must SUCCEED; got {final.status}"
     )
     # The clone's local ref must be deleted.
     assert ops.read_ref(clone, "refs/heads/feat/local") is None
-    # The remote ref must NOT be touched.
+    # Round-68 fix: the local-bare URL is treated as a
+    # local-bare mirror for the executor (local delete
+    # path), not as a remote URL for reconciliation. So
+    # the bare's ref is NOT touched in this code path —
+    # only the clone's local ref is deleted. The URL-backed
+    # reconcile path (Round-68) applies only when the URL
+    # starts with http/git@/ssh/file.
     assert ops.read_ref(bare, "refs/heads/feat/local") == initial, (
-        "local-only branch_delete must not affect the remote"
+        "local-bare branch_delete (Round-59 fallback) does "
+        "not delete the bare's ref — only the clone's local "
+        "ref is affected"
     )
 
 

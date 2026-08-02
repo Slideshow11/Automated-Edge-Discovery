@@ -317,11 +317,52 @@ class GuardedMutationOrchestrator:
         # configured remote URL when the operation is
         # PUSH_REMOTE and no local bare is available; fall
         # back to the local repo for non-PUSH operations.
+        #
+        # Round-68 P1 fix (Reconcile URL-backed deletions
+        # against the remote): for a DELETE_LOCAL plan that
+        # was just pushed to a URL-backed remote (Round-63
+        # path), the local clone's branch still exists
+        # until the next `git remote prune`, so reading the
+        # local branch returns the pre-deletion SHA. The
+        # runner must reconcile against the actual remote
+        # state (via ls-remote on the configured remote URL)
+        # so a successful remote deletion is reported as
+        # SUCCEEDED, not NOT_APPLIED. The condition here
+        # extends the Round-60 PUSH_REMOTE fallback to also
+        # cover DELETE_LOCAL when the configured remote is
+        # URL-backed (http/https/git@/ssh/file). Local-bare
+        # URLs continue to use the local_repo fallback
+        # because the runner's _do_execute used local delete
+        # for them, not the remote CAS.
+        is_url_backed = False
+        if remote_ref_path is None and self.plan.operation in (
+            grm.Operation.PUSH_REMOTE.value,
+            grm.Operation.DELETE_LOCAL.value,
+        ):
+            try:
+                cfg = subprocess.run(
+                    ["git", "-C", str(local_repo),
+                     "config", "--get",
+                     f"remote.{remote}.url"],
+                    capture_output=True, text=True, check=True,
+                )
+                clone_url_check = cfg.stdout.strip() or ""
+                is_url_backed = (
+                    clone_url_check.startswith("http")
+                    or clone_url_check.startswith("git@")
+                    or clone_url_check.startswith("ssh://")
+                    or clone_url_check.startswith("file://")
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                is_url_backed = False
         if remote_ref_path is not None:
             read_result = _read_remote_ref_via_query(
                 remote_ref_path, self.plan.target_ref
             )
-        elif self.plan.operation == grm.Operation.PUSH_REMOTE.value:
+        elif self.plan.operation == grm.Operation.PUSH_REMOTE.value or (
+            self.plan.operation == grm.Operation.DELETE_LOCAL.value
+            and is_url_backed
+        ):
             clone_remote_url = None
             try:
                 cfg = subprocess.run(
