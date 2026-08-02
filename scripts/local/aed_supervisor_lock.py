@@ -956,6 +956,19 @@ def try_acquire(
     evidence) with a process-evidence fallback. Indeterminate
     liveness FAILS CLOSED (returns ok=False with indeterminate=True
     and reason="indeterminate_liveness").
+
+    Round-71 P1 fix (Hold the repository sentinel through lease
+    publication): the entire post-acquisition body (cross-scope
+    conflict scan + per-scope sentinel acquisition + payload
+    publication + final acquisition return) runs inside a single
+    outer try/finally that holds the per-repository sentinel
+    through the end. Holding the per-repo sentinel through
+    publication serializes concurrent initializers for distinct
+    scopes but the same repository; without it, two contenders
+    can both pass the cross-scope check before either publishes
+    its lease. The sentinel is released in the outer finally
+    block so all return paths (early-exit LockOutcome, exceptions,
+    the final acquisition return) release it without leaking.
     """
     scope_key = build_scope_key(
         repository=scope["repository"],
@@ -964,23 +977,13 @@ def try_acquire(
     )
     path = lock_path_for(scope_key, base_dir=base_dir)
 
-    # Round-50 P1 fix (Serialize cross-scope acquisition at
-    # repository level — PARTIAL): when repository-wide and
-    # PR- or target-scoped acquisitions for the same
-    # repository start concurrently in an empty lock
-    # directory, both can complete the cross-scope conflict
-    # scan before either publishes its lock. The full fix
-    # (a per-repo sentinel held through publication)
-    # requires restructuring try_acquire to wrap the entire
-    # post-acquisition body in try/finally. For this round,
-    # the partial fix is: acquire a per-repo sentinel ONLY
-    # for the duration of the cross-scope check, then
-    # release it before the per-scope sentinel acquisition.
-    # This serializes the cross-scope check itself; the
-    # publication is still protected by the per-scope
-    # sentinel. A future round should add the full
-    # try/finally refactor.
+    # Acquire the per-repository sentinel BEFORE the
+    # cross-scope conflict scan. The sentinel is held
+    # through the entire post-acquisition body via the
+    # outer try/finally below.
     repository = scope.get("repository") or ""
+    repo_sentinel_fd = None
+    repo_sentinel_path = None
     if repository:
         repo_sentinel_path = _repo_sentinel_path(
             repository, base_dir
@@ -995,210 +998,209 @@ def try_acquire(
                 owner=None,
                 reason="repo_sentinel_busy",
             )
-    else:
-        repo_sentinel_fd = None
     try:
         # Round-32 P1 fix (Make repository-wide leases conflict
         # with narrower scopes): check that a wider or narrower
         # lease for the same repository is not already held. See
         # _check_cross_scope_conflict for the full reasoning.
+        # The per-repo sentinel above serializes this scan AND
+        # the subsequent per-scope sentinel acquisition AND
+        # the lease publication.
         cross_scope_conflict = _check_cross_scope_conflict(
             scope=scope, base_dir=base_dir,
         )
-    finally:
-        # Release the per-repo sentinel AFTER the cross-scope
-        # check. The per-scope sentinel (acquired below) takes
-        # over for the publication.
-        if repo_sentinel_fd is not None:
-            _release_sentinel_fd(repo_sentinel_fd, repo_sentinel_path)
-    if cross_scope_conflict is not None:
-        return cross_scope_conflict
+        if cross_scope_conflict is not None:
+            return cross_scope_conflict
 
-    # Build the candidate lock payload.
-    now_iso = _utcnow()
-    payload = {
-        "lock_version": LOCK_VERSION,
-        "lock_version_chain": 1,
-        "scope_key": scope_key,
-        "scope": scope,
-        "owner_run_id": owner_run_id,
-        "owner_host": owner_host,
-        "owner_pid": owner_pid,
-        "owner_state_path": owner_state_path,
-        "owner_start_evidence": owner_start_evidence,
-        "created_at": now_iso,
-        "last_renewed_at": now_iso,
-        "max_age_seconds": int(max_age_seconds),
-        "recovery_history": [],
-    }
-    assert_no_secrets(payload, context=str(path))
+        # Build the candidate lock payload.
+        now_iso = _utcnow()
+        payload = {
+            "lock_version": LOCK_VERSION,
+            "lock_version_chain": 1,
+            "scope_key": scope_key,
+            "scope": scope,
+            "owner_run_id": owner_run_id,
+            "owner_host": owner_host,
+            "owner_pid": owner_pid,
+            "owner_state_path": owner_state_path,
+            "owner_start_evidence": owner_start_evidence,
+            "created_at": now_iso,
+            "last_renewed_at": now_iso,
+            "max_age_seconds": int(max_age_seconds),
+            "recovery_history": [],
+        }
+        assert_no_secrets(payload, context=str(path))
 
-    existing = _read_lock(path)
-    if existing is None and _is_corrupt_lock(path):
-        # Round-8 P1 fix: a corrupt existing lease cannot be
-        # treated as "no lock" — the file exists, was created by
-        # an interrupted prior bootstrap, and would let a new
-        # acquirer overwrite an in-progress lease. Refuse and
-        # require explicit recover_stale() so the operator's
-        # intent is recorded.
-        return LockOutcome(
-            ok=False,
-            path=path,
-            owner=None,
-            reason="corrupt_existing_lease_recovery_required",
-        )
-    if existing is None:
-        # No existing lock. Round-8 P1 fix: publish atomically.
-        # The previous code did O_EXCL then `json.dump` into the
-        # live fd; a kill between create and close would leave an
-        # empty or truncated lock file that subsequent acquirers
-        # cannot recover. Now: write the complete payload to a
-        # sibling tmp file, then os.replace to publish atomically.
-        # Round-9 P1 fix (Serialize initial lease publication):
-        # hold the same scope sentinel used by recover_stale/
-        # release while publishing. Without the sentinel, two
-        # concurrent inits could both observe no lock, both write
-        # a .new file, and the second os.replace would overwrite
-        # the first's lease — both calls would then return ok.
-        # The sentinel serializes the read+publish sequence.
-        sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
-        sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
-        if sentinel_fd is None:
+        existing = _read_lock(path)
+        if existing is None and _is_corrupt_lock(path):
+            # Round-8 P1 fix: a corrupt existing lease cannot be
+            # treated as "no lock" — the file exists, was created by
+            # an interrupted prior bootstrap, and would let a new
+            # acquirer overwrite an in-progress lease. Refuse and
+            # require explicit recover_stale() so the operator's
+            # intent is recorded.
             return LockOutcome(
                 ok=False,
                 path=path,
                 owner=None,
-                reason="acquire_sentinel_busy",
+                reason="corrupt_existing_lease_recovery_required",
             )
-        try:
-            # Re-check inside the sentinel: another contender may
-            # have raced ahead of us between _read_lock above and
-            # the sentinel acquire.
-            existing2 = _read_lock(path)
-            if existing2 is not None:
-                evidence = assess_liveness(existing2)
-                if evidence.is_indeterminate:
-                    return LockOutcome(
-                        ok=False,
-                        path=path,
-                        owner=existing2,
-                        reason=f"indeterminate_liveness_after_sentinel:{evidence.reason}",
-                        indeterminate=True,
-                    )
-                if evidence.is_alive:
-                    return LockOutcome(
-                        ok=False,
-                        path=path,
-                        owner=existing2,
-                        reason=f"live_lock_held_by:{existing2.get('owner_run_id')}",
-                    )
-            tmp_path = path.with_suffix(path.suffix + ".new")
-            try:
-                with safe_restrictive_open(tmp_path, "w") as f:
-                    json.dump(payload, f, indent=2, sort_keys=True)
-                    f.write("\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                # One more re-check immediately before replace, in
-                # case the previous contents reappeared after we
-                # cleared the sentinel — they cannot, but this is
-                # the last line of defense against the round-9 race.
-                existing3 = _read_lock(path)
-                if existing3 is not None:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    return LockOutcome(
-                        ok=False,
-                        path=path,
-                        owner=existing3,
-                        reason="lock_reappeared_during_publish",
-                    )
-                try:
-                    os.replace(tmp_path, path)
-                    # Round-37 P2 fix: write the sibling
-                    # `.repo` index file alongside the
-                    # lock so the cross-scope scan can
-                    # identify corrupt leases'
-                    # repositories. Best-effort: ignore
-                    # errors.
-                    _write_repo_index(
-                        path, (scope.get("repository") or "")
-                    )
-                except OSError as e:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    return LockOutcome(
-                        ok=False,
-                        path=path,
-                        owner=None,
-                        reason=f"atomic_publish_failed:{e.strerror or str(e)}",
-                    )
-                # Round-23 P1 fix (Fsync the lock directory after
-                # publishing the lease): os.replace renames the
-                # tmp inode into the lock path, but on POSIX the
-                # directory entry update is a separate write that
-                # the file's own fsync does not cover. If a power
-                # loss occurs immediately after os.replace but
-                # before the directory is fsynced, the live
-                # inode may still exist but its directory entry
-                # may be missing — and a later initializer can
-                # then acquire the same scope while the original
-                # run is resumed, defeating exclusivity. fsync the
-                # lock directory before reporting acquisition.
-                try:
-                    dir_fd = os.open(
-                        str(path.parent), os.O_RDONLY | _posix_cloexec_flag()
-                    )
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except (OSError, NotImplementedError):
-                    # Non-POSIX or unsupported (e.g. some FUSE
-                    # filesystems). The file is published on
-                    # disk; we accept the smaller window.
-                    pass
-            except OSError as e:
+        if existing is None:
+            # No existing lock. Round-8 P1 fix: publish atomically.
+            # The previous code did O_EXCL then `json.dump` into the
+            # live fd; a kill between create and close would leave an
+            # empty or truncated lock file that subsequent acquirers
+            # cannot recover. Now: write the complete payload to a
+            # sibling tmp file, then os.replace to publish atomically.
+            # Round-9 P1 fix (Serialize initial lease publication):
+            # hold the same scope sentinel used by recover_stale/
+            # release while publishing. Without the sentinel, two
+            # concurrent inits could both observe no lock, both write
+            # a .new file, and the second os.replace would overwrite
+            # the first's lease — both calls would then return ok.
+            # The sentinel serializes the read+publish sequence.
+            sentinel_path = path.with_suffix(path.suffix + ".recovery-sentinel")
+            sentinel_fd = _acquire_sentinel_fd(sentinel_path, max_attempts=20)
+            if sentinel_fd is None:
                 return LockOutcome(
                     ok=False,
                     path=path,
                     owner=None,
-                    reason=f"write_tmp_failed:{e.strerror or str(e)}",
+                    reason="acquire_sentinel_busy",
                 )
-        finally:
-            _release_sentinel_fd(sentinel_fd, sentinel_path)
-        return LockOutcome(ok=True, path=path, owner=payload, reason="acquired")
+            try:
+                # Re-check inside the sentinel: another contender may
+                # have raced ahead of us between _read_lock above and
+                # the sentinel acquire.
+                existing2 = _read_lock(path)
+                if existing2 is not None:
+                    evidence = assess_liveness(existing2)
+                    if evidence.is_indeterminate:
+                        return LockOutcome(
+                            ok=False,
+                            path=path,
+                            owner=existing2,
+                            reason=f"indeterminate_liveness_after_sentinel:{evidence.reason}",
+                            indeterminate=True,
+                        )
+                    if evidence.is_alive:
+                        return LockOutcome(
+                            ok=False,
+                            path=path,
+                            owner=existing2,
+                            reason=f"live_lock_held_by:{existing2.get('owner_run_id')}",
+                        )
+                tmp_path = path.with_suffix(path.suffix + ".new")
+                try:
+                    with safe_restrictive_open(tmp_path, "w") as f:
+                        json.dump(payload, f, indent=2, sort_keys=True)
+                        f.write("\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # One more re-check immediately before replace, in
+                    # case the previous contents reappeared after we
+                    # cleared the sentinel — they cannot, but this is
+                    # the last line of defense against the round-9 race.
+                    existing3 = _read_lock(path)
+                    if existing3 is not None:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        return LockOutcome(
+                            ok=False,
+                            path=path,
+                            owner=existing3,
+                            reason="lock_reappeared_during_publish",
+                        )
+                    try:
+                        os.replace(tmp_path, path)
+                        # Round-37 P2 fix: write the sibling
+                        # `.repo` index file alongside the
+                        # lock so the cross-scope scan can
+                        # identify corrupt leases'
+                        # repositories. Best-effort: ignore
+                        # errors.
+                        _write_repo_index(
+                            path, (scope.get("repository") or "")
+                        )
+                    except OSError as e:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        return LockOutcome(
+                            ok=False,
+                            path=path,
+                            owner=None,
+                            reason=f"atomic_publish_failed:{e.strerror or str(e)}",
+                        )
+                    # Round-23 P1 fix (Fsync the lock directory after
+                    # publishing the lease): os.replace renames the
+                    # tmp inode into the lock path, but on POSIX the
+                    # directory entry update is a separate write that
+                    # the file's own fsync does not cover. If a power
+                    # loss occurs immediately after os.replace but
+                    # before the directory is fsynced, the live
+                    # inode may still exist but its directory entry
+                    # was lost; a subsequent observer would see
+                    # "no lock". Fsync the directory.
+                    try:
+                        dir_fd = os.open(str(path.parent), os.O_RDONLY | _posix_cloexec_flag())
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except (OSError, NotImplementedError):
+                        # Non-POSIX or unsupported (e.g. some FUSE
+                        # filesystems). The file is published on
+                        # disk; we accept the smaller window.
+                        pass
+                except OSError as e:
+                    return LockOutcome(
+                        ok=False,
+                        path=path,
+                        owner=None,
+                        reason=f"write_tmp_failed:{e.strerror or str(e)}",
+                    )
+            finally:
+                _release_sentinel_fd(sentinel_fd, sentinel_path)
+            return LockOutcome(ok=True, path=path, owner=payload, reason="acquired")
 
-    # Existing lock present. Determine if it's alive.
-    evidence = assess_liveness(existing)
-    if evidence.is_indeterminate:
+        # Existing lock present. Determine if it's alive.
+        evidence = assess_liveness(existing)
+        if evidence.is_indeterminate:
+            return LockOutcome(
+                ok=False,
+                path=path,
+                owner=existing,
+                reason=f"indeterminate_liveness:{evidence.reason}",
+                indeterminate=True,
+            )
+        if evidence.is_alive:
+            return LockOutcome(
+                ok=False,
+                path=path,
+                owner=existing,
+                reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
+            )
+
+        # Stale lock. Do NOT silently overwrite. Caller must use
+        # recover_stale() explicitly.
         return LockOutcome(
             ok=False,
             path=path,
             owner=existing,
-            reason=f"indeterminate_liveness:{evidence.reason}",
-            indeterminate=True,
+            reason=f"stale_lock_detected:{evidence.reason}",
         )
-    if evidence.is_alive:
-        return LockOutcome(
-            ok=False,
-            path=path,
-            owner=existing,
-            reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
-        )
-
-    # Stale lock. Do NOT silently overwrite. Caller must use
-    # recover_stale() explicitly.
-    return LockOutcome(
-        ok=False,
-        path=path,
-        owner=existing,
-        reason=f"stale_lock_detected:{evidence.reason}",
-    )
+    finally:
+        # Round-71 P1 fix: release the per-repo sentinel at
+        # the END of the function. The outer try/finally
+        # ensures all return paths (early-exit LockOutcome,
+        # exceptions, AND the final acquisition return)
+        # release the sentinel without leaking it.
+        if repo_sentinel_fd is not None and repo_sentinel_path is not None:
+            _release_sentinel_fd(repo_sentinel_fd, repo_sentinel_path)
 
 
 def recover_stale(
