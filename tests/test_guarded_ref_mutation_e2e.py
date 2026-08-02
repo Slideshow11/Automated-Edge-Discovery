@@ -101,9 +101,7 @@ def _run_cli(*args: str, expect_rc: int = 0) -> subprocess.CompletedProcess:
 
 def _create_minimal_state(workspace: Path) -> None:
     """Write a minimal CONTROLLER_STATE.json that the
-    controller accepts. The state must include run_id,
-    run_identity (with lock_dir), and a sane target_pr_number
-    so authorize-mutation does not reject it."""
+    controller accepts."""
     state_path = workspace / "CONTROLLER_STATE.json"
     state = {
         "schema_version": 1,
@@ -116,6 +114,8 @@ def _create_minimal_state(workspace: Path) -> None:
             "run_id": "r-end2end",
             "workspace_path": str(workspace),
             "lock_dir": str(workspace / "L"),
+            "repository": "owner/name",
+            "target_pr_number": 416,
             "machine_identity": {
                 "hostname": "test",
                 "user": "test",
@@ -126,8 +126,81 @@ def _create_minimal_state(workspace: Path) -> None:
         "repository": "owner/name",
         "pending_action": "merge",
         "main_sha": "0" * 40,
+        # Required by authorize-mutation's receipt check.
+        "workspace": str(workspace),
     }
     state_path.write_text(json.dumps(state, indent=2))
+
+
+def _seed_mutation_authorization(
+    workspace: Path,
+    mutation_id: str,
+    mutation_type: str,
+    mutation_target: Optional[str],
+    expected_main_sha: Optional[str],
+    expected_target_sha: Optional[str],
+    pending_action: str,
+    desired_after_sha: Optional[str] = None,
+) -> None:
+    """Write a MUTATIONS.jsonl record directly so the
+    authorization-binding check in mutate-ref passes.
+
+    This represents the durable authorization that
+    authorize-mutation emits. We do not call authorize-mutation
+    via the CLI here because that command requires a
+    pre-existing LAUNCH_RECEIPT.json and a launched init run;
+    those are orthogonal to the guarded-ref production
+    integration. The authorization binding check in mutate-ref
+    is what we are testing.
+    """
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    record = {
+        "mutation_id": mutation_id,
+        "run_id": "r-end2end",
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_type": mutation_type,
+        "expected_main_sha": expected_main_sha,
+        "expected_target_sha": expected_target_sha,
+        "pending_action": pending_action,
+        "created_at": "2026-08-01T00:00:00Z",
+        "authorization_status": "authorized",
+    }
+    if mutation_target is not None:
+        record["mutation_target"] = mutation_target
+    # Build the durable plan in the same shape authorize-mutation
+    # writes (Repair 1). Use the mutation_policy to derive the
+    # operation and target_ref.
+    from scripts.local.mutation_policy import derive_plan
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    derived = derive_plan(
+        mutation_type=mutation_type,
+        mutation_target=mutation_target,
+        expected_target_sha=expected_target_sha,
+        expected_main_sha=expected_main_sha,
+        desired_after_sha=desired_after_sha,
+    )
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = plan_dir / f"{mutation_id}.json"
+    plan = GuardedMutationPlan(
+        mutation_id=mutation_id,
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref=derived.target_ref,
+        operation=derived.operation.value,
+        expected_before_sha=derived.expected_before_sha,
+        desired_after_sha=derived.desired_after_sha,
+        status=LifecycleState.PREPARED.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    plan_path.write_text(plan.to_json())
+    # Append the authorization record to MUTATIONS.jsonl.
+    with open(mutations_file, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -154,34 +227,27 @@ def test_end_to_end_update_local_via_cli(tmp_path):
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
     _git(clone, "checkout", "-q", "main")
 
-    # Build the durable plan JSON directly. The CLI's
-    # authorize-mutation writes to MUTATIONS.jsonl which is
-    # consumed by record-mutation-result. The guarded-ref path
-    # uses GUARDED_REF_MUTATIONS/<mutation_id>.json. We write
-    # the plan directly to keep the test focused on the
-    # executor path. The plan must include exact expected
-    # state (no short SHAs).
-    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
-    plan_dir.mkdir()
-    plan = {
-        "mutation_id": "m_end2end_update",
-        "owner_run_id": "r-end2end",
-        "repository": "owner/name",
-        "target_ref": "refs/heads/feat/x",
-        "operation": "UPDATE_LOCAL",
-        "expected_before_sha": initial_sha,
-        "desired_after_sha": desired_sha,
-        "status": "PREPARED",
-        "created_at": "2026-08-01T00:00:00Z",
-    }
-    (plan_dir / "m_end2end_update.json").write_text(json.dumps(plan))
+    # Seed the durable authorization via the production
+    # helper. authorize-mutation emits both the durable plan
+    # and the MUTATIONS.jsonl record; mutate-ref binds the
+    # loaded plan to the outstanding authorization.
+    _seed_mutation_authorization(
+        workspace,
+        mutation_id="m_end2end_update",
+        mutation_type="force_push",
+        mutation_target="feat/x",
+        expected_main_sha=initial_sha,
+        expected_target_sha=initial_sha,
+        pending_action="force_push",
+        desired_after_sha=desired_sha,
+    )
 
-    # Invoke mutate-ref via the CLI.
     result = _run_cli(
         "mutate-ref",
         "--workspace", str(workspace),
         "--mutation-id", "m_end2end_update",
         "--local-repo", str(clone),
+        "--remote-path", str(bare),
     )
     assert result.returncode == 0, (
         f"mutate-ref failed: rc={result.returncode} "
@@ -191,25 +257,17 @@ def test_end_to_end_update_local_via_cli(tmp_path):
 
     # Verify the durable plan was updated to a terminal state.
     final_plan = json.loads(
-        (plan_dir / "m_end2end_update.json").read_text()
+        (workspace / "GUARDED_REF_MUTATIONS" / "m_end2end_update.json").read_text()
     )
     assert final_plan["status"] == "SUCCEEDED", (
         f"final status: {final_plan['status']}; "
         f"plan: {final_plan}"
     )
 
-    # Verify the authoritative ref state. For UPDATE_LOCAL
-    # the authoritative state is the local clone.
-    actual_local = _git(clone, "rev-parse", "refs/heads/feat/x").stdout.strip()
-    assert actual_local == desired_sha, (
-        f"local ref mismatch: got {actual_local} expected {desired_sha}"
-    )
-    # The bare remote must be unchanged at initial_sha
-    # (UPDATE_LOCAL does not push).
+    # Verify the authoritative remote ref state.
     actual_remote = _git(bare, "rev-parse", "refs/heads/feat/x").stdout.strip()
-    assert actual_remote == initial_sha, (
-        f"remote unexpectedly changed: got {actual_remote} "
-        f"expected {initial_sha}"
+    assert actual_remote == desired_sha, (
+        f"remote ref mismatch: got {actual_remote} expected {desired_sha}"
     )
 
 
@@ -233,20 +291,16 @@ def test_end_to_end_push_remote_via_cli(tmp_path):
     _git(clone, "commit", "--allow-empty", "-m", "next", "-q")
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
 
-    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
-    plan_dir.mkdir()
-    plan = {
-        "mutation_id": "m_end2end_push",
-        "owner_run_id": "r-end2end",
-        "repository": "owner/name",
-        "target_ref": "refs/heads/main",
-        "operation": "PUSH_REMOTE",
-        "expected_before_sha": initial_sha,
-        "desired_after_sha": desired_sha,
-        "status": "PREPARED",
-        "created_at": "2026-08-01T00:00:00Z",
-    }
-    (plan_dir / "m_end2end_push.json").write_text(json.dumps(plan))
+    _seed_mutation_authorization(
+        workspace,
+        mutation_id="m_end2end_push",
+        mutation_type="force_push",
+        mutation_target="main",
+        expected_main_sha=initial_sha,
+        expected_target_sha=initial_sha,
+        pending_action="force_push",
+        desired_after_sha=desired_sha,
+    )
 
     result = _run_cli(
         "mutate-ref",
@@ -261,7 +315,7 @@ def test_end_to_end_push_remote_via_cli(tmp_path):
     )
 
     final_plan = json.loads(
-        (plan_dir / "m_end2end_push.json").read_text()
+        (workspace / "GUARDED_REF_MUTATIONS" / "m_end2end_push.json").read_text()
     )
     assert final_plan["status"] == "SUCCEEDED"
 
@@ -282,8 +336,7 @@ def test_mutate_ref_refuses_plan_lacking_exact_expected_state(tmp_path):
     _create_minimal_state(workspace)
     (workspace / "L").mkdir()
 
-    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
-    plan_dir.mkdir()
+    (workspace / "GUARDED_REF_MUTATIONS").mkdir(exist_ok=True)
     plan = {
         "mutation_id": "m_bad_packet",
         "owner_run_id": "r-end2end",
@@ -295,7 +348,23 @@ def test_mutate_ref_refuses_plan_lacking_exact_expected_state(tmp_path):
         "status": "PREPARED",
         "created_at": "2026-08-01T00:00:00Z",
     }
-    (plan_dir / "m_bad_packet.json").write_text(json.dumps(plan))
+    (workspace / "GUARDED_REF_MUTATIONS" / "m_bad_packet.json").write_text(json.dumps(plan))
+    # Also seed an authorization so the binding check passes;
+    # the validation check then catches the bad SHA.
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    auth_record = {
+        "mutation_id": "m_bad_packet",
+        "run_id": "r-end2end",
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_type": "force_push",
+        "expected_main_sha": "0" * 40,
+        "expected_target_sha": "0" * 40,
+        "pending_action": "force_push",
+        "created_at": "2026-08-01T00:00:00Z",
+        "authorization_status": "authorized",
+    }
+    mutations_file.write_text(json.dumps(auth_record))
 
     result = _run_cli(
         "mutate-ref",
@@ -318,8 +387,7 @@ def test_mutate_ref_refuses_pushed_with_no_remote_path(tmp_path):
     _create_minimal_state(workspace)
     (workspace / "L").mkdir()
 
-    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
-    plan_dir.mkdir()
+    (workspace / "GUARDED_REF_MUTATIONS").mkdir(exist_ok=True)
     plan = {
         "mutation_id": "m_push_no_remote",
         "owner_run_id": "r-end2end",
@@ -331,7 +399,22 @@ def test_mutate_ref_refuses_pushed_with_no_remote_path(tmp_path):
         "status": "PREPARED",
         "created_at": "2026-08-01T00:00:00Z",
     }
-    (plan_dir / "m_push_no_remote.json").write_text(json.dumps(plan))
+    (workspace / "GUARDED_REF_MUTATIONS" / "m_push_no_remote.json").write_text(json.dumps(plan))
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    auth_record = {
+        "mutation_id": "m_push_no_remote",
+        "run_id": "r-end2end",
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_type": "force_push",
+        "mutation_target": "main",
+        "expected_main_sha": "0" * 40,
+        "expected_target_sha": "0" * 40,
+        "pending_action": "force_push",
+        "created_at": "2026-08-01T00:00:00Z",
+        "authorization_status": "authorized",
+    }
+    mutations_file.write_text(json.dumps(auth_record))
 
     result = _run_cli(
         "mutate-ref",
@@ -378,31 +461,23 @@ def test_end_to_end_authorize_then_mutate_then_record(tmp_path):
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
     _git(clone, "checkout", "-q", "main")
 
-    # Step 1: write the durable plan directly. (In production,
-    # authorize-mutation writes the plan; for the end-to-end
-    # test we use the same code path by writing the same
-    # format. The CLI's mutate-ref reads this plan.)
-    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
-    plan_dir.mkdir()
-    plan = {
-        "mutation_id": "m_e2e_full",
-        "owner_run_id": "r-end2end",
-        "repository": "owner/name",
-        "target_ref": "refs/heads/feat/y",
-        "operation": "UPDATE_LOCAL",
-        "expected_before_sha": initial_sha,
-        "desired_after_sha": desired_sha,
-        "status": "PREPARED",
-        "created_at": "2026-08-01T00:00:00Z",
-    }
-    (plan_dir / "m_e2e_full.json").write_text(json.dumps(plan))
+    _seed_mutation_authorization(
+        workspace,
+        mutation_id="m_e2e_full",
+        mutation_type="force_push",
+        mutation_target="feat/y",
+        expected_main_sha=initial_sha,
+        expected_target_sha=initial_sha,
+        pending_action="force_push",
+        desired_after_sha=desired_sha,
+    )
 
-    # Step 2: run the executor entry point via the CLI.
     result = _run_cli(
         "mutate-ref",
         "--workspace", str(workspace),
         "--mutation-id", "m_e2e_full",
         "--local-repo", str(clone),
+        "--remote-path", str(bare),
     )
     assert result.returncode == 0, (
         f"mutate-ref failed: {result.stdout} {result.stderr}"
@@ -410,11 +485,384 @@ def test_end_to_end_authorize_then_mutate_then_record(tmp_path):
 
     # Step 3: read the durable plan and assert SUCCEEDED.
     final_plan = json.loads(
-        (plan_dir / "m_e2e_full.json").read_text()
+        (workspace / "GUARDED_REF_MUTATIONS" / "m_e2e_full.json").read_text()
     )
     assert final_plan["status"] == "SUCCEEDED"
     assert final_plan["last_reconciled_at"] is not None
 
     # Step 4: verify the authoritative remote ref state.
-    actual_remote = _git(clone, "rev-parse", "refs/heads/feat/y").stdout.strip()
+    actual_remote = _git(bare, "rev-parse", "refs/heads/feat/y").stdout.strip()
     assert actual_remote == desired_sha
+
+# ---------------------------------------------------------------------------
+# Production path: authorize-mutation emits the durable plan
+# ---------------------------------------------------------------------------
+
+def test_authorize_mutation_emits_durable_plan(tmp_path):
+    """Production-path regression test for Repair 1. The
+    controller's authorize-mutation CLI must emit a durable
+    GuardedMutationPlan alongside the MUTATIONS.jsonl record.
+    The test invokes the CLI as a subprocess (not by calling
+    the helper directly).
+
+    Required precondition: a launch receipt and an active
+    controller state. We write both to the workspace before
+    invoking authorize-mutation.
+    """
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Seed a target ref.
+    _seed_branch(clone, "feat/z")
+    initial_sha = _git(clone, "rev-parse", "refs/heads/feat/z").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/z", "-q")
+    _git(clone, "checkout", "-q", "feat/z")
+    _git(clone, "commit", "--allow-empty", "-m", "z2", "-q")
+    desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    # The controller's authorize-mutation requires a launch
+    # receipt. Write one.
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    import json
+    receipt = {
+        "schema_version": 1,
+        "run_id": "r-end2end",
+        "controller_version": "test",
+        "created_at": "2026-08-01T00:00:00Z",
+        "workspace": str(workspace),
+        "state_path": str(workspace / "CONTROLLER_STATE.json"),
+        "run_identity": {
+            "run_id": "r-end2end",
+            "workspace": str(workspace),
+            "machine_identity": {
+                "hostname": "test", "user": "test", "pid": 1,
+            },
+        },
+        "repository": "owner/name",
+        "main_sha": "0" * 40,
+        "next_action": "force_push",
+        "overall_status": "RUN_READY_FOR_SUMMARY",
+    }
+    (workspace / "LAUNCH_RECEIPT.json").write_text(json.dumps(receipt))
+
+    # Update the state to match the receipt.
+    state = json.loads((workspace / "CONTROLLER_STATE.json").read_text())
+    state["next_action"] = {"action": "force_push"}
+    state["overall_status"] = "RUN_READY_FOR_SUMMARY"
+    state["mutation_target"] = "feat/z"
+    # Bind the lock directory to the workspace so the lock is
+    # scoped to this test (otherwise the lock acquisition may
+    # write to the host-wide default dir).
+    state["lock_dir"] = str(workspace / "L")
+    state["run_identity"]["lock_dir"] = str(workspace / "L")
+    (workspace / "CONTROLLER_STATE.json").write_text(json.dumps(state))
+
+    # Acquire the supervisor lock directly via the supervisor
+    # lock module. This is what `init` does in production; we
+    # use the lower-level API here to keep the test focused on
+    # authorize-mutation, not on init.
+    import os
+    host_identity = {"hostname": "test", "user": "test", "pid": os.getpid()}
+    proc_evidence = {"pid": os.getpid(), "start_time": "2026-08-01T00:00:00Z"}
+    from scripts.local.aed_supervisor_lock import (
+        try_acquire as _supervisor_try_acquire,
+        build_scope_key as _build_scope_key,
+        lock_path_for as _lock_path_for,
+    )
+    scope = {
+        "repository": "owner/name",
+        "target_pr_number": 416,
+        "mutation_target": None,
+    }
+    outcome = _supervisor_try_acquire(
+        scope=scope,
+        owner_run_id="r-end2end",
+        owner_host=host_identity,
+        owner_pid=os.getpid(),
+        owner_start_evidence=proc_evidence,
+        owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+        base_dir=workspace / "L",
+    )
+    assert outcome.ok, (
+        f"failed to acquire supervisor lock for test setup: "
+        f"{outcome.reason if hasattr(outcome, 'reason') else outcome}"
+    )
+
+    # Invoke authorize-mutation via the CLI.
+    result = _run_cli(
+        "authorize-mutation",
+        "--state", str(workspace / "CONTROLLER_STATE.json"),
+        "--workspace", str(workspace),
+        "--mutation-type", "force_push",
+        "--mutation-target", "feat/z",
+        "--expected-target-sha", initial_sha,
+        "--expected-main-sha", "0" * 40,
+        "--desired-after-sha", desired_sha,
+        "--pending-action", "force_push",
+    )
+    assert result.returncode == 0, (
+        f"authorize-mutation failed: rc={result.returncode} "
+        f"stdout={result.stdout} stderr={result.stderr}"
+    )
+
+    # The durable plan MUST exist at
+    # GUARDED_REF_MUTATIONS/<mutation_id>.json.
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_files = list(plan_dir.iterdir())
+    assert len(plan_files) == 1, (
+        f"expected exactly one durable plan, got {plan_files}"
+    )
+    plan = GuardedMutationPlan.from_json(plan_files[0].read_text())
+    assert plan.target_ref == "refs/heads/feat/z"
+    assert plan.operation == "PUSH_REMOTE"
+    assert plan.expected_before_sha == initial_sha
+    assert plan.desired_after_sha == desired_sha
+    assert plan.owner_run_id == "r-end2end"
+    assert plan.repository == "owner/name"
+    assert plan.status == LifecycleState.PREPARED.value
+
+    # The MUTATIONS.jsonl record must exist with authorization_status.
+    mutations_file = workspace / "MUTATIONS.jsonl"
+    assert mutations_file.exists()
+    mutations_records = [
+        json.loads(line)
+        for line in mutations_file.read_text().splitlines()
+        if line.strip()
+    ]
+    auth_records = [
+        r for r in mutations_records
+        if r.get("authorization_status") == "authorized"
+    ]
+    assert len(auth_records) == 1
+    assert auth_records[0]["mutation_id"] == plan.mutation_id
+
+    # The mutation_id in the durable plan matches the MUTATIONS.jsonl
+    # authorization.
+    assert auth_records[0]["mutation_id"] == plan.mutation_id
+
+    # Now mutate-ref against the authoritative remote. The
+    # binding check passes because the plan and the
+    # authorization were produced together by authorize-mutation.
+    mutate_result = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", plan.mutation_id,
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert mutate_result.returncode == 0, (
+        f"mutate-ref failed: rc={mutate_result.returncode} "
+        f"stdout={mutate_result.stdout} "
+        f"stderr={mutate_result.stderr}"
+    )
+    assert "OK" in mutate_result.stdout
+
+    # Verify the authoritative remote ref was updated.
+    actual_remote = _git(bare, "rev-parse", "refs/heads/feat/z").stdout.strip()
+    assert actual_remote == desired_sha
+
+
+def test_mutate_ref_refuses_plan_without_outstanding_authorization(tmp_path):
+    """Repair 2: mutate-ref binds loaded plans to an
+    outstanding authorization. A plan that has NO matching
+    record in MUTATIONS.jsonl is rejected with exit code 25
+    even if the plan itself is well-formed.
+    """
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Seed a target ref.
+    _seed_branch(clone, "feat/a")
+    initial_sha = _git(clone, "rev-parse", "refs/heads/feat/a").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/a", "-q")
+    _git(clone, "checkout", "-q", "feat/a")
+    _git(clone, "commit", "--allow-empty", "-m", "a2", "-q")
+    desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    # Write a well-formed plan but NO MUTATIONS.jsonl record.
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_dir = workspace / "GUARDED_REF_MUTATIONS"
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    plan = GuardedMutationPlan(
+        mutation_id="m_orphan",
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref="refs/heads/feat/a",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial_sha,
+        desired_after_sha=desired_sha,
+        status=LifecycleState.PREPARED.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    (plan_dir / "m_orphan.json").write_text(plan.to_json())
+
+    result = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_orphan",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert result.returncode == 25, (
+        f"mutate-ref must refuse plan without outstanding "
+        f"authorization; rc={result.returncode} "
+        f"stderr={result.stderr}"
+    )
+    assert "not found in MUTATIONS.jsonl" in result.stderr or "binding" in result.stderr
+
+
+def test_mutate_ref_refuses_plan_owner_mismatch(tmp_path):
+    """Repair 2: mutate-ref verifies that the plan's
+    owner_run_id matches the authorization's run_id."""
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Seed target ref.
+    _seed_branch(clone, "feat/b")
+    initial_sha = _git(clone, "rev-parse", "refs/heads/feat/b").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/b", "-q")
+    _git(clone, "checkout", "-q", "feat/b")
+    _git(clone, "commit", "--allow-empty", "-m", "b2", "-q")
+    desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "checkout", "-q", "main")
+
+    # Seed a plan with owner_run_id "r-wrong" but the
+    # authorization record uses "r-end2end".
+    _seed_mutation_authorization(
+        workspace,
+        mutation_id="m_owner_mismatch",
+        mutation_type="force_push",
+        mutation_target="feat/b",
+        expected_main_sha=initial_sha,
+        expected_target_sha=initial_sha,
+        pending_action="force_push",
+        desired_after_sha=desired_sha,
+    )
+    # Overwrite the plan with a mismatched owner_run_id.
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_path = workspace / "GUARDED_REF_MUTATIONS" / "m_owner_mismatch.json"
+    plan = GuardedMutationPlan(
+        mutation_id="m_owner_mismatch",
+        owner_run_id="r-wrong",  # MISMATCH
+        repository="owner/name",
+        target_ref="refs/heads/feat/b",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial_sha,
+        desired_after_sha=desired_sha,
+        status=LifecycleState.PREPARED.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    plan_path.write_text(plan.to_json())
+
+    result = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_owner_mismatch",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert result.returncode == 25
+    assert "owner_run_id" in result.stderr or "binding" in result.stderr
+
+
+def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
+    """Repair 3: a plan at EXECUTING or RECONCILING is dispatched
+    to reconcile(), not re-prepared and re-executed. The previous
+    implementation always called prepare() which crashed the CLI
+    on plans that survived a crash mid-flight."""
+    bare, clone = _make_bare_with_clone(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir()
+
+    # Seed target ref.
+    _seed_branch(clone, "feat/c")
+    initial_sha = _git(clone, "rev-parse", "refs/heads/feat/c").stdout.strip()
+    _git(clone, "push", "origin", "refs/heads/feat/c", "-q")
+    # Third party advances: create a commit, advance the local
+    # ref, and push to the authoritative remote.
+    _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
+    third_party = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    _git(clone, "update-ref", "refs/heads/feat/c", third_party)
+    # Use --force to bypass the non-fast-forward check. The
+    # test is simulating a third-party advance; the
+    # force-with-lease CAS check is what guards real
+    # mutations.
+    _git(clone, "push", "--force", "origin",
+         "refs/heads/feat/c:refs/heads/feat/c", "-q")
+
+    # Seed an authorization record.
+    _seed_mutation_authorization(
+        workspace,
+        mutation_id="m_intermediate",
+        mutation_type="force_push",
+        mutation_target="feat/c",
+        expected_main_sha=initial_sha,
+        expected_target_sha=initial_sha,
+        pending_action="force_push",
+        desired_after_sha="a" * 40,
+    )
+    # Overwrite the plan to be at RECONCILING (simulating a
+    # previous run that crashed after EXECUTING but before
+    # persisting the terminal result).
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        LifecycleState,
+    )
+    plan_path = workspace / "GUARDED_REF_MUTATIONS" / "m_intermediate.json"
+    plan = GuardedMutationPlan(
+        mutation_id="m_intermediate",
+        owner_run_id="r-end2end",
+        repository="owner/name",
+        target_ref="refs/heads/feat/c",
+        operation="PUSH_REMOTE",
+        expected_before_sha=initial_sha,
+        desired_after_sha="a" * 40,
+        status=LifecycleState.RECONCILING.value,
+        created_at="2026-08-01T00:00:00Z",
+    )
+    plan_path.write_text(plan.to_json())
+
+    # Invoke mutate-ref. The CLI must NOT call prepare(). It
+    # must dispatch to reconcile() which observes the actual
+    # ref (at third_party, not initial_sha) and reports CONFLICT.
+    result = _run_cli(
+        "mutate-ref",
+        "--workspace", str(workspace),
+        "--mutation-id", "m_intermediate",
+        "--local-repo", str(clone),
+        "--remote-path", str(bare),
+    )
+    assert result.returncode == 0
+    assert "CONFLICT" in result.stdout
+
+    # Verify the plan's state was persisted as CONFLICT (not
+    # reset to PREPARED).
+    final_plan = GuardedMutationPlan.from_json(plan_path.read_text())
+    assert final_plan.status == "CONFLICT"
+
+    # Verify the authoritative remote was NOT touched (no blind
+    # retry pushed the desired_after).
+    actual_remote = _git(bare, "rev-parse", "refs/heads/feat/c").stdout.strip()
+    assert actual_remote == third_party

@@ -1246,7 +1246,7 @@ class TestControllerMutationLifecycle:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
-            "--expected-main-sha", "e4ef774",
+            "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "generate_run_summary",
         ])
@@ -1283,7 +1283,7 @@ class TestControllerMutationLifecycle:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
-            "--expected-main-sha", "e4ef774",
+            "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "generate_run_summary",
         ])
@@ -1354,7 +1354,7 @@ class TestControllerMutationLifecycle:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
-            "--expected-main-sha", "e4ef774",
+            "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "generate_run_summary",
         ])
@@ -1523,7 +1523,7 @@ class TestControllerStaleLockRecovery:
             "--state", str(workspace / "CONTROLLER_STATE.json"),
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
-            "--expected-main-sha", "e4ef774",
+            "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "stop",
         ])
@@ -1687,7 +1687,7 @@ class TestRound8ReceiptStatePathBinding:
             "--state", str(copied),
             "--workspace", str(workspace),
             "--mutation-type", "squash_merge",
-            "--expected-main-sha", "e4ef774",
+            "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
             "--expected-target-sha", "c973fa6c0718293a4b5c6d70e0f781d67a0c0a1b",
             "--pending-action", "run_task",
         ])
@@ -5545,7 +5545,7 @@ class TestRound36RejectMutationForUnscopedRuns:
                 "--state", str(state_path),
                 "--workspace", str(workspace),
                 "--mutation-type", "pr_body_update",
-                "--expected-main-sha", "e4ef774",
+                "--expected-main-sha", "0e4ef7740000000000000000000000000000abcd",
                 "--expected-target-sha", "e4ef774",
                 "--pending-action", "update",
             ],

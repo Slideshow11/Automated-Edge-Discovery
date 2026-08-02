@@ -479,3 +479,58 @@ def test_create_with_empty_expected_against_bare_remote(bare_and_clone, tmp_path
     final = orch.execute(local_repo=clone, remote_ref_path=clone)
     assert final.status == grm.LifecycleState.SUCCEEDED.value
     assert ops.read_ref(clone, "refs/heads/feat/new") == new_sha
+
+
+# ---------------------------------------------------------------------------
+# INDETERMINATE vs missing ref (read-failure safety)
+# ---------------------------------------------------------------------------
+
+def test_delete_with_unreadable_remote_returns_indeterminate(tmp_path):
+    """When the remote path is unreadable during a delete
+    reconciliation, the result MUST be INDETERMINATE, never
+    SUCCEEDED. The previous implementation confused a missing
+    ref with a read failure by collapsing both to None; this
+    test pins the corrected behavior.
+    """
+    plan = grm.GuardedMutationPlan(
+        mutation_id="m_delete_unreadable",
+        owner_run_id="r-unreadable",
+        repository="owner/name",
+        target_ref="refs/heads/old",
+        operation="DELETE_LOCAL",
+        expected_before_sha="a" * 40,
+        desired_after_sha=None,
+        status="RECONCILING",
+        created_at="",
+    )
+    orch = runner.GuardedMutationOrchestrator(workspace=tmp_path, plan=plan)
+    # Use a nonexistent path: ops.read_ref raises a
+    # FileNotFoundError when the path doesn't exist; the
+    # adapter converts it to a GuardedRefError.
+    bad_path = tmp_path / "nonexistent.git"
+    final = orch.reconcile(remote_ref_path=bad_path)
+    assert final.status == grm.LifecycleState.INDETERMINATE.value, (
+        f"delete reconcile with unreadable remote must be "
+        f"INDETERMINATE, got {final.status}"
+    )
+
+
+def test_execute_with_unreadable_remote_returns_indeterminate(tmp_path):
+    """execute() with an unreadable remote must also return
+    INDETERMINATE, not SUCCEEDED.
+    """
+    plan = grm.GuardedMutationPlan(
+        mutation_id="m_exec_unreadable",
+        owner_run_id="r-exec-unreadable",
+        repository="owner/name",
+        target_ref="refs/heads/main",
+        operation="UPDATE_LOCAL",
+        expected_before_sha="a" * 40,
+        desired_after_sha="b" * 40,
+        status="PREPARED",
+        created_at="",
+    )
+    orch = runner.GuardedMutationOrchestrator(workspace=tmp_path, plan=plan)
+    bad_path = tmp_path / "nonexistent.git"
+    final = orch.execute(local_repo=bad_path, remote_ref_path=bad_path)
+    assert final.status == grm.LifecycleState.INDETERMINATE.value

@@ -65,20 +65,54 @@ def _persist_plan(plan: grm.GuardedMutationPlan, workspace: Path) -> None:
 
 def _read_remote_ref_via_query(
     remote_ref_path: Path, ref: str
-) -> Optional[str]:
+) -> "_ReadResult":
     """Read the ref's current SHA from a local path that points
     to the remote bare repo.
 
-    Returns None if the path does not exist, the ref does not
-    exist, or the ref cannot be read for any reason. The
-    caller (reconcile) classifies None as INDETERMINATE.
+    Returns a _ReadResult with three states:
+      - actual_ref_sha=None, is_indeterminate=False:
+        the ref does not exist at the remote (truly absent).
+      - actual_ref_sha=<sha>, is_indeterminate=False:
+        the ref's current value was successfully read.
+      - actual_ref_sha=None, is_indeterminate=True:
+        the read FAILED (path missing, permission denied,
+        corrupt repo, network error, etc.). The caller MUST
+        classify this as INDETERMINATE and never as
+        SUCCEEDED — even for a delete, because we never
+        observed the remote state.
     """
     if not remote_ref_path.exists():
-        return None
+        return _ReadResult(sha=None, indeterminate=True)
     try:
-        return ops.read_ref(remote_ref_path, ref)
-    except ops.GuardedRefError:
-        return None
+        sha = ops.read_ref(remote_ref_path, ref)
+        return _ReadResult(sha=sha, indeterminate=False)
+    except (ops.GuardedRefError, FileNotFoundError, PermissionError,
+            OSError, subprocess.CalledProcessError):
+        # FileNotFoundError: the git binary or a parent
+        # directory was deleted between existence check and
+        # git invocation.
+        # PermissionError: the remote path is not readable.
+        # OSError: broader filesystem error.
+        # CalledProcessError: git returned non-zero for some
+        # other reason (not a known "ref not found" case).
+        return _ReadResult(sha=None, indeterminate=True)
+
+
+class _ReadResult:
+    """Tristate result of reading a ref from a remote path.
+
+    is_indeterminate=True means the read FAILED. The caller
+    MUST classify this as INDETERMINATE (especially for a
+    delete, where the absence-of-ref domain value is
+    indistinguishable from a read failure under the previous
+    implementation).
+    """
+
+    __slots__ = ("sha", "indeterminate")
+
+    def __init__(self, *, sha: Optional[str], indeterminate: bool):
+        self.sha = sha
+        self.indeterminate = indeterminate
 
 
 # ---------------------------------------------------------------------------
@@ -156,9 +190,28 @@ class GuardedMutationOrchestrator:
         self.plan.status = grm.LifecycleState.EXECUTING.value
         _persist_plan(self.plan, self.workspace)
 
-        # Perform the guarded mutation.
+        # Perform the guarded mutation. Wrap in try/except so
+        # a missing remote path, a missing local repo, or
+        # any other unexpected git failure produces an
+        # INDETERMINATE result instead of an unhandled
+        # exception. The durable plan is preserved at the
+        # EXECUTING state so a recovery run can resume.
         op = grm.Operation(self.plan.operation)
-        result = self._do_execute(local_repo, op)
+        result: Optional[ops.RefMutationResult] = None
+        try:
+            result = self._do_execute(local_repo, op)
+        except (ops.GuardedRefError, FileNotFoundError,
+                PermissionError, OSError,
+                subprocess.CalledProcessError) as e:
+            # Treat any executor exception as INDETERMINATE.
+            # We never saw a successful CAS; the durable
+            # evidence is the EXECUTING state plus the
+            # exception. The reconcile phase below reads the
+            # remote ref (which may now also be unreadable)
+            # and reports INDETERMINATE.
+            self.plan.terminal_evidence = (
+                f"executor_exception={type(e).__name__}:{e}"
+            )
 
         # EXECUTING -> RECONCILING
         self.plan.status = grm.LifecycleState.RECONCILING.value
@@ -166,24 +219,43 @@ class GuardedMutationOrchestrator:
 
         # Read the actual ref for reconciliation.
         remote = remote_ref_path or local_repo
-        actual = _read_remote_ref_via_query(remote, self.plan.target_ref)
-
-        # Reconcile. The domain uses None to mean "the ref does
-        # not exist"; the adapter has already translated any
-        # empty-string from git rev-parse to None.
-        outcome = grm.reconcile(
-            expected_before_sha=self.plan.expected_before_sha,
-            desired_after_sha=self.plan.desired_after_sha,
-            actual_ref_sha=actual,
+        read_result = _read_remote_ref_via_query(
+            remote, self.plan.target_ref
         )
+        # If the read failed, force INDETERMINATE. Never
+        # confuse a read failure with a missing ref — for
+        # delete this is the difference between SUCCEEDED and
+        # INDETERMINATE.
+        if read_result.indeterminate:
+            outcome = grm.LifecycleState.INDETERMINATE
+            evidence = (
+                f"actual_ref_sha=<read failed>, "
+                f"executor_result="
+                f"{result.returncode if result is not None else 'exception'}, "
+                f"stdout="
+                f"{(result.stdout if result is not None else '')[:200]!r}, "
+                f"stderr="
+                f"{(result.stderr if result is not None else '')[:200]!r}"
+            )
+            self.plan.terminal_evidence = evidence
+        else:
+            outcome = grm.reconcile(
+                expected_before_sha=self.plan.expected_before_sha,
+                desired_after_sha=self.plan.desired_after_sha,
+                actual_ref_sha=read_result.sha,
+            )
+            evidence = (
+                f"actual_ref_sha={read_result.sha!r}, "
+                f"stdout="
+                f"{(result.stdout if result is not None else '')[:200]!r}, "
+                f"stderr="
+                f"{(result.stderr if result is not None else '')[:200]!r}, "
+                f"returncode="
+                f"{result.returncode if result is not None else 'exception'}"
+            )
+            self.plan.terminal_evidence = evidence
         self.plan.status = outcome.value
         self.plan.last_reconciled_at = _utcnow_iso()
-        self.plan.terminal_evidence = (
-            f"actual_ref_sha={actual!r}, "
-            f"stdout={result.stdout[:200]!r}, "
-            f"stderr={result.stderr[:200]!r}, "
-            f"returncode={result.returncode}"
-        )
         _persist_plan(self.plan, self.workspace)
         return self.plan
 
@@ -257,19 +329,25 @@ class GuardedMutationOrchestrator:
         _persist_plan(self.plan, self.workspace)
 
         # Re-read the actual ref.
-        actual = _read_remote_ref_via_query(
+        read_result = _read_remote_ref_via_query(
             remote_ref_path, self.plan.target_ref
         )
-        outcome = grm.reconcile(
-            expected_before_sha=self.plan.expected_before_sha,
-            desired_after_sha=self.plan.desired_after_sha,
-            actual_ref_sha=actual,
-        )
+        if read_result.indeterminate:
+            outcome = grm.LifecycleState.INDETERMINATE
+            self.plan.terminal_evidence = (
+                f"actual_ref_sha=<read failed>"
+            )
+        else:
+            outcome = grm.reconcile(
+                expected_before_sha=self.plan.expected_before_sha,
+                desired_after_sha=self.plan.desired_after_sha,
+                actual_ref_sha=read_result.sha,
+            )
+            self.plan.terminal_evidence = (
+                f"actual_ref_sha={read_result.sha!r}"
+            )
         self.plan.status = outcome.value
         self.plan.last_reconciled_at = _utcnow_iso()
-        self.plan.terminal_evidence = (
-            f"actual_ref_sha={actual!r}"
-        )
         _persist_plan(self.plan, self.workspace)
         return self.plan
 

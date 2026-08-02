@@ -291,9 +291,17 @@ def validate_plan(plan: GuardedMutationPlan) -> None:
             errors.append(
                 "GRAPHQL_UPDATE_REFS requires beforeOid full SHA"
             )
-        if plan.desired_after_sha is None:
+        # desired_after_sha is OPTIONAL: for squash_merge the
+        # controller records the post-merge SHA via
+        # record-mutation-result. The durable plan records the
+        # PRE-merge state; the POST-merge state is recorded
+        # later.
+        if plan.desired_after_sha is not None and not is_full_sha(
+            plan.desired_after_sha
+        ):
             errors.append(
-                "GRAPHQL_UPDATE_REFS requires afterOid full SHA"
+                "GRAPHQL_UPDATE_REFS desired_after_sha must be "
+                "a full 40-char lowercase hex SHA when supplied"
             )
 
     if errors:

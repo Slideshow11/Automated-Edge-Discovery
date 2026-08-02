@@ -3594,6 +3594,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mauth.add_argument("--expected-main-sha", help="Expected current main SHA at execution time")
     p_mauth.add_argument("--expected-target-sha", help="Expected target/PR-head SHA at execution time")
     p_mauth.add_argument("--mutation-target", help="Mutation target identifier (e.g. branch name)")
+    p_mauth.add_argument(
+        "--desired-after-sha",
+        help=(
+            "Desired SHA after the mutation (full 40-char lowercase hex). "
+            "Required for force_push, push, branch_create_force; must "
+            "be omitted for branch_delete and squash_merge."
+        ),
+    )
     p_mauth.add_argument("--pending-action", required=True, help="Exact pending action")
 
     p_mres = sub.add_parser(
@@ -4040,6 +4048,27 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 file=sys.stderr,
             )
             sys.exit(14)
+        # squash_merge uses --expected-main-sha as the pre-merge
+        # base SHA (or --expected-target-sha if supplied). The
+        # selected value must be a full SHA for the durable
+        # plan emission.
+        if args.mutation_type == "squash_merge":
+            main_sha = args.expected_main_sha or ""
+            if args.expected_target_sha:
+                # --expected-target-sha is already validated as a
+                # full SHA above; squash_merge uses it as the
+                # pre-merge head SHA.
+                pass
+            elif main_sha and not _is_full_sha(main_sha):
+                print(
+                    "ERROR: cannot authorize mutation: "
+                    "--expected-main-sha must be a full "
+                    "40-character lowercase hex SHA for squash_merge "
+                    f"when --expected-target-sha is not given, "
+                    f"got {main_sha!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(14)
     # P2 fix (round 4): resolve owner_state_path to an absolute
     # path. Relative paths become relative to the CURRENT process's
     # CWD when later read, so a controller invocation from a
@@ -4304,6 +4333,81 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         )
         sys.exit(3)
     assert outcome.record is not None
+    # Repair 1: emit the durable GuardedMutationPlan as part
+    # of the serialized authorization transaction. The plan
+    # is consumed by mutate-ref. Without this emission,
+    # mutate-ref cannot find a durable plan and exits with
+    # code 20. The journal sentinel is still held; the plan
+    # file is written atomically.
+    try:
+        from scripts.local.guarded_ref_mutation import (
+            GuardedMutationPlan,
+            LifecycleState,
+        )
+        from scripts.local.mutation_policy import (
+            derive_plan as _derive_plan,
+            get_policy as _get_policy,
+            derive_target_ref as _derive_target_ref,
+            supported_mutation_types as _supported_mt,
+        )
+        if args.mutation_type not in _supported_mt():
+            # Non-ref-changing mutation (pr_body_update, label_change,
+            # etc.). No durable GuardedMutationPlan is emitted; the
+            # authorization record in MUTATIONS.jsonl is sufficient.
+            print(f"Authorized mutation {outcome.mutation_id}")
+            print(f"  type:                {outcome.record.get('mutation_type')}")
+            print(f"  run_id:              {outcome.record.get('run_id')}")
+            print(f"  repository:          {outcome.record.get('repository')}")
+            print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
+            print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
+            print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
+            print(f"  pending_action:      {outcome.record.get('pending_action')}")
+            return
+        derived = _derive_plan(
+            mutation_type=args.mutation_type,
+            mutation_target=(
+                args.mutation_target
+                or _state_mutation_target(state)
+            ),
+            expected_target_sha=args.expected_target_sha,
+            expected_main_sha=args.expected_main_sha,
+            desired_after_sha=args.desired_after_sha,
+        )
+        plan_dir = Path(args.workspace) / "GUARDED_REF_MUTATIONS"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        plan_path = plan_dir / f"{outcome.mutation_id}.json"
+        plan = GuardedMutationPlan(
+            mutation_id=outcome.mutation_id,
+            owner_run_id=state.get("run_id", "unknown"),
+            repository=repository,
+            target_ref=derived.target_ref,
+            operation=derived.operation.value,
+            expected_before_sha=derived.expected_before_sha,
+            desired_after_sha=derived.desired_after_sha,
+            status=LifecycleState.PREPARED.value,
+            created_at=datetime.now(
+                timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        from scripts.local.guarded_ref_mutation import (
+            validate_plan as _validate_plan,
+        )
+        _validate_plan(plan)
+        tmp = plan_path.with_suffix(plan_path.suffix + ".tmp")
+        tmp.write_text(plan.to_json())
+        os.fsync(tmp.open("rb").fileno()) if False else None
+        # Robust fsync: open in binary, write, flush, fsync.
+        with open(tmp, "rb+") as f:
+            f.write(plan.to_json().encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, plan_path)
+    except (ValueError, KeyError, OSError) as plan_err:
+        print(
+            f"ERROR: durable plan emission failed: {plan_err}",
+            file=sys.stderr,
+        )
+        sys.exit(24)
     print(f"Authorized mutation {outcome.mutation_id}")
     print(f"  type:                {outcome.record.get('mutation_type')}")
     print(f"  run_id:              {outcome.record.get('run_id')}")
@@ -4564,30 +4668,46 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     The downstream executor must:
       1. Load the durable plan (mutate_ref packet) by
          mutation_id from the workspace.
-      2. Validate the packet: the operation must be one of
+      2. Bind the loaded plan to an outstanding authorization
+         in MUTATIONS.jsonl (Repair 2). The plan must match:
+         - mutation_id
+         - owner_run_id (matches the active run)
+         - repository (matches the active run's repository)
+         - target_ref (derived from authorization's
+           mutation_target)
+         - expected_before_sha (matches authorization's
+           expected_target_sha or expected_main_sha)
+         - authorization_status AUTHORIZED
+         If any check fails, the executor refuses.
+      3. Validate the packet: the operation must be one of
          the supported mutation types and the expected_before_sha
          must be a full 40-char lowercase hex SHA (or None for
-         CREATE_LOCAL). A packet that lacks exact expected state
-         is refused.
-      3. Run the operation through the guarded CAS adapter
-         (scripts/local/guarded_ref_ops.py). The executor
-         itself does NOT touch the journal sentinel or any
-         supervisor-lease primitive.
-      4. Reconcile the authoritative remote ref via the
+         CREATE_LOCAL).
+      4. Dispatch intermediate plans (EXECUTING, RECONCILING)
+         to reconcile() — never re-prepare (Repair 3). This is
+         the resume path for plans that survived a crash
+         between authorization and terminal persistence.
+      5. Run the operation through the guarded CAS adapter
+         (scripts/local/guarded_ref_ops.py) for PREPARED plans.
+      6. Reconcile the authoritative remote ref via the
          Layer 2 reconcile() function. Read the actual ref from
          the remote, never from a local branch or stale
          remote-tracking ref.
-      5. Persist the terminal result. The durable plan is the
-         authoritative record.
+      7. Persist the terminal result.
     """
     from scripts.local.guarded_ref_mutation import (
         GuardedMutationPlan,
         PlanValidationError,
+        LifecycleState,
         Operation as GrdOp,
         guarded_ref_mutation_plan_path,
     )
     from scripts.local.guarded_ref_mutation_runner import (
         GuardedMutationOrchestrator,
+    )
+    from scripts.local.mutation_policy import (
+        find_outstanding_authorization,
+        AuthorizationBindingError,
     )
 
     workspace = Path(args.workspace)
@@ -4607,21 +4727,42 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         sys.exit(20)
     plan = GuardedMutationPlan.from_json(plan_path.read_text())
 
-    # Step 2: validate the packet. Reject plans that lack exact
-    # expected state for ref-changing operations.
+    # Step 2: validate the packet FIRST. Reject plans that
+    # lack exact expected state for ref-changing operations.
+    # Validation runs before the authorization binding check
+    # so that malformed plans are rejected without consulting
+    # MUTATIONS.jsonl.
     try:
-        validate_plan = PlanValidationError  # placeholder
-        from scripts.local.guarded_ref_mutation import (
-            validate_plan as _validate_plan,
-        )
-        _validate_plan(plan)
+        from scripts.local.guarded_ref_mutation import validate_plan
+        validate_plan(plan)
     except PlanValidationError as e:
         print(f"ERROR: plan validation failed: {e}", file=sys.stderr)
         sys.exit(21)
 
+    # Step 3: bind the loaded plan to an outstanding
+    # authorization in MUTATIONS.jsonl.
+    outstanding_records = _mutation_auth.outstanding_mutations(
+        workspace
+    )
+    try:
+        find_outstanding_authorization(
+            outstanding_records,
+            mutation_id=plan.mutation_id,
+            owner_run_id=plan.owner_run_id,
+            repository=plan.repository,
+            target_ref=plan.target_ref,
+            expected_before_sha=plan.expected_before_sha,
+        )
+    except AuthorizationBindingError as e:
+        print(
+            f"ERROR: plan binding failed for mutation_id="
+            f"{plan.mutation_id}: {e}",
+            file=sys.stderr,
+        )
+        sys.exit(25)
+
     op = GrdOp(plan.operation)
     if op is GrdOp.PUSH_REMOTE and remote_path is None:
-        # PUSH_REMOTE requires the authoritative remote path.
         print(
             "ERROR: PUSH_REMOTE requires --remote-path pointing "
             "to the authoritative remote (e.g. a local bare repo)",
@@ -4629,23 +4770,42 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         )
         sys.exit(22)
 
-    # Step 3-5: run the orchestrator. The CAS adapter is the
-    # only Git-touching path.
+    # Step 4: dispatch intermediate plans to reconcile() —
+    # never re-prepare. If the plan is at EXECUTING or
+    # RECONCILING, the previous run crashed mid-flight.
+    # Re-preparing would reset the lifecycle state and
+    # could re-execute the mutation blindly. We dispatch to
+    # reconcile() which reads the authoritative remote ref
+    # and reports SUCCEEDED, NOT_APPLIED, CONFLICT, or
+    # INDETERMINATE.
     orch = GuardedMutationOrchestrator(workspace=workspace, plan=plan)
-    orch.prepare()
-    try:
+    current_state = LifecycleState(plan.status)
+    if current_state in (
+        LifecycleState.EXECUTING,
+        LifecycleState.RECONCILING,
+    ):
+        final = orch.reconcile(remote_ref_path=remote_path or local_repo)
+    elif current_state is LifecycleState.PREPARED:
+        # Step 5-6: run the guarded CAS adapter, then
+        # reconcile the authoritative remote ref.
+        orch.prepare()
         final = orch.execute(
             local_repo=local_repo,
             remote_ref_path=remote_path,
         )
-    except Exception as e:
-        print(f"ERROR: executor failure: {e}", file=sys.stderr)
-        sys.exit(23)
+    else:
+        # Terminal state (SUCCEEDED, NOT_APPLIED, CONFLICT,
+        # CANCELLED) — refuse to re-execute. The operator
+        # must inspect the plan file and either re-authorize
+        # or record the result manually.
+        print(
+            f"ERROR: plan mutation_id={plan.mutation_id} is in "
+            f"terminal state {plan.status}; refusing to re-execute. "
+            f"Inspect the plan file at {plan_path}.",
+            file=sys.stderr,
+        )
+        sys.exit(26)
 
-    # Step 5: the orchestrator has already persisted the
-    # terminal result (status, last_reconciled_at,
-    # terminal_evidence) to the GUARDED_REF_MUTATIONS/<id>.json
-    # file. Print the outcome for the caller.
     print(f"OK mutation_id={plan.mutation_id} status={final.status}")
 
 

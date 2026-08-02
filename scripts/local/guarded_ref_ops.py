@@ -231,30 +231,73 @@ def guarded_push(
     expected_remote_sha: Optional[str],
     new_local_sha: Optional[str],
 ) -> RefMutationResult:
-    """git push --force-with-lease=<ref>:<expected> <remote> <ref>:<ref>.
+    """git push --force-with-lease=<ref>:<expected> <remote> <src>:<dst>.
 
     The push is rejected by the receiving Git server if the
     remote ref's current value is not expected_remote_sha.
     For CREATE, expected_remote_sha is None and the push is
     rejected if the ref exists.
 
+    The source side of the refspec is the validated
+    new_local_sha (full 40-char hex) when supplied, so the
+    receiving server pushes exactly that object ID — never
+    whatever the local ref happens to point at. The local
+    ref itself is NOT updated here; staging the local ref is
+    the caller's responsibility (and is verified by the
+    orchestrator before invocation).
+
     For integration tests, the remote is a local bare repo path.
     """
+    # Refuse if new_local_sha is missing for an UPDATE-style
+    # push. CREATE-style pushes pass expected_remote_sha=None
+    # AND new_local_sha=None.
     if new_local_sha is not None:
-        # Update the local ref to the new SHA so the push has
-        # something to send.
-        subprocess.run(
-            ["git", "update-ref", ref, new_local_sha],
+        # Verify the desired object ID exists in the local repo.
+        # If it does not, the push will fail anyway; we abort
+        # early with a clear error.
+        cat_result = subprocess.run(
+            ["git", "cat-file", "-e", new_local_sha],
             cwd=str(repo),
             capture_output=True,
             text=True,
-            check=False,
         )
+        if cat_result.returncode != 0:
+            return RefMutationResult(
+                ok=False,
+                actual_ref_sha=None,
+                stdout="",
+                stderr=(
+                    f"refusing to push: new_local_sha={new_local_sha} "
+                    f"does not exist in the local repo: "
+                    f"{cat_result.stderr.strip()}"
+                ),
+                returncode=cat_result.returncode,
+            )
+        # Build a refspec that pushes the validated object ID
+        # directly, NOT the local ref. git push accepts a SHA
+        # as <src> and pushes exactly that commit to <dst>.
+        src_spec = new_local_sha
+    else:
+        # CREATE: the caller did not supply a new_local_sha.
+        # The local ref must be at the desired SHA; we read it.
+        current_local = read_ref(repo, ref)
+        if current_local is None:
+            return RefMutationResult(
+                ok=False,
+                actual_ref_sha=None,
+                stdout="",
+                stderr=(
+                    f"refusing to push: local ref {ref} does not exist "
+                    f"and no new_local_sha was supplied"
+                ),
+                returncode=1,
+            )
+        src_spec = current_local
     lease_option = _build_push_force_with_lease(
         ref=ref,
         expected_remote_sha=expected_remote_sha,
     )
-    spec = f"{ref}:{ref}"
+    spec = f"{src_spec}:{ref}"
     cmd = ["git", "push", lease_option, remote, spec]
     result = subprocess.run(
         cmd, cwd=str(repo), capture_output=True, text=True

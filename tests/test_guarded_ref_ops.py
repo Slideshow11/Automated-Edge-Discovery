@@ -296,3 +296,53 @@ def test_push_with_mismatched_expected_remote_sha_refuses(
         ops.read_remote_ref(remote_repo=bare, ref="refs/heads/main")
         == third_party
     )
+
+
+# ---------------------------------------------------------------------------
+# Repair 4: staged-SHA validation
+# ---------------------------------------------------------------------------
+
+def test_push_aborts_when_new_local_sha_does_not_exist(tmp_path):
+    """guarded_push must abort if new_local_sha is not a
+    valid object in the local repo. The previous
+    implementation ignored the update-ref failure and pushed
+    whatever the local ref happened to point to."""
+    bare = tmp_path / "bare.git"
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "init", "--bare", str(bare), "-q"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(bare), str(clone), "-q"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@l"],
+                   cwd=str(clone), check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "T"],
+                   cwd=str(clone), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "i", "-q"],
+                   cwd=str(clone), check=True, capture_output=True)
+    initial = subprocess.run(["git", "rev-parse", "HEAD"],
+                             cwd=str(clone), capture_output=True,
+                             text=True).stdout.strip()
+    subprocess.run(["git", "push", "origin", "refs/heads/main", "-q"],
+                   cwd=str(clone), check=True, capture_output=True)
+
+    # A SHA that does NOT exist in the local repo.
+    fake_sha = "0" * 40
+
+    result = ops.guarded_push(
+        repo=clone,
+        remote="origin",
+        ref="refs/heads/main",
+        expected_remote_sha=initial,
+        new_local_sha=fake_sha,
+    )
+    assert result.ok is False, (
+        "guarded_push must abort when new_local_sha does not "
+        "exist in the local repo"
+    )
+    assert "does not exist" in result.stderr or "not exist" in result.stderr
+    # The remote was NOT touched.
+    actual_remote = subprocess.run(
+        ["git", "rev-parse", "refs/heads/main"],
+        cwd=str(bare), capture_output=True, text=True,
+    ).stdout.strip()
+    assert actual_remote == initial
