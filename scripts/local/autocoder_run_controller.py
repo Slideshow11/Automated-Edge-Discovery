@@ -3610,6 +3610,40 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mres.add_argument("--actual-target-sha", help="Observed target SHA after the mutation")
     p_mres.add_argument("--error-detail", help="Optional error detail")
 
+    # Round-52-fix architectural repair: mutate-ref is the
+    # repository-owned executor entry point. The downstream
+    # executor (which actually runs `git push` / `git update-ref`)
+    # MUST consume the durable plan produced by
+    # authorize-mutation and run it through the guarded CAS
+    # adapter. The packet contract is defined by
+    # guarded_ref_mutation.GuardedMutationPlan; this CLI
+    # refuses to execute any plan that lacks exact expected
+    # state. The reconcile() reads the authoritative remote
+    # ref (not the local clone).
+    p_mutate = sub.add_parser(
+        "mutate-ref",
+        help=(
+            "Execute a previously-authorized mutation through "
+            "the guarded CAS adapter against the authoritative "
+            "remote. Reconciles the actual ref after the CAS. "
+            "Persists the terminal result."
+        ),
+    )
+    p_mutate.add_argument("--workspace", required=True,
+                            help="Workspace directory holding the durable plan")
+    p_mutate.add_argument("--mutation-id", required=True,
+                            help="The mutation_id from authorize-mutation")
+    p_mutate.add_argument("--local-repo", required=True,
+                            help="Path to the local clone used to perform the push")
+    p_mutate.add_argument("--remote-path",
+                            help=(
+                                "Path to the authoritative remote (e.g. a local bare "
+                                "repo). For UPDATE/DELETE/CREATE_LOCAL the local-repo "
+                                "is authoritative. For PUSH_REMOTE this is required."
+                            ))
+    p_mutate.add_argument("--remote", default="origin",
+                            help="Remote name (default: origin)")
+
     p_locks = sub.add_parser(
         "inspect-lock",
         help="Inspect a supervisor lock for a given scope and report liveness",
@@ -4523,6 +4557,98 @@ def _list_outstanding_mutations(args: argparse.Namespace) -> None:
         print(f"  - {m.get('mutation_id')} ({m.get('mutation_type')}) run_id={m.get('run_id')}")
 
 
+def _mutate_ref(args: argparse.Namespace) -> None:
+    """Round-52-fix architectural repair: the
+    repository-owned executor entry point.
+
+    The downstream executor must:
+      1. Load the durable plan (mutate_ref packet) by
+         mutation_id from the workspace.
+      2. Validate the packet: the operation must be one of
+         the supported mutation types and the expected_before_sha
+         must be a full 40-char lowercase hex SHA (or None for
+         CREATE_LOCAL). A packet that lacks exact expected state
+         is refused.
+      3. Run the operation through the guarded CAS adapter
+         (scripts/local/guarded_ref_ops.py). The executor
+         itself does NOT touch the journal sentinel or any
+         supervisor-lease primitive.
+      4. Reconcile the authoritative remote ref via the
+         Layer 2 reconcile() function. Read the actual ref from
+         the remote, never from a local branch or stale
+         remote-tracking ref.
+      5. Persist the terminal result. The durable plan is the
+         authoritative record.
+    """
+    from scripts.local.guarded_ref_mutation import (
+        GuardedMutationPlan,
+        PlanValidationError,
+        Operation as GrdOp,
+        guarded_ref_mutation_plan_path,
+    )
+    from scripts.local.guarded_ref_mutation_runner import (
+        GuardedMutationOrchestrator,
+    )
+
+    workspace = Path(args.workspace)
+    local_repo = Path(args.local_repo)
+    remote_path = (
+        Path(args.remote_path) if args.remote_path else None
+    )
+
+    # Step 1: load the durable plan by mutation_id.
+    plan_path = guarded_ref_mutation_plan_path(workspace, args.mutation_id)
+    if not plan_path.exists():
+        print(
+            f"ERROR: no durable plan for mutation_id={args.mutation_id} "
+            f"at {plan_path}",
+            file=sys.stderr,
+        )
+        sys.exit(20)
+    plan = GuardedMutationPlan.from_json(plan_path.read_text())
+
+    # Step 2: validate the packet. Reject plans that lack exact
+    # expected state for ref-changing operations.
+    try:
+        validate_plan = PlanValidationError  # placeholder
+        from scripts.local.guarded_ref_mutation import (
+            validate_plan as _validate_plan,
+        )
+        _validate_plan(plan)
+    except PlanValidationError as e:
+        print(f"ERROR: plan validation failed: {e}", file=sys.stderr)
+        sys.exit(21)
+
+    op = GrdOp(plan.operation)
+    if op is GrdOp.PUSH_REMOTE and remote_path is None:
+        # PUSH_REMOTE requires the authoritative remote path.
+        print(
+            "ERROR: PUSH_REMOTE requires --remote-path pointing "
+            "to the authoritative remote (e.g. a local bare repo)",
+            file=sys.stderr,
+        )
+        sys.exit(22)
+
+    # Step 3-5: run the orchestrator. The CAS adapter is the
+    # only Git-touching path.
+    orch = GuardedMutationOrchestrator(workspace=workspace, plan=plan)
+    orch.prepare()
+    try:
+        final = orch.execute(
+            local_repo=local_repo,
+            remote_ref_path=remote_path,
+        )
+    except Exception as e:
+        print(f"ERROR: executor failure: {e}", file=sys.stderr)
+        sys.exit(23)
+
+    # Step 5: the orchestrator has already persisted the
+    # terminal result (status, last_reconciled_at,
+    # terminal_evidence) to the GUARDED_REF_MUTATIONS/<id>.json
+    # file. Print the outcome for the caller.
+    print(f"OK mutation_id={plan.mutation_id} status={final.status}")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -4543,6 +4669,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-persistent-guard-compare": _record_persistent_guard_compare,
         "authorize-mutation": _authorize_mutation,
         "record-mutation-result": _record_mutation_result,
+        "mutate-ref": _mutate_ref,
         "inspect-lock": _inspect_lock,
         "recover-stale-lock": _recover_stale_lock,
         "list-outstanding-mutations": _list_outstanding_mutations,
