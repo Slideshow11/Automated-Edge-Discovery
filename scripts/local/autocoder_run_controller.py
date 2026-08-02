@@ -1278,14 +1278,104 @@ def _init(args: argparse.Namespace) -> None:
     }
     lock_to_release_on_failure = lock_outcome
     try:
-        # Round-14 P1 fix (Publish the runnable state only after
-        # both receipts): emit BOTH receipts to disk BEFORE
-        # publishing the runnable state. If either receipt fails,
-        # the state is never visible and no recovery is needed.
-        # On signal/host crash between receipts and state, the
-        # runnable state file is still absent so a replacement
-        # init sees "no state at this path" and proceeds.
-        #
+        # Round-59 P1 fix (Recheck artifacts after acquiring the
+        # workspace sentinel, on fa03915+): the artifact
+        # ownership check below ran BEFORE the workspace and
+        # output-state sentinels were acquired, so two
+        # initializers for distinct scopes could both pass the
+        # check before either published anything. Round-42
+        # claimed to have moved the sentinel before the
+        # artifact check, but the comment described intent and
+        # the actual ordering preserved the original race. The
+        # fix: acquire the workspace sentinel FIRST, then the
+        # output-state sentinel, THEN re-check artifact
+        # ownership while both sentinels are held. The
+        # Round-44 P1 fix (output-state sentinel) and
+        # Round-42 P1 fix (workspace sentinel) become
+        # re-applied in the correct order. The
+        # Round-42 ownership-rejection patch (sys.exit(16) /
+        # sys.exit(17) routing) must be installed before the
+        # sentinels because the existing code raises
+        # plain SystemExit that bypasses the outer cleanup
+        # handler.
+        _orig_sys_exit = sys.exit
+        def _patched_sys_exit(code=0):
+            if code in (16, 17):
+                raise _OwnershipRejectedError(code)
+            _orig_sys_exit(code)
+        sys.exit = _patched_sys_exit
+        # The sentinel file is
+        # `<workspace>/.aed-workspace-owned.json`. On
+        # ownership rejection (above) or any other failure
+        # the sentinel is released in the existing cleanup
+        # path.
+        workspace_owned_path = workspace / ".aed-workspace-owned.json"
+        out_state_sentinel_path = Path(out_path).with_suffix(
+            Path(out_path).suffix + ".aed-write-sentinel"
+        )
+        workspace_owned_fd = None
+        out_state_sentinel_fd = None
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+            workspace_owned_fd = os.open(
+                str(workspace_owned_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            with os.fdopen(workspace_owned_fd, "w") as _wf:
+                _wf.write(
+                    json.dumps({"held_by": args.run_id}) + "\n"
+                )
+            # NOTE: os.fdopen takes ownership of the fd and
+            # closes it on exit; reassign to None to skip
+            # the duplicate close below.
+            workspace_owned_fd = None
+        except FileExistsError:
+            # Another init currently holds the workspace.
+            # Reject with rc=17.
+            print(
+                f"ERROR: workspace {workspace!r} is currently "
+                f"being initialized by another run. Wait for "
+                f"it to finish or remove "
+                f"{workspace_owned_path!r} to override.",
+                file=sys.stderr,
+            )
+            sys.exit(17)
+        try:
+            out_path_parent = Path(out_path).parent
+            out_path_parent.mkdir(parents=True, exist_ok=True)
+            out_state_sentinel_fd = os.open(
+                str(out_state_sentinel_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            with os.fdopen(out_state_sentinel_fd, "w") as _wf:
+                _wf.write(
+                    json.dumps({
+                        "held_by": args.run_id,
+                        "out_path": out_path,
+                    }) + "\n"
+                )
+            out_state_sentinel_fd = None
+        except FileExistsError:
+            # Another init currently holds the output-state
+            # path. Reject with rc=17.
+            print(
+                f"ERROR: output-state path {out_path!r} is "
+                f"currently being initialized by another run. "
+                f"Wait for it to finish or remove "
+                f"{out_state_sentinel_path!r} to override.",
+                file=sys.stderr,
+            )
+            sys.exit(17)
+        # Round-59 P1 fix (continued): the artifact ownership
+        # check below now runs WHILE both sentinels are held,
+        # so a delayed second initializer cannot squeeze past
+        # the check after the first has finished. The check
+        # itself is unchanged; only its position relative to
+        # the sentinels changes.
         # Round-41 P2 fix (Refuse to overwrite another run's
         # workspace artifacts): before publishing the
         # machine/human receipts and the state, refuse if any
@@ -1389,128 +1479,6 @@ def _init(args: argparse.Namespace) -> None:
                             file=sys.stderr,
                         )
                         sys.exit(16)
-        # Round-42 P1 fix (Serialize workspace ownership
-        # before publishing artifacts): two concurrent
-        # initializers for distinct PR or mutation-target
-        # scopes could point at the same empty workspace
-        # and both pass the artifact-existence check before
-        # either publishes anything. The fix: acquire a
-        # workspace-level O_EXCL sentinel BEFORE the
-        # artifact check and hold it through publication.
-        # Round-45 P1 fix (Route output-state contention
-        # through rollback): the sys.exit(16) and
-        # sys.exit(17) calls for workspace/output-state
-        # contention must go through the same
-        # SystemExit-subclass routing as the Round-42
-        # ownership rejection. The previous patch was
-        # installed AFTER the workspace sentinel, so
-        # sys.exit(17) raised a plain SystemExit that
-        # bypassed the outer cleanup handler. Install
-        # the patch BEFORE the sentinels.
-        _orig_sys_exit = sys.exit
-        def _patched_sys_exit(code=0):
-            if code in (16, 17):
-                raise _OwnershipRejectedError(code)
-            _orig_sys_exit(code)
-        sys.exit = _patched_sys_exit
-        # The sentinel file is
-        # `<workspace>/.aed-workspace-owned.json`. On
-        # ownership rejection (above) or any other failure
-        # the sentinel is released in the existing cleanup
-        # path.
-        workspace_owned_path = workspace / ".aed-workspace-owned.json"
-        # Round-44 P1 fix: also declare the output-state
-        # sentinel at outer scope so the rollback can
-        # unlink it.
-        out_state_sentinel_path = Path(out_path).with_suffix(
-            Path(out_path).suffix + ".aed-write-sentinel"
-        )
-        workspace_owned_fd = None
-        try:
-            workspace.mkdir(parents=True, exist_ok=True)
-            workspace_owned_fd = os.open(
-                str(workspace_owned_path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            with os.fdopen(workspace_owned_fd, "w") as _wf:
-                _wf.write(
-                    json.dumps({"held_by": args.run_id}) + "\n"
-                )
-            # NOTE: os.fdopen takes ownership of the fd and
-            # closes it on exit; reassign to None to skip
-            # the duplicate close below.
-            workspace_owned_fd = None
-        except FileExistsError:
-            # Another init currently holds the workspace.
-            # Reject with rc=17.
-            print(
-                f"ERROR: workspace {workspace!r} is currently "
-                f"being initialized by another run. Wait for "
-                f"it to finish or remove "
-                f"{workspace_owned_path!r} to override.",
-                file=sys.stderr,
-            )
-            sys.exit(17)
-        # Round-44 P1 fix (Serialize ownership of custom
-        # output-state paths): when two initializers use
-        # different workspaces but the same nonexistent
-        # --output-state, their workspace sentinel paths
-        # differ, so both can pass the preceding artifact
-        # ownership check and then publish to the same
-        # state path. Because _save_state also uses the
-        # same fixed <output-state>.tmp path, the processes
-        # can overwrite each other's state. The fix: also
-        # take an O_EXCL lock on the resolved output-state
-        # path BEFORE the artifact check, so any other init
-        # for the same output-state blocks with rc=17 (or
-        # a clear reason). The output-state sentinel is
-        # unlinked on success (or rollback) just like the
-        # workspace sentinel.
-        out_path_parent = Path(out_path).parent
-        out_path_parent.mkdir(parents=True, exist_ok=True)
-        out_state_sentinel_fd = None
-        try:
-            out_state_sentinel_fd = os.open(
-                str(out_state_sentinel_path),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0),
-                0o600,
-            )
-            with os.fdopen(out_state_sentinel_fd, "w") as _wf:
-                _wf.write(
-                    json.dumps({
-                        "held_by": args.run_id,
-                        "out_path": out_path,
-                    }) + "\n"
-                )
-            out_state_sentinel_fd = None
-        except FileExistsError:
-            # Another init currently holds the output-state
-            # path. Reject with rc=17.
-            print(
-                f"ERROR: output-state path {out_path!r} is "
-                f"currently being initialized by another run. "
-                f"Wait for it to finish or remove "
-                f"{out_state_sentinel_path!r} to override.",
-                file=sys.stderr,
-            )
-            sys.exit(17)
-        # Round-42 P2 fix (Release the acquired lease on
-        # ownership rejection): the previous sys.exit(16)
-        # raised SystemExit which is NOT caught by the
-        # following except Exception block. The lease
-        # would be left behind, requiring explicit
-        # stale-lock recovery. The fix routes the
-        # rejection through a dedicated SystemExit catcher
-        # that performs the rollback + lock release.
-
-        # Round-43 P2 fix (Release the supervisor lease
-        # when workspace ownership is busy): also route
-        # the rc=17 path (workspace-already-owned) through
-        # the same SystemExit catcher so the lease is
-        # released on rollback.
 
         # Patch sys.exit inside this scope so the
         # ownership rejection raises _OwnershipRejectedError

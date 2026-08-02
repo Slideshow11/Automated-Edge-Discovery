@@ -128,7 +128,9 @@ def test_execute_create_then_delete_then_push(bare_and_clone, tmp_path):
     assert final.status == grm.LifecycleState.SUCCEEDED.value
     assert ops.read_ref(clone, "refs/heads/feat/new") == new_sha
 
-    # DELETE
+    # DELETE — Round-59 P1 fix: pass remote_ref_path=None
+    # to exercise the local fallback (the test asserts the
+    # local clone's ref is deleted, not the remote's).
     plan2 = grm.GuardedMutationPlan(
         mutation_id="m2",
         owner_run_id="r1",
@@ -142,7 +144,7 @@ def test_execute_create_then_delete_then_push(bare_and_clone, tmp_path):
     )
     orch2 = runner.GuardedMutationOrchestrator(workspace=tmp_path, plan=plan2)
     orch2.prepare()
-    final2 = orch2.execute(local_repo=clone, remote_ref_path=clone)
+    final2 = orch2.execute(local_repo=clone, remote_ref_path=None)
     assert final2.status == grm.LifecycleState.SUCCEEDED.value
     assert ops.read_ref(clone, "refs/heads/feat/new") is None
 
@@ -459,7 +461,12 @@ def test_delete_with_matching_expected_succeeds_against_bare_remote(
     )
     orch = runner.GuardedMutationOrchestrator(workspace=tmp_path, plan=plan)
     orch.prepare()
-    final = orch.execute(local_repo=clone, remote_ref_path=clone)
+    # Round-59 P1 fix: when remote_ref_path is supplied, the
+    # runner now dispatches DELETE_LOCAL through push-delete
+    # so the remote branch is removed (not just the local
+    # clone). For a pure local-delete test pass
+    # remote_ref_path=None to exercise the local fallback.
+    final = orch.execute(local_repo=clone, remote_ref_path=None)
     assert final.status == grm.LifecycleState.SUCCEEDED.value
     assert ops.read_ref(clone, "refs/heads/feat/old") is None
 

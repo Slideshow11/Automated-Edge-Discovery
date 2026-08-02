@@ -206,7 +206,10 @@ class GuardedMutationOrchestrator:
         op = grm.Operation(self.plan.operation)
         result: Optional[ops.RefMutationResult] = None
         try:
-            result = self._do_execute(local_repo, op, remote=remote)
+            result = self._do_execute(
+                local_repo, op, remote=remote,
+                remote_ref_path=remote_ref_path,
+            )
         except (ops.GuardedRefError, FileNotFoundError,
                 PermissionError, OSError,
                 subprocess.CalledProcessError) as e:
@@ -269,6 +272,7 @@ class GuardedMutationOrchestrator:
     def _do_execute(
         self, local_repo: Path, op: grm.Operation,
         remote: str = "origin",
+        remote_ref_path: Optional[Path] = None,
     ) -> ops.RefMutationResult:
         """Perform the actual git operation."""
         if op == grm.Operation.PUSH_REMOTE:
@@ -297,6 +301,37 @@ class GuardedMutationOrchestrator:
                 new_sha=self.plan.desired_after_sha or "",
             )
         elif op == grm.Operation.DELETE_LOCAL:
+            # Round-59 P1 fix (Execute branch deletion
+            # against the remote): when a remote_ref_path
+            # is supplied, the branch must be removed from
+            # the remote repository, not just the local
+            # clone. Use push-delete with the supplied
+            # expected_remote_sha as the force-with-lease
+            # CAS so the remote ref's current value is
+            # verified before deletion. When no
+            # remote_ref_path is supplied, fall back to
+            # local delete via git update-ref (the previous
+            # behavior).
+            if remote_ref_path is not None:
+                # The remote_ref_path is supplied by the
+                # caller (mutate-ref passes it for PUSH_REMOTE
+                # operations and explicitly via
+                # --remote-path). For DELETE_LOCAL it may
+                # not have been threaded through. We pass
+                # `remote` (the remote name, default
+                # "origin") and let guarded_push use the
+                # clone's remote.<name>.url as the actual
+                # push target. The reconcile() phase below
+                # will then read remote_ref_path to verify
+                # the deletion took effect on the remote.
+                return ops.guarded_push(
+                    repo=local_repo,
+                    remote=remote,
+                    ref=self.plan.target_ref,
+                    expected_remote_sha=self.plan.expected_before_sha,
+                    new_local_sha=None,
+                    delete_remote=True,
+                )
             return ops.guarded_delete_ref(
                 repo=local_repo,
                 ref=self.plan.target_ref,

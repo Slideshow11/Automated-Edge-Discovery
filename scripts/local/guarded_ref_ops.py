@@ -230,6 +230,7 @@ def guarded_push(
     ref: str,
     expected_remote_sha: Optional[str],
     new_local_sha: Optional[str],
+    delete_remote: bool = False,
 ) -> RefMutationResult:
     """git push --force-with-lease=<ref>:<expected> <remote> <src>:<dst>.
 
@@ -247,11 +248,35 @@ def guarded_push(
     orchestrator before invocation).
 
     For integration tests, the remote is a local bare repo path.
+
+    Round-59 P1 fix (Execute branch deletion against the
+    remote, on fa03915+): when delete_remote=True, the
+    refspec is `:<ref>` (push-delete) with the supplied
+    expected_remote_sha enforced via --force-with-lease.
+    The receiving server rejects the push if the remote
+    ref's current value is not expected_remote_sha, so the
+    CAS contract is preserved. new_local_sha is ignored
+    when delete_remote=True.
     """
-    # Refuse if new_local_sha is missing for an UPDATE-style
-    # push. CREATE-style pushes pass expected_remote_sha=None
-    # AND new_local_sha=None.
-    if new_local_sha is not None:
+    if delete_remote:
+        # Round-59 P1 fix: push-delete refspec. The empty
+        # source side tells the server to delete the ref.
+        # expected_remote_sha must be supplied so the
+        # --force-with-lease CAS is meaningful.
+        if expected_remote_sha is None:
+            return RefMutationResult(
+                ok=False,
+                actual_ref_sha=None,
+                stdout="",
+                stderr=(
+                    "refusing to push-delete: expected_remote_sha "
+                    "is required so the force-with-lease CAS can "
+                    "verify the remote ref's current value"
+                ),
+                returncode=2,
+            )
+        src_spec = ""
+    elif new_local_sha is not None:
         # Verify the desired object ID exists in the local repo.
         # If it does not, the push will fail anyway; we abort
         # early with a clear error.
