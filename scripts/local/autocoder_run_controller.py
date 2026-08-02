@@ -3753,6 +3753,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_mutate.add_argument("--workspace", required=True,
                             help="Workspace directory holding the durable plan")
+    p_mutate.add_argument(
+        "--state",
+        help=(
+            "Path to the controller's CONTROLLER_STATE.json. "
+            "Default: <workspace>/CONTROLLER_STATE.json. Override "
+            "this when init was invoked with --output-state "
+            "pointing at a path outside the workspace."
+        ),
+    )
     p_mutate.add_argument("--mutation-id", required=True,
                             help="The mutation_id from authorize-mutation")
     p_mutate.add_argument("--local-repo", required=True,
@@ -4333,15 +4342,38 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             # mutation_target) tuple. If another run
             # holds it, refuse the upgrade (fail closed).
             target_pr = _state_target_pr_number(state)
-            target_scope = {
-                "repository": (
-                    (state.get("run_identity") or {}).get("repository")
-                    or args.repository
-                ),
-                "target_pr_number": target_pr,
-                "mutation_target": args.mutation_target,
-            }
-            if target_scope["repository"]:
+            # Round-79 P1 fix (V0sD0 continuation): probe
+            # BOTH the target-only scope (repo, None,
+            # mutation_target) and the PR+target scope
+            # (repo, target_pr, mutation_target). The
+            # previous Round-73 fix only checked the
+            # PR+target scope, but another controller
+            # could hold the target-only scope (a
+            # --mutation-target main run without a
+            # --target-pr-number). The two scopes have
+            # different scope_keys (since Round-74 includes
+            # mutation_target in the key), so a single
+            # probe would miss the other.
+            for target_scope in [
+                {
+                    "repository": (
+                        (state.get("run_identity") or {}).get("repository")
+                        or args.repository
+                    ),
+                    "target_pr_number": None,
+                    "mutation_target": args.mutation_target,
+                },
+                {
+                    "repository": (
+                        (state.get("run_identity") or {}).get("repository")
+                        or args.repository
+                    ),
+                    "target_pr_number": target_pr,
+                    "mutation_target": args.mutation_target,
+                },
+            ]:
+                if not target_scope["repository"]:
+                    continue
                 existing_target_outcome = _supervisor_lock.try_acquire(
                     scope=target_scope,
                     owner_run_id=(
@@ -5449,6 +5481,34 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             # explicitly permits NOT_APPLIED -> PREPARED for the
             # safe retry path. Dispatch prepare() + execute()
             # exactly once.
+            # Round-79 P1 fix (V0sD3 continuation): revalidate
+            # the supervisor lease immediately before the
+            # execute() call in the NOT_APPLIED retry path.
+            # The PREPARED branch has the same check, but
+            # the NOT_APPLIED retry path was added before the
+            # revalidation was introduced; without this
+            # addition, a superseded run could still
+            # perform the CAS through the retry path even
+            # if its lease was recovered. Fail closed.
+            from scripts.local.aed_supervisor_lock import (
+                is_lease_held_by_run,
+            )
+            if not is_lease_held_by_run(
+                scope=scope,
+                owner_run_id=plan.owner_run_id,
+                base_dir=lock_base_for_check,
+            ):
+                print(
+                    f"ERROR: cannot execute mutation (NOT_APPLIED retry): the "
+                    f"supervisor lease is no longer held by "
+                    f"run_id={plan.owner_run_id} for scope={scope}. "
+                    "A concurrent recover_stale transferred the "
+                    "lease to a successor run. The current run "
+                    "cannot proceed with the executor; refuse "
+                    "before any protected Git or GitHub mutation.",
+                    file=sys.stderr,
+                )
+                sys.exit(11)
             orch.prepare()
             final = orch.execute(
                 local_repo=local_repo,
