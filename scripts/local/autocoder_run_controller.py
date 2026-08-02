@@ -4797,21 +4797,26 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # If it is a real GitHub URL, the runner can use it for
     # `git ls-remote`.
     clone_remote_url = None
+    _early_block_ran = False
+    # Read the selected remote's URL even when --remote-path
+    # is user-supplied, so the local-bare identity can be
+    # correctly assigned when the selected remote URL and
+    # the user-supplied --remote-path point at the same
+    # filesystem location. Skip the early block's path
+    # threading when --remote-path is already set.
+    try:
+        cfg = subprocess.run(
+            ["git", "-C", str(local_repo),
+             "config", "--get",
+             f"remote.{args.remote}.url"],
+            capture_output=True, text=True, check=True,
+        )
+        clone_remote_url = cfg.stdout.strip() or None
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        clone_remote_url = None
     if remote_path is None:
-        try:
-            cfg = subprocess.run(
-                ["git", "-C", str(local_repo),
-                 "config", "--get",
-                 f"remote.{args.remote}.url"],
-                capture_output=True, text=True, check=True,
-            )
-            clone_remote_url = cfg.stdout.strip() or None
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            clone_remote_url = None
-        # If the configured URL is a local bare path, thread
-        # the local path through as the authoritative mirror
-        # so the runner's existing local-path code path runs
-        # unchanged.
+        # Thread the configured URL into remote_path so the
+        # runner's local-path code path runs unchanged.
         if (
             clone_remote_url
             and not clone_remote_url.startswith("http")
@@ -4819,6 +4824,7 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             and not clone_remote_url.startswith("ssh://")
         ):
             remote_path = Path(clone_remote_url)
+            _early_block_ran = True
             clone_remote_url = None
 
     # Step 3.5 (Round-58 P1 fix: Bind the execution remote to the
@@ -4859,19 +4865,16 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # If `clone_remote_url` is None (remote completely
     # unconfigured), fail closed: there is no selected
     # remote URL to verify.
-    if (
-        local_repo_identity is None
-        and remote_path is not None
-        and clone_remote_url is None
-    ):
-        # Either --remote-path was user-supplied, or the
-        # early block threaded the selected remote URL
-        # (a local bare path) into remote_path. In both
-        # cases the runner reads directly from a local
-        # bare path.
-        local_repo_identity = _run_identity.RepositoryIdentity(
-            host="local", owner="local", name="local",
-        )
+    #
+    # Round-63 P1 fix (Bind local remotes before exempting
+    # their identity): the local-bare identity is assigned
+    # only when EITHER the early block has already threaded
+    # the selected local-bare URL into remote_path, OR (the
+    # new path) the selected remote URL is a local-bare path
+    # that resolves to the same location as the
+    # user-supplied --remote-path. A user who pushes to one
+    # local-bare (selected remote) and reconciles against a
+    # different one (--remote-path) must NOT be accepted.
     if plan_repo_identity is None:
         print(
             "ERROR: cannot verify repository identity: "
@@ -4881,6 +4884,51 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(27)
+    # Round-63 P1 fix (Bind local remotes before exempting
+    # their identity): when the selected remote's URL is a
+    # local-bare path AND the user supplied --remote-path
+    # pointing at a different filesystem location, the
+    # local-bare exemption must NOT apply — that would let a
+    # user push to one local-bare and reconcile against a
+    # different one with the same synthetic "local" identity.
+    # Only assign the local-bare identity when the two paths
+    # resolve to the same filesystem location.
+    #
+    # The original Round-60 first branch (clone_remote_url
+    # is None + remote_path is not None) was too loose: it
+    # fired even when the selected remote was a local-bare
+    # different from --remote-path, accepting the fork case.
+    # The fixed condition: the local-bare identity is
+    # assigned only when EITHER the early block has already
+    # threaded the selected local-bare URL into remote_path
+    # (so the same local-bare is being pushed to and
+    # reconciled against), OR (the new path) the selected
+    # remote URL is a local-bare path that resolves to the
+    # same location as the user-supplied --remote-path.
+    _remote_path_match = False
+    if remote_path is not None and clone_remote_url is not None:
+        try:
+            _remote_path_match = (
+                Path(clone_remote_url).resolve()
+                == Path(remote_path).resolve()
+            )
+        except (OSError, ValueError):
+            _remote_path_match = False
+    if (
+        local_repo_identity is None
+        and remote_path is not None
+        and (_early_block_ran or _remote_path_match)
+    ):
+        # Either the early block threaded the selected
+        # remote URL (a local-bare path) into remote_path,
+        # OR the selected-remote local path and the
+        # user-supplied --remote-path resolve to the same
+        # filesystem location. In both cases the runner
+        # pushes to and reconciles against the same local
+        # bare — treat as a local-bare mirror.
+        local_repo_identity = _run_identity.RepositoryIdentity(
+            host="local", owner="local", name="local",
+        )
     if local_repo_identity is None:
         print(
             "ERROR: cannot verify repository identity: "
