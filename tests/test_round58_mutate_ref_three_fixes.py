@@ -73,7 +73,7 @@ def _make_bare_with_clone(
     transport: str = "https",
     initial_branch: str = "main",
     seed_commit: bool = True,
-):
+) -> tuple:
     """Create a bare repo plus a clone, with remote.origin.url
     configured to a GitHub URL matching the canonical
     (host, owner, name) identity.
@@ -348,14 +348,24 @@ def test_a_fork_with_same_commit_refused(tmp_path):
     commit SHAs). POST-FIX: mutate-ref refuses because the
     --local-repo origin is fork-owner/fork-name, not owner/name."""
     # Authorization was issued for owner/name at initial_sha.
-    # A fork (fork-owner/fork-name) was created at the same SHA.
+    # A fork (fork-owner/fork-name) was created containing the
+    # same initial commit. We use the original's initial_sha
+    # as the seed for both clones; the fork clone fetches
+    # the commit from the original's bare so the SHA exists
+    # in the fork clone's history. (Each fresh bare has its
+    # own initial commit with a different SHA; the test
+    # uses the same seed SHA in both so the "fork contains
+    # the same commit" premise holds.)
     _bare_a, _clone_a, initial_sha = _make_bare_with_clone(
         tmp_path, owner="owner", name="name",
     )
     bare_fork, clone_fork, _ = _make_bare_with_clone(
         tmp_path, owner="fork-owner", name="fork-name",
+        seed_commit=False,  # don't create a new init commit
     )
-    # Push the same commit SHA into the fork so the SHAs match.
+    # Fetch the original's initial_sha into the fork clone so
+    # the reset below has a valid target.
+    _git(clone_fork, "fetch", str(_bare_a), initial_sha, "-q")
     _git(clone_fork, "reset", "--hard", initial_sha)
     _git(clone_fork, "push", str(bare_fork), "refs/heads/main", "-q")
 
