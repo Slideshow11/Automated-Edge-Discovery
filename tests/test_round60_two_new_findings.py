@@ -86,9 +86,14 @@ def _write_workspace(
     plan: grm.GuardedMutationPlan,
     mutation_id: str,
     repository: str = "owner/name",
-):
+) -> Path:
     """Write the durable plan file and a matching MUTATIONS.jsonl
-    authorization record so that mutate-ref's binding succeeds."""
+    authorization record so that mutate-ref's binding succeeds.
+    Also write a CONTROLLER_STATE.json with a matching
+    run_identity so the Round-77 lease revalidation check
+    can find the lease, and acquire the supervisor lease
+    with the matching scope.
+    """
     plan_dir = workspace / "GUARDED_REF_MUTATIONS"
     plan_dir.mkdir(parents=True, exist_ok=True)
     plan_path = plan_dir / f"{mutation_id}.json"
@@ -109,6 +114,78 @@ def _write_workspace(
     }
     journal_path = workspace / "MUTATIONS.jsonl"
     journal_path.write_text(json.dumps(auth_record) + "\n")
+    # Write a CONTROLLER_STATE.json with run_identity
+    # matching the lease scope.
+    (workspace / "CONTROLLER_STATE.json").write_text(json.dumps({
+        "controller_version": 1,
+        "run_id": "r1",
+        "workspace": str(workspace),
+        "overall_status": "RUN_ACTIVE",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "next_action": {"action": "noop"},
+        "run_identity": {
+            "run_id": "r1",
+            "controller_version": 1,
+            "repository": repository,
+            "target_pr_number": 416,
+            "lock_dir": str(workspace / "L"),
+        },
+    }))
+    # Acquire the supervisor lease with the matching
+    # scope so the Round-77 lease revalidation check
+    # passes. The mutate-ref check uses (state's
+    # run_identity.target_pr_number, None) since the
+    # test's plan target_ref is "refs/heads/main" and
+    # the state has no mutation_target.
+    import os
+    from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
+    lock_dir = workspace / "L"
+    lock_dir.mkdir(exist_ok=True)
+    lease_outcome = _try_acquire(
+        scope={
+            "repository": repository,
+            "target_pr_number": 416,
+        },
+        owner_run_id="r1",
+        owner_host={"hostname": "test", "user": "test"},
+        owner_pid=os.getpid(),
+        owner_start_evidence={
+            "pid": os.getpid(),
+            "start_time": "2026-08-01T00:00:00Z",
+        },
+        owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+        base_dir=lock_dir,
+    )
+    if not lease_outcome.ok:
+        # If a previous test left a lease, release it
+        # and try again.
+        from scripts.local.aed_supervisor_lock import release as _release
+        _release(
+            scope={
+                "repository": repository,
+                "target_pr_number": 416,
+            },
+            owner_run_id="r1",
+            base_dir=lock_dir,
+        )
+        lease_outcome = _try_acquire(
+            scope={
+                "repository": repository,
+                "target_pr_number": 416,
+            },
+            owner_run_id="r1",
+            owner_host={"hostname": "test", "user": "test"},
+            owner_pid=os.getpid(),
+            owner_start_evidence={
+                "pid": os.getpid(),
+                "start_time": "2026-08-01T00:00:00Z",
+            },
+            owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+            base_dir=lock_dir,
+        )
+    assert lease_outcome.ok, (
+        f"failed to acquire lease for test: {lease_outcome.reason!r}"
+    )
     return plan_path
 
 

@@ -4976,6 +4976,64 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         sys.exit(20)
     plan = GuardedMutationPlan.from_json(plan_path.read_text())
 
+    # Round-77 P1 fix: pre-compute the scope and lock base
+    # for the lease re-validation check (the
+    # orch.execute() call below). The scope and base_dir
+    # mirror the values used by the lease check in
+    # authorize-mutation so a re-check here uses the same
+    # inputs and produces the same result.
+    lock_base_for_check = None
+    # Read lock_dir from the state file (if present) so
+    # the lease check looks in the same directory
+    # authorize-mutation used. The mutate-ref subcommand
+    # uses --workspace to locate the state (default
+    # state path: <workspace>/CONTROLLER_STATE.json).
+    try:
+        _state_path_for_lock = (
+            getattr(args, "state", None) or
+            str(workspace / "CONTROLLER_STATE.json")
+        )
+        with open(_state_path_for_lock) as _sf:
+            _state_for_lock_dir = json.load(_sf)
+        _rid_for_lock_dir = (
+            _state_for_lock_dir.get("run_identity") or {}
+        )
+        if isinstance(_rid_for_lock_dir, dict) and _rid_for_lock_dir.get("lock_dir"):
+            lock_base_for_check = Path(
+                _rid_for_lock_dir["lock_dir"]
+            )
+    except (OSError, json.JSONDecodeError, ValueError):
+        _rid_for_lock_dir = None
+    # Scope used by the lease check. The mutate-ref
+    # subcommand does not have a --target-pr-number flag
+    # or a --mutation-target flag (the branch is in the
+    # plan's target_ref). Use the state values
+    # (run_identity.target_pr_number and
+    # run_identity.mutation_target) to match what
+    # authorize-mutation checked. The plan's target_ref
+    # segment is NOT used because authorize-mutation did
+    # not set run_identity.mutation_target (the lease
+    # scope is run_identity.mutation_target, which is
+    # typically None for PR-scoped runs).
+    state_target_pr = None
+    state_mutation_target = None
+    if isinstance(_rid_for_lock_dir, dict):
+        state_target_pr = _rid_for_lock_dir.get("target_pr_number")
+        state_mutation_target = _rid_for_lock_dir.get("mutation_target")
+    scope = {
+        "repository": plan.repository,
+        "target_pr_number": (
+            state_target_pr
+            if state_target_pr is not None
+            else getattr(args, "target_pr_number", None)
+        ),
+        "mutation_target": (
+            state_mutation_target
+            if state_mutation_target is not None
+            else getattr(args, "mutation_target", None)
+        ),
+    }
+
     # Step 2: validate the packet FIRST. Reject plans that
     # lack exact expected state for ref-changing operations.
     # Validation runs before the authorization binding check
@@ -5333,6 +5391,38 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         # one (Repair 1: --remote is accepted but must
         # actually be used).
         orch.prepare()
+        # Round-77 P1 fix (Revalidate the supervisor
+        # lease before executing): the previous code
+        # called orch.execute() without re-verifying that
+        # the current run still owns the live supervisor
+        # lease. If another worker recovered the lease
+        # between authorize-mutation and mutate-ref, the
+        # current run could still execute its authorized
+        # plan. The lease check is the SAME check that
+        # authorize-mutation performed; it MUST be done
+        # immediately before the executor is called so a
+        # superseded executor cannot race a replacement
+        # run. Fail closed: if the lease is no longer
+        # held, exit 11.
+        from scripts.local.aed_supervisor_lock import (
+            is_lease_held_by_run,
+        )
+        if not is_lease_held_by_run(
+            scope=scope,
+            owner_run_id=plan.owner_run_id,
+            base_dir=lock_base_for_check,
+        ):
+            print(
+                f"ERROR: cannot execute mutation: the "
+                f"supervisor lease is no longer held by "
+                f"run_id={plan.owner_run_id} for scope={scope}. "
+                "A concurrent recover_stale transferred the "
+                "lease to a successor run. The current run "
+                "cannot proceed with the executor; refuse "
+                "before any protected Git or GitHub mutation.",
+                file=sys.stderr,
+            )
+            sys.exit(11)
         final = orch.execute(
             local_repo=local_repo,
             remote_ref_path=remote_path,

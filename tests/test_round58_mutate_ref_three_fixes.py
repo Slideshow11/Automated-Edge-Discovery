@@ -41,6 +41,8 @@ import sys
 import uuid
 from pathlib import Path
 
+import os
+
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -141,7 +143,13 @@ def _write_workspace(
     result: dict | None = None,
 ):
     """Write the durable plan file and a matching MUTATIONS.jsonl
-    authorization record so that mutate-ref's binding succeeds."""
+    authorization record so that mutate-ref's binding succeeds.
+
+    Round-77 P1 fix: also write a CONTROLLER_STATE.json
+    with a matching run_identity and acquire the supervisor
+    lease so the mutate-ref lease revalidation check
+    passes.
+    """
     # Durable plan
     plan_dir = workspace / "GUARDED_REF_MUTATIONS"
     plan_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +173,80 @@ def _write_workspace(
     journal_path = workspace / "MUTATIONS.jsonl"
     with open(journal_path, "w") as f:
         f.write(json.dumps(auth_record) + "\n")
+    # Round-77 P1 fix: write a CONTROLLER_STATE.json
+    # with a matching run_identity and acquire the
+    # supervisor lease so the mutate-ref lease
+    # revalidation check passes.
+    lock_dir = workspace / "L"
+    lock_dir.mkdir(exist_ok=True)
+    from scripts.local.aed_run_identity import safe_restrictive_open
+    state = {
+        "controller_version": 1,
+        "run_id": run_id,
+        "workspace": str(workspace),
+        "overall_status": "RUN_ACTIVE",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "next_action": {"action": "noop"},
+        "run_identity": {
+            "run_id": run_id,
+            "controller_version": 1,
+            "repository": repository,
+            "target_pr_number": target_pr_number,
+            "mutation_target": mutation_target,
+            "lock_dir": str(lock_dir),
+        },
+    }
+    fd = safe_restrictive_open(workspace / "CONTROLLER_STATE.json", "w")
+    try:
+        fd.write(json.dumps(state, indent=2))
+        fd.flush()
+        os.fsync(fd.fileno())
+    finally:
+        fd.close()
+    # Acquire the lease. Use the scope derived from the
+    # state to match what the controller's check looks
+    # for. The plan's target_ref is "refs/heads/<branch>"
+    # and the state has no mutation_target, so the
+    # controller's check uses (target_pr_number,
+    # branch_from_ref) where branch_from_ref is the last
+    # segment of plan.target_ref. For a clean test,
+    # acquire the lease at the scope the controller
+    # looks for.
+    import os as _os
+    from scripts.local.aed_supervisor_lock import (
+        try_acquire as _try_acquire,
+        release as _release,
+    )
+    # Match what the controller's mutate-ref check
+    # looks for. The state has run_identity.target_pr_number
+    # and no mutation_target. The plan's target_ref strips
+    # to its last segment.
+    branch = None
+    if plan.target_ref and plan.target_ref.startswith("refs/heads/"):
+        branch = plan.target_ref[len("refs/heads/"):]
+    lease_scope = {
+        "repository": repository,
+        "target_pr_number": target_pr_number,
+        "mutation_target": branch or mutation_target,
+    }
+    for attempt in range(2):
+        outcome = _try_acquire(
+            scope=lease_scope,
+            owner_run_id=run_id,
+            owner_host={"hostname": "test", "user": "test"},
+            owner_pid=_os.getpid(),
+            owner_start_evidence={
+                "pid": _os.getpid(),
+                "start_time": "2026-08-01T00:00:00Z",
+            },
+            owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+            base_dir=lock_dir,
+        )
+        if outcome.ok:
+            break
+        _release(
+            scope=lease_scope, owner_run_id=run_id, base_dir=lock_dir,
+        )
     return plan_path
 
 

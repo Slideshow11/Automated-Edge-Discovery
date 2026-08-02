@@ -122,6 +122,8 @@ def _write_minimal_state(workspace: Path):
     state contents don't matter for these tests; mutate-ref
     reads the plan + MUTATIONS.jsonl directly."""
     from scripts.local.aed_run_identity import safe_restrictive_open
+    lock_dir = workspace / "L"
+    lock_dir.mkdir(exist_ok=True)
     state = {
         "controller_version": 1,
         "run_id": "r1",
@@ -134,6 +136,7 @@ def _write_minimal_state(workspace: Path):
             "controller_version": 1,
             "repository": "owner/name",
             "target_pr_number": 416,
+            "lock_dir": str(lock_dir),
         },
     }
     fd = safe_restrictive_open(workspace / "CONTROLLER_STATE.json", "w")
@@ -143,6 +146,36 @@ def _write_minimal_state(workspace: Path):
         os.fsync(fd.fileno())
     finally:
         fd.close()
+    # Round-77 P1 fix: acquire the supervisor lease so
+    # the mutate-ref lease revalidation check passes.
+    import os as _os
+    from scripts.local.aed_supervisor_lock import (
+        try_acquire as _try_acquire,
+        release as _release,
+    )
+    lease_scope = {
+        "repository": "owner/name",
+        "target_pr_number": 416,
+    }
+    for attempt in range(2):
+        outcome = _try_acquire(
+            scope=lease_scope,
+            owner_run_id="r1",
+            owner_host={"hostname": "test", "user": "test"},
+            owner_pid=_os.getpid(),
+            owner_start_evidence={
+                "pid": _os.getpid(),
+                "start_time": "2026-08-01T00:00:00Z",
+            },
+            owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+            base_dir=lock_dir,
+        )
+        if outcome.ok:
+            break
+        # A previous test left a lease; release and retry.
+        _release(
+            scope=lease_scope, owner_run_id="r1", base_dir=lock_dir,
+        )
 
 
 # ---------------------------------------------------------------------------

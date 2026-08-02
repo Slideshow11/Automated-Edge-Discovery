@@ -171,6 +171,7 @@ def _seed_mutation_authorization(
     expected_target_sha: Optional[str],
     pending_action: str,
     desired_after_sha: Optional[str] = None,
+    acquire_lease: bool = True,
 ) -> None:
     """Write a MUTATIONS.jsonl record directly so the
     authorization-binding check in mutate-ref passes.
@@ -182,6 +183,11 @@ def _seed_mutation_authorization(
     those are orthogonal to the guarded-ref production
     integration. The authorization binding check in mutate-ref
     is what we are testing.
+
+    Round-77 P1 fix: also acquire the supervisor lease
+    so the mutate-ref lease revalidation check passes.
+    The lease is acquired with the same scope as the
+    plan's repository+target.
     """
     mutations_file = workspace / "MUTATIONS.jsonl"
     record = {
@@ -231,6 +237,68 @@ def _seed_mutation_authorization(
     # Append the authorization record to MUTATIONS.jsonl.
     with open(mutations_file, "a") as f:
         f.write(json.dumps(record) + "\n")
+    # Round-77 P1 fix: acquire the supervisor lease so
+    # the mutate-ref lease revalidation check passes.
+    # The controller's check uses
+    # (run_identity.target_pr_number,
+    # run_identity.mutation_target) from the state. The
+    # e2e test's state (from _create_minimal_state) has
+    # target_pr_number=416 and mutation_target=None
+    # (i.e. a PR-scoped run without a target), so
+    # acquire the lease with that scope.
+    if acquire_lease:
+        import os
+        import time
+        from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
+        lock_dir = workspace / "L"
+        lock_dir.mkdir(exist_ok=True)
+        # Determine the scope from the state (if it has
+        # run_identity) or fall back to mutation_target
+        # only (target-only scope).
+        _state_for_lease = json.loads(
+            (workspace / "CONTROLLER_STATE.json").read_text()
+        ) if (workspace / "CONTROLLER_STATE.json").exists() else {}
+        _rid_for_lease = _state_for_lease.get("run_identity") or {}
+        # The liveness check requires run_identity.run_id
+        # to match the lock's owner_run_id. Persist this
+        # injection to the state file so the
+        # controller's later check sees the right value.
+        if (
+            isinstance(_rid_for_lease, dict)
+            and "run_id" not in _rid_for_lease
+            and "run_id" in _state_for_lease
+        ):
+            _rid_for_lease["run_id"] = _state_for_lease["run_id"]
+            _state_for_lease["run_identity"] = _rid_for_lease
+            (workspace / "CONTROLLER_STATE.json").write_text(
+                json.dumps(_state_for_lease, indent=2)
+            )
+        # Use the state's run_identity values directly
+        # (no fallback to the function's mutation_target
+        # parameter) so the lease scope matches what
+        # the controller's mutate-ref check will look
+        # for.
+        lease_scope = {
+            "repository": "owner/name",
+            "target_pr_number": _rid_for_lease.get("target_pr_number"),
+            "mutation_target": _rid_for_lease.get("mutation_target"),
+        }
+        lease_outcome = _try_acquire(
+            scope=lease_scope,
+            owner_run_id="r-end2end",
+            owner_host={"hostname": "test", "user": "test"},
+            owner_pid=os.getpid(),
+            owner_start_evidence={
+                "pid": os.getpid(),
+                "start_time": "2026-08-01T00:00:00Z",
+            },
+            owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+            base_dir=lock_dir,
+        )
+        assert lease_outcome.ok, (
+            f"failed to acquire supervisor lease in e2e "
+            f"setup: {lease_outcome.reason!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +516,43 @@ def test_mutate_ref_refuses_pushed_with_no_remote_path(tmp_path):
     }
     mutations_file.write_text(json.dumps(auth_record))
 
+    # Round-77 P1 fix: acquire the supervisor lease so
+    # the mutate-ref lease revalidation check passes.
+    # The mutate-ref check uses (args.target_pr_number,
+    # branch_from_ref); the test does not pass
+    # --target-pr-number, but the controller's check
+    # falls back to the state's run_identity.target_pr_number
+    # (= 416) and to args.mutation_target (which is not
+    # set). The branch_from_ref strips the "refs/heads/"
+    # prefix from plan.target_ref ("refs/heads/main"),
+    # giving "main" as mutation_target. Acquire the lease
+    # at (416, None) so the check passes. We pass
+    # mutation_target=None because the controller's check
+    # uses None (no mutation_target in run_identity) for
+    # this PR-scoped test.
+    import os
+    from scripts.local.aed_supervisor_lock import try_acquire as _try_acquire
+    outcome = _try_acquire(
+        scope={
+            "repository": "owner/name",
+            "target_pr_number": 416,
+            "mutation_target": None,
+        },
+        owner_run_id="r-end2end",
+        owner_host={"hostname": "test", "user": "test", "pid": os.getpid()},
+        owner_pid=os.getpid(),
+        owner_start_evidence={
+            "pid": os.getpid(),
+            "start_time": "2026-08-01T00:00:00Z",
+        },
+        owner_state_path=str(workspace / "CONTROLLER_STATE.json"),
+        base_dir=workspace / "L",
+    )
+    assert outcome.ok, (
+        f"failed to acquire supervisor lease in e2e setup: "
+        f"{outcome.reason if hasattr(outcome, 'reason') else outcome}"
+    )
+
     result = _run_cli(
         "mutate-ref",
         "--workspace", str(workspace),
@@ -612,13 +717,23 @@ def test_authorize_mutation_emits_durable_plan(tmp_path):
     # lock module. This is what `init` does in production; we
     # use the lower-level API here to keep the test focused on
     # authorize-mutation, not on init.
+    # Round-77 P1 fix: acquire the supervisor lease with
+    # a scope that matches what authorize-mutation will
+    # check (which uses the state.run_identity values:
+    # target_pr_number=416, mutation_target=None).
+    # NOTE: the state.mutation_target field is set to
+    # "feat/z" at line 645 for the controller to record
+    # the desired branch, but the run_identity's
+    # mutation_target (used for the lease scope) is
+    # None. Acquire the lease with target_pr_number=416
+    # and mutation_target=None to match the lease
+    # scope that authorize-mutation and mutate-ref
+    # will check.
     import os
     host_identity = {"hostname": "test", "user": "test", "pid": os.getpid()}
     proc_evidence = {"pid": os.getpid(), "start_time": "2026-08-01T00:00:00Z"}
     from scripts.local.aed_supervisor_lock import (
         try_acquire as _supervisor_try_acquire,
-        build_scope_key as _build_scope_key,
-        lock_path_for as _lock_path_for,
     )
     scope = {
         "repository": "owner/name",
@@ -959,12 +1074,21 @@ def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
     _git(clone, "commit", "--allow-empty", "-m", "remote_test", "-q")
     desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
 
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    # _create_minimal_state writes a CONTROLLER_STATE.json
+    # with run_identity.target_pr_number=416, etc. The
+    # seed helper below acquires a supervisor lease with
+    # a scope derived from this state, so create the
+    # state BEFORE seeding the mutation authorization.
+    _create_minimal_state(workspace)
+    (workspace / "L").mkdir(exist_ok=True)
     # The lease expects the remote ref to currently point
     # to `initial`. The desired after-SHA is the new commit
     # (`desired`). The executor will force-push the new
     # commit, but only if the remote is at `initial`.
     _seed_mutation_authorization(
-        workspace=tmp_path / "workspace",
+        workspace=workspace,
         mutation_id="m_remote",
         mutation_type="force_push",
         mutation_target="main",
@@ -980,10 +1104,16 @@ def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
         ["git", "update-ref", "refs/heads/main", initial],
         cwd=clone, check=True, capture_output=True,
     )
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
+    # _seed_mutation_authorization already created
+    # workspace/L when it acquired the lease. The
+    # additional mkdir here is a no-op for the lock
+    # directory but the test still needs to ensure the
+    # CONTROLLER_STATE.json exists (the seed helper
+    # did not create it; _create_minimal_state
+    # does). Use the workspace that the seed helper
+    # populated.
     _create_minimal_state(workspace)
-    (workspace / "L").mkdir()
+    (workspace / "L").mkdir(exist_ok=True)
 
     # Run mutate-ref with --remote=upstream. The push MUST go
     # to upstream, not origin.
