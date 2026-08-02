@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -52,16 +53,36 @@ def _utcnow_iso() -> str:
 
 
 def _persist_plan(plan: grm.GuardedMutationPlan, workspace: Path) -> None:
-    """Rewrite the durable plan file atomically.
+    """Rewrite the durable plan file atomically with
+    restrictive permissions preserved across replacement.
 
-    Uses a tmp-file + os.replace for atomicity. The controller
-    and the executor both call this at every state transition.
+    Uses a tmp-file + os.replace for atomicity. The
+    controller and the executor both call this at every
+    state transition.
+
+    Round-60 P2 fix (PRRT_kwDOSHFpYM6VzOP8): the previous
+    implementation used Path.write_text which creates the
+    tmp file with the process umask (commonly 0o644 on
+    POSIX), replacing the authorization-time 0o600 plan
+    with a world-readable inode. Use safe_restrictive_open
+    to create the tmp file with 0o600 mode so the
+    replacement inode retains restrictive permissions.
+    The os.replace atomically swaps the tmp file into the
+    plan path (POSIX rename preserves the inode mode).
     """
+    from scripts.local.aed_run_identity import safe_restrictive_open
     path = grm.guarded_ref_mutation_plan_path(workspace, plan.mutation_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(plan.to_json())
-    tmp.replace(path)
+    payload = plan.to_json()
+    fd = safe_restrictive_open(tmp, "w")
+    try:
+        fd.write(payload)
+        fd.flush()
+        os.fsync(fd.fileno())
+    finally:
+        fd.close()
+    os.replace(tmp, path)
 
 
 def _read_remote_ref_via_query(

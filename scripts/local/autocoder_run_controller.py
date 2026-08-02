@@ -4969,13 +4969,30 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # retried by a fresh reconcile. (Repair 3.)
     orch = GuardedMutationOrchestrator(workspace=workspace, plan=plan)
     current_state = LifecycleState(plan.status)
+    # Round-61 P1 fix (Reconcile resumptions against the
+    # configured remote): for PUSH_REMOTE plans resumed from
+    # EXECUTING / RECONCILING / INDETERMINATE / NOT_APPLIED,
+    # do NOT pass the local clone as the authoritative
+    # remote path. The local branch may already point at
+    # desired_after_sha without the push having happened,
+    # which would mis-classify as SUCCEEDED. Pass None for
+    # remote_ref_path and let the runner fall back to
+    # `git ls-remote` over the configured remote URL. For
+    # UPDATE_LOCAL / CREATE_LOCAL / DELETE_LOCAL operations
+    # the local clone IS authoritative, so the existing
+    # fallback `remote_path or local_repo` remains correct.
+    is_push_remote = op is GrdOp.PUSH_REMOTE
+    reconcile_remote_ref_path = (
+        None if is_push_remote and remote_path is None
+        else (remote_path or local_repo)
+    )
     if current_state in (
         LifecycleState.EXECUTING,
         LifecycleState.RECONCILING,
         LifecycleState.INDETERMINATE,
     ):
         final = orch.reconcile(
-            remote_ref_path=remote_path or local_repo,
+            remote_ref_path=reconcile_remote_ref_path,
             remote_url=clone_remote_url,
         )
     elif current_state is LifecycleState.PREPARED:
@@ -5004,7 +5021,7 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         # NOT_APPLIED -> RECONCILING is the permitted
         # lifecycle transition; reconcile() handles it.
         final = orch.reconcile(
-            remote_ref_path=remote_path or local_repo,
+            remote_ref_path=reconcile_remote_ref_path,
             remote_url=clone_remote_url,
         )
         if final.status == LifecycleState.NOT_APPLIED.value:
