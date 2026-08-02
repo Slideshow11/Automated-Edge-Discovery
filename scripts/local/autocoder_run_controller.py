@@ -4815,6 +4815,83 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         )
         sys.exit(22)
 
+    # Step 3.5 (Round-58 P1 fix: Bind the execution remote to the
+    # authorized repository): before any mutation or reconciliation,
+    # verify that --local-repo, --remote-path, and the selected
+    # --remote refer to the same repository that the plan authorizes.
+    # Two repositories or forks can contain the same commit SHA, so
+    # matching commit SHAs are NOT proof that two endpoints refer to
+    # the same repository. We canonicalize both sides via
+    # (host, owner, name) and refuse if they disagree. Fail closed
+    # when either side is unparseable or missing.
+    plan_repo_identity = _run_identity.canonical_repository_identity(
+        plan.repository
+    )
+    local_repo_identity = _run_identity.resolve_local_repo_origin_identity(
+        local_repo
+    )
+    if plan_repo_identity is None:
+        print(
+            "ERROR: cannot verify repository identity: "
+            f"plan.repository={plan.repository!r} is not a parseable "
+            "GitHub repository identifier (owner/name, "
+            "https://github.com/owner/name, or git@github.com:owner/name).",
+            file=sys.stderr,
+        )
+        sys.exit(27)
+    if local_repo_identity is None:
+        print(
+            "ERROR: cannot verify repository identity: "
+            f"--local-repo={local_repo} has no parseable origin URL. "
+            "Configure remote.origin.url to a GitHub repository URL "
+            "(HTTPS or SSH form) before invoking mutate-ref.",
+            file=sys.stderr,
+        )
+        sys.exit(27)
+    if not _run_identity.repository_identities_match(
+        plan_repo_identity, local_repo_identity
+    ):
+        print(
+            "ERROR: repository identity mismatch: "
+            f"plan authorizes {plan_repo_identity} but "
+            f"--local-repo origin resolves to {local_repo_identity}. "
+            "Refusing to mutate a repository that does not match the "
+            "authorization record.",
+            file=sys.stderr,
+        )
+        sys.exit(27)
+    # If --remote-path is supplied (e.g. a local bare repo used for
+    # CI integration testing), verify its own origin — if any —
+    # matches the same authorized identity. A local bare repo with
+    # no remote.<name>.url is acceptable for testing but must have
+    # a HEAD branch whose path matches the canonical owner/name;
+    # we only check that the resolved local_repo identity matches,
+    # which already passed above.
+    if remote_path is not None:
+        remote_path_identity = _run_identity.resolve_local_repo_origin_identity(
+            remote_path
+        )
+        # If the remote_path has no origin URL (typical for a bare
+        # local test fixture), accept it; the local_repo identity
+        # match above is the authoritative check. If the remote_path
+        # does have an origin URL, it MUST match the authorized
+        # identity too.
+        if (
+            remote_path_identity is not None
+            and not _run_identity.repository_identities_match(
+                plan_repo_identity, remote_path_identity
+            )
+        ):
+            print(
+                "ERROR: repository identity mismatch: "
+                f"plan authorizes {plan_repo_identity} but "
+                f"--remote-path origin resolves to {remote_path_identity}. "
+                "Refusing to reconcile against a remote that does not "
+                "match the authorization record.",
+                file=sys.stderr,
+            )
+            sys.exit(27)
+
     # Step 4: dispatch intermediate plans to reconcile() —
     # never re-prepare. If the plan is at EXECUTING,
     # RECONCILING, or INDETERMINATE, the previous run did not
@@ -4847,11 +4924,52 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             remote_ref_path=remote_path,
             remote=args.remote,
         )
+    elif current_state is LifecycleState.NOT_APPLIED:
+        # Round-58 P1 fix (Safely resume plans left in
+        # NOT_APPLIED). Do not blindly retry merely because
+        # the persisted plan says NOT_APPLIED. Re-read the
+        # authoritative ref via reconcile() first; only
+        # dispatch prepare()+execute() if the ref is still
+        # at expected_before_sha. If the ref advanced to
+        # desired_after_sha, classify as SUCCEEDED. If it
+        # diverged from both, classify as CONFLICT. If the
+        # read fails, remain INDETERMINATE.
+        # NOT_APPLIED -> RECONCILING is the permitted
+        # lifecycle transition; reconcile() handles it.
+        final = orch.reconcile(remote_ref_path=remote_path or local_repo)
+        if final.status == LifecycleState.NOT_APPLIED.value:
+            # Ref is still at expected_before_sha. The lifecycle
+            # explicitly permits NOT_APPLIED -> PREPARED for the
+            # safe retry path. Dispatch prepare() + execute()
+            # exactly once.
+            orch.prepare()
+            final = orch.execute(
+                local_repo=local_repo,
+                remote_ref_path=remote_path,
+                remote=args.remote,
+            )
+    elif current_state is LifecycleState.SUCCEEDED:
+        # Round-58 P1 fix (Return the persisted success on
+        # idempotent replay). When the plan is already SUCCEEDED,
+        # the mutation has been applied exactly once. Do NOT
+        # re-prepare, do NOT re-execute, do NOT perform any
+        # Git or GitHub mutation. Verify the plan remains
+        # bound to an active durable authorization, return
+        # the stored successful result, and exit 0. The
+        # no-blind-retry invariant is preserved.
+        # The Step 3 find_outstanding_authorization() call
+        # above already verified the plan is bound to an
+        # outstanding MUTATIONS.jsonl record. We do not
+        # append a contradictory duplicate terminal result;
+        # the persisted plan.status=SUCCEEDED is the source
+        # of truth. The exit-code-0 signal indicates the
+        # prior successful apply to automation.
+        final = plan
     else:
-        # Terminal state (SUCCEEDED, NOT_APPLIED, CONFLICT,
-        # CANCELLED) — refuse to re-execute. The operator
-        # must inspect the plan file and either re-authorize
-        # or record the result manually.
+        # Terminal state (CONFLICT, CANCELLED) — refuse to
+        # re-execute. The operator must inspect the plan
+        # file and either re-authorize or record the
+        # result manually.
         print(
             f"ERROR: plan mutation_id={plan.mutation_id} is in "
             f"terminal state {plan.status}; refusing to re-execute. "

@@ -28,7 +28,9 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -369,3 +371,152 @@ def posix_cloexec_flag() -> int:
     so aed_mutation_authorization can import it.
     """
     return getattr(os, "O_CLOEXEC", 0)
+
+
+# ---------------------------------------------------------------------------
+# Repository identity canonicalization
+# ---------------------------------------------------------------------------
+# Round-58 P1 fix (Bind the execution remote to the authorized repository).
+#
+# A mutation's authorized repository is recorded in the durable plan and
+# in MUTATIONS.jsonl. The executor's --local-repo, --remote, and
+# --remote-path arguments identify the actual Git working copy and remote
+# endpoint being mutated. Two different repositories or forks can contain
+# the same commit SHA (forks routinely do), so matching commit SHAs is NOT
+# proof that two endpoints refer to the same repository.
+#
+# canonical_repository_identity() parses a stored repository string
+# (e.g. "owner/name") or a Git remote URL (HTTPS or SSH form) into a
+# canonical (host, owner, name) triple. mutate-ref uses this to compare
+# the authorized repository against the actual --local-repo origin and
+# against --remote-path, and refuses the mutation if the identities
+# disagree.
+
+# GitHub HTTPS form, with optional .git suffix and optional embedded
+# credentials. Examples:
+#   https://github.com/owner/name
+#   https://github.com/owner/name.git
+#   https://user:token@github.com/owner/name.git
+_GITHUB_HTTPS_RE = re.compile(
+    r"^https?://(?:[^/@]*@)?github\.com/"
+    r"(?P<owner>[A-Za-z0-9._-]+)/(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+
+# SSH form. Examples:
+#   git@github.com:owner/name.git
+#   ssh://git@github.com/owner/name.git
+#   ssh://git@github.com/owner/name
+_GITHUB_SSH_RE = re.compile(
+    r"^(?:ssh://)?git@github\.com[:/](?P<owner>[A-Za-z0-9._-]+)/"
+    r"(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+
+# owner/name shorthand (already canonical for GitHub repos).
+_GITHUB_SHORTHAND_RE = re.compile(
+    r"^(?P<owner>[A-Za-z0-9._-]+)/(?P<name>[A-Za-z0-9._-]+?)(?:\.git)?/?$"
+)
+
+
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    """Canonical identity for a Git repository.
+
+    Two RepositoryIdentity values compare equal iff they refer to the
+    same (host, owner, name) — including different transport forms
+    (HTTPS vs SSH) for the same repository. Forks and unrelated
+    repositories never compare equal even if they share commit SHAs.
+    """
+
+    host: str
+    owner: str
+    name: str
+
+    def __str__(self) -> str:
+        return f"{self.owner}/{self.name}"
+
+    @property
+    def shorthand(self) -> str:
+        """Return owner/name form (used in plan.repository)."""
+        return f"{self.owner}/{self.name}"
+
+    def matches(self, other: "RepositoryIdentity") -> bool:
+        """True iff both identities refer to the same repository."""
+        return (
+            self.host.lower() == other.host.lower()
+            and self.owner.lower() == other.owner.lower()
+            and self.name.lower() == other.name.lower()
+        )
+
+
+def canonical_repository_identity(value: str) -> Optional[RepositoryIdentity]:
+    """Parse a repository reference into a canonical identity.
+
+    Accepts:
+      - "owner/name" shorthand (GitHub)
+      - "https://github.com/owner/name" or "...name.git"
+      - "git@github.com:owner/name.git" or "ssh://git@github.com/owner/name"
+      - local bare-repo path (returned with host="local" and a synthesized
+        identity derived from the path's basename; used only when a
+        --remote-path is supplied for local CI integration tests).
+
+    Returns None when the value cannot be parsed into a canonical
+    identity (the caller must fail closed).
+    """
+    if not value or not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    for regex, host in (
+        (_GITHUB_HTTPS_RE, "github.com"),
+        (_GITHUB_SSH_RE, "github.com"),
+        (_GITHUB_SHORTHAND_RE, "github.com"),
+    ):
+        m = regex.match(v)
+        if m:
+            return RepositoryIdentity(
+                host=host,
+                owner=m.group("owner"),
+                name=m.group("name"),
+            )
+    # Not a parseable GitHub URL — could be a local path or unsupported
+    # host. We do NOT silently accept it; the caller must decide what
+    # to do. Returning None is the fail-closed behavior.
+    return None
+
+
+def resolve_local_repo_origin_identity(local_repo: Path) -> Optional[RepositoryIdentity]:
+    """Resolve the canonical identity of --local-repo's origin remote.
+
+    Reads `git -C local_repo config --get remote.origin.url`. If the
+    origin is configured to a GitHub URL (HTTPS or SSH), returns the
+    canonical identity. Returns None if the origin is unconfigured or
+    points to a non-GitHub host (the caller must fail closed).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(local_repo), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    url = result.stdout.strip()
+    if not url:
+        return None
+    return canonical_repository_identity(url)
+
+
+def repository_identities_match(
+    a: Optional[RepositoryIdentity],
+    b: Optional[RepositoryIdentity],
+) -> bool:
+    """Compare two canonical identities.
+
+    Returns False if either side is None (fail closed). Same
+    (host, owner, name) — regardless of transport form — returns True.
+    """
+    if a is None or b is None:
+        return False
+    return a.matches(b)

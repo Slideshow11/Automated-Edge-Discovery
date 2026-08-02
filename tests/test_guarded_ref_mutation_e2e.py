@@ -70,6 +70,19 @@ def _make_bare_with_clone(
     so the fixture is deterministic regardless of the
     runner's init.defaultBranch setting. The symbolic-ref
     HEAD assignment is kept as defense in depth.
+
+    Round-58 (P1: Bind the execution remote to the authorized
+    repository): mutate-ref's Step 3.5 now canonicalizes the
+    repository identity from the plan and from the clone's
+    remote.origin.url. The fixture sets the *origin* remote
+    to a parseable GitHub URL so the canonicalization succeeds.
+    A separate remote named `bare` points at the local bare
+    repository for actual push operations; tests invoke
+    mutate-ref with `--remote bare` to target the local bare.
+
+    The plan's repository field is `owner/name` (the existing
+    tests' convention) which canonicalizes to the same
+    (host, owner, name) triple as the GitHub-form origin URL.
     """
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
@@ -78,9 +91,20 @@ def _make_bare_with_clone(
     _git(tmp_path, "clone", str(bare), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
     _git(clone, "config", "user.name", "Test")
-    # Push an initial commit so HEAD is valid.
+    # Push an initial commit so HEAD is valid. Use the bare path
+    # (not origin) because origin will be a GitHub URL after the
+    # next step, and we don't want network access in tests.
     _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
-    _git(clone, "push", "origin", "refs/heads/main", "-q")
+    _git(clone, "push", str(bare), "refs/heads/main", "-q")
+    # Round-58: configure origin URL to a parseable GitHub URL
+    # so mutate-ref's Step 3.5 repository-identity check succeeds.
+    # The `bare` remote (added below) is the actual push target
+    # used by guarded_push inside mutate-ref.
+    _git(clone, "remote", "set-url", "origin",
+         "https://github.com/owner/name.git")
+    # Add a separate `bare` remote that points at the local bare
+    # so guarded_push can actually deliver the mutation locally.
+    _git(clone, "remote", "add", "bare", str(bare))
     return bare, clone
 
 
@@ -226,7 +250,7 @@ def test_end_to_end_update_local_via_cli(tmp_path):
     # Seed a target ref on main so we can update it.
     _seed_branch(clone, "feat/x")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/x").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/x", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/x", "-q")
     # Make a new commit for the desired_after.
     _git(clone, "checkout", "-q", "feat/x")
     _git(clone, "commit", "--allow-empty", "-m", "next", "-q")
@@ -253,6 +277,7 @@ def test_end_to_end_update_local_via_cli(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_end2end_update",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert result.returncode == 0, (
@@ -313,6 +338,7 @@ def test_end_to_end_push_remote_via_cli(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_end2end_push",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert result.returncode == 0, (
@@ -460,7 +486,7 @@ def test_end_to_end_authorize_then_mutate_then_record(tmp_path):
     # Seed a target ref with an initial commit.
     _seed_branch(clone, "feat/y")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/y").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/y", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/y", "-q")
     # Desired = new commit on feat/y.
     _git(clone, "checkout", "-q", "feat/y")
     _git(clone, "commit", "--allow-empty", "-m", "y2", "-q")
@@ -483,6 +509,7 @@ def test_end_to_end_authorize_then_mutate_then_record(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_e2e_full",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert result.returncode == 0, (
@@ -524,7 +551,7 @@ def test_authorize_mutation_emits_durable_plan(tmp_path):
     # Seed a target ref.
     _seed_branch(clone, "feat/z")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/z").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/z", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/z", "-q")
     _git(clone, "checkout", "-q", "feat/z")
     _git(clone, "commit", "--allow-empty", "-m", "z2", "-q")
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -661,6 +688,7 @@ def test_authorize_mutation_emits_durable_plan(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", plan.mutation_id,
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert mutate_result.returncode == 0, (
@@ -690,7 +718,7 @@ def test_mutate_ref_refuses_plan_without_outstanding_authorization(tmp_path):
     # Seed a target ref.
     _seed_branch(clone, "feat/a")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/a").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/a", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/a", "-q")
     _git(clone, "checkout", "-q", "feat/a")
     _git(clone, "commit", "--allow-empty", "-m", "a2", "-q")
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -721,6 +749,7 @@ def test_mutate_ref_refuses_plan_without_outstanding_authorization(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_orphan",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert result.returncode == 25, (
@@ -743,7 +772,7 @@ def test_mutate_ref_refuses_plan_owner_mismatch(tmp_path):
     # Seed target ref.
     _seed_branch(clone, "feat/b")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/b").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/b", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/b", "-q")
     _git(clone, "checkout", "-q", "feat/b")
     _git(clone, "commit", "--allow-empty", "-m", "b2", "-q")
     desired_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -785,6 +814,7 @@ def test_mutate_ref_refuses_plan_owner_mismatch(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_owner_mismatch",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert result.returncode == 25
@@ -805,7 +835,7 @@ def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
     # Seed target ref.
     _seed_branch(clone, "feat/c")
     initial_sha = _git(clone, "rev-parse", "refs/heads/feat/c").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/c", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/c", "-q")
     # Third party advances: create a commit, advance the local
     # ref, and push to the authoritative remote.
     _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
@@ -815,7 +845,7 @@ def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
     # test is simulating a third-party advance; the
     # force-with-lease CAS check is what guards real
     # mutations.
-    _git(clone, "push", "--force", "origin",
+    _git(clone, "push", "--force", str(bare),
          "refs/heads/feat/c:refs/heads/feat/c", "-q")
 
     # Seed an authorization record.
@@ -858,6 +888,7 @@ def test_mutate_ref_dispatches_intermediate_plan_to_reconcile(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_intermediate",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     # CONFLICT is a non-zero exit (Repair 2): the mutation was
@@ -898,7 +929,11 @@ def test_mutate_ref_threads_remote_through_to_guarded_push(tmp_path):
     _git(clone, "config", "user.name", "Test")
     _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
     initial = _git(clone, "rev-parse", "HEAD").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/main", "-q")
+    _git(clone, "push", str(bare_origin), "refs/heads/main", "-q")
+    # Round-58: configure origin to a parseable GitHub URL so
+    # mutate-ref's Step 3.5 repository-identity check succeeds.
+    _git(clone, "remote", "set-url", "origin",
+         "https://github.com/owner/name.git")
 
     # Add the upstream bare as a second remote.
     _git(clone, "remote", "add", "upstream", str(bare_upstream))
@@ -976,7 +1011,7 @@ def test_mutate_ref_exit_code_distinguishes_terminal_states(tmp_path):
     (workspace / "L").mkdir()
     _seed_branch(clone, "feat/s")
     initial = _git(clone, "rev-parse", "refs/heads/feat/s").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/s", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/s", "-q")
     _git(clone, "checkout", "-q", "feat/s")
     _git(clone, "commit", "--allow-empty", "-m", "s2", "-q")
     desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -990,6 +1025,7 @@ def test_mutate_ref_exit_code_distinguishes_terminal_states(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_ok",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert r.returncode == 0, f"SUCCEEDED should be exit 0, got {r.returncode}"
@@ -1007,7 +1043,7 @@ def test_mutate_ref_exit_code_distinguishes_terminal_states(tmp_path):
     _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
     tp = _git(clone, "rev-parse", "HEAD").stdout.strip()
     _git(clone, "update-ref", "refs/heads/feat/c", tp)
-    _git(clone, "push", "--force", "origin", "refs/heads/feat/c:refs/heads/feat/c", "-q")
+    _git(clone, "push", "--force", str(bare), "refs/heads/feat/c:refs/heads/feat/c", "-q")
     _git(clone, "checkout", "-q", "main")
     _seed_mutation_authorization(
         workspace2, "m_conflict", "force_push", "feat/c",
@@ -1018,6 +1054,7 @@ def test_mutate_ref_exit_code_distinguishes_terminal_states(tmp_path):
         "--workspace", str(workspace2),
         "--mutation-id", "m_conflict",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert r.returncode == 31, f"CONFLICT should be exit 31, got {r.returncode}"
@@ -1033,13 +1070,13 @@ def test_mutate_ref_dispatches_indeterminate_to_reconcile(tmp_path):
     (workspace / "L").mkdir()
     _seed_branch(clone, "feat/i")
     initial = _git(clone, "rev-parse", "refs/heads/feat/i").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/i", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/i", "-q")
     # Third party advances feat/i.
     _git(clone, "checkout", "-q", "feat/i")
     _git(clone, "commit", "--allow-empty", "-m", "tp", "-q")
     tp = _git(clone, "rev-parse", "HEAD").stdout.strip()
     _git(clone, "update-ref", "refs/heads/feat/i", tp)
-    _git(clone, "push", "--force", "origin", "refs/heads/feat/i:refs/heads/feat/i", "-q")
+    _git(clone, "push", "--force", str(bare), "refs/heads/feat/i:refs/heads/feat/i", "-q")
     _git(clone, "checkout", "-q", "main")
     _seed_mutation_authorization(
         workspace, "m_indet", "force_push", "feat/i",
@@ -1069,6 +1106,7 @@ def test_mutate_ref_dispatches_indeterminate_to_reconcile(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_indet",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     # INDETERMINATE is a non-SUCCEEDED state. The dispatcher
@@ -1097,7 +1135,7 @@ def test_mutate_ref_rejects_plan_with_mismatched_desired_after_sha(tmp_path):
     _seed_branch(clone, "feat/d")
     initial = _git(clone, "rev-parse", "refs/heads/feat/d").stdout.strip()
     initial = _git(clone, "rev-parse", "refs/heads/feat/d").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/d", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/d", "-q")
     _git(clone, "checkout", "-q", "feat/d")
     _git(clone, "commit", "--allow-empty", "-m", "d2", "-q")
     desired_authorized = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -1148,6 +1186,7 @@ def test_mutate_ref_rejects_plan_with_mismatched_desired_after_sha(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_d",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert r.returncode == 25, (
@@ -1170,7 +1209,7 @@ def test_mutate_ref_rejects_plan_from_different_workspace(tmp_path):
     (workspace / "L").mkdir()
     _seed_branch(clone, "feat/w")
     initial = _git(clone, "rev-parse", "refs/heads/feat/w").stdout.strip()
-    _git(clone, "push", "origin", "refs/heads/feat/w", "-q")
+    _git(clone, "push", str(bare), "refs/heads/feat/w", "-q")
     _git(clone, "checkout", "-q", "feat/w")
     _git(clone, "commit", "--allow-empty", "-m", "w2", "-q")
     desired = _git(clone, "rev-parse", "HEAD").stdout.strip()
@@ -1218,6 +1257,7 @@ def test_mutate_ref_rejects_plan_from_different_workspace(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_w",
         "--local-repo", str(clone),
+        "--remote", "bare",
         "--remote-path", str(bare),
     )
     assert r.returncode == 25, (
