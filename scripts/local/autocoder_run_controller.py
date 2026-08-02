@@ -1406,11 +1406,35 @@ def _init(args: argparse.Namespace) -> None:
             (Path(out_path), "CONTROLLER_STATE.json"),
         ]:
             if artifact_path.exists():
-                try:
-                    with open(artifact_path) as _af:
-                        existing = json.load(_af)
-                except (OSError, json.JSONDecodeError):
-                    existing = {}
+                # Round-85 P2 fix (V00-M continuation): parse
+                # the Markdown receipt (LAUNCH_RECEIPT.md) for
+                # the run_id when JSON parsing fails. The
+                # previous code always tried to parse the file
+                # as JSON, which fails for .md files and
+                # silently derives no owner ID — allowing
+                # init to overwrite that audit artifact
+                # without --replace-stale-state. Extract the
+                # run_id from the Markdown run-ID line.
+                existing = {}
+                if kind == "LAUNCH_RECEIPT.md":
+                    try:
+                        with open(artifact_path) as _af:
+                            md_content = _af.read()
+                        import re
+                        md_match = re.search(
+                            r"\*\*Run ID:\*\*\s+`?([A-Za-z0-9_.-]+)",
+                            md_content,
+                        )
+                        if md_match:
+                            existing = {"run_id": md_match.group(1)}
+                    except OSError:
+                        existing = {}
+                else:
+                    try:
+                        with open(artifact_path) as _af:
+                            existing = json.load(_af)
+                    except (OSError, json.JSONDecodeError):
+                        existing = {}
                 # Round-42 P2 fix (Recognize legacy state
                 # ownership before overwriting): legacy
                 # state files (pre-Round-9 controller
@@ -4833,7 +4857,30 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
                 Path(args.workspace).resolve() / "CONTROLLER_STATE.json"
             )
         else:
-            recovered_state_path = str(Path(args.state).resolve())
+            # Round-83 P2 fix (V00-L continuation): if neither
+            # --recovered-state-path nor --workspace is
+            # supplied, refuse to install the new lease with
+            # the predecessor's state path. The predecessor's
+            # state contains the old run ID; assess_liveness()
+            # would immediately report state_run_id_mismatch
+            # (the new lease is bound to a different
+            # owner_run_id), so the lease is functionally
+            # unusable. Refuse and require a replacement
+            # path/workspace.
+            print(
+                "ERROR: --recovered-state-path or --workspace is "
+                "required when using the legacy --state "
+                "<predecessor-state> form. The predecessor's "
+                "state contains the old run_id; installing the "
+                "recovered lease with the predecessor's state "
+                "path leaves an immediately-stale lease. Pass "
+                "either --recovered-state-path <new-state> or "
+                "--workspace <new-workspace> (with "
+                "<workspace>/CONTROLLER_STATE.json as the "
+                "replacement).",
+                file=sys.stderr,
+            )
+            sys.exit(6)
         # The legacy path allows the state to provide the scope,
         # but the recovered run_id MUST come from CLI so the
         # replacement is bound to its own identity.
