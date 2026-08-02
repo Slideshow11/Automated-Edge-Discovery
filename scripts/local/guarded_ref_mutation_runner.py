@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -96,6 +97,57 @@ def _read_remote_ref_via_query(
         # CalledProcessError: git returned non-zero for some
         # other reason (not a known "ref not found" case).
         return _ReadResult(sha=None, indeterminate=True)
+
+
+def _read_remote_ref_via_ls_remote(
+    remote_url: str, ref: str
+) -> "_ReadResult":
+    """Read the ref's current SHA from a remote URL via
+    `git ls-remote <remote_url> <ref>`.
+
+    Round-60 P1 fix (Reconcile configured remotes without a
+    local bare path). Production mutations against real
+    GitHub have no local bare repository mirror; the
+    controller must still be able to verify the remote ref's
+    current value. Use git ls-remote to query the ref
+    directly from the remote.
+
+    Returns a _ReadResult with the same tristate semantics as
+    _read_remote_ref_via_query: present, absent, or
+    indeterminate on read failure.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", remote_url, ref],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return _ReadResult(sha=None, indeterminate=True)
+    for line in proc.stdout.splitlines():
+        m = re.match(r"^([0-9a-f]{40})\s+\S*$", line)
+        if m:
+            return _ReadResult(sha=m.group(1), indeterminate=False)
+    return _ReadResult(sha=None, indeterminate=False)
+
+
+def read_remote_ref_unified(
+    remote_ref_path: Optional[Path],
+    *,
+    remote_url: Optional[str] = None,
+    ref: str,
+) -> "_ReadResult":
+    """Unified reader: use local path if supplied, else
+    fall back to ls-remote over remote_url.
+
+    Round-60 P1 fix: callers should use this entry point so
+    that production mutations without a local bare mirror
+    still get authoritative reconciliation via ls-remote.
+    """
+    if remote_ref_path is not None:
+        return _read_remote_ref_via_query(remote_ref_path, ref)
+    if remote_url is not None:
+        return _read_remote_ref_via_ls_remote(remote_url, ref)
+    return _ReadResult(sha=None, indeterminate=True)
 
 
 class _ReadResult:
@@ -228,10 +280,35 @@ class GuardedMutationOrchestrator:
         _persist_plan(self.plan, self.workspace)
 
         # Read the actual ref for reconciliation.
-        remote = remote_ref_path or local_repo
-        read_result = _read_remote_ref_via_query(
-            remote, self.plan.target_ref
-        )
+        # Round-60 P1 fix: prefer the caller-supplied local
+        # bare path; fall back to ls-remote over the clone's
+        # configured remote URL when the operation is
+        # PUSH_REMOTE and no local bare is available; fall
+        # back to the local repo for non-PUSH operations.
+        if remote_ref_path is not None:
+            read_result = _read_remote_ref_via_query(
+                remote_ref_path, self.plan.target_ref
+            )
+        elif self.plan.operation == grm.Operation.PUSH_REMOTE.value:
+            clone_remote_url = None
+            try:
+                cfg = subprocess.run(
+                    ["git", "-C", str(local_repo),
+                     "config", "--get",
+                     f"remote.{remote}.url"],
+                    capture_output=True, text=True, check=True,
+                )
+                clone_remote_url = cfg.stdout.strip() or None
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                clone_remote_url = None
+            read_result = _read_remote_ref_via_ls_remote(
+                clone_remote_url or remote,
+                self.plan.target_ref,
+            )
+        else:
+            read_result = _read_remote_ref_via_query(
+                local_repo, self.plan.target_ref
+            )
         # If the read failed, force INDETERMINATE. Never
         # confuse a read failure with a missing ref — for
         # delete this is the difference between SUCCEEDED and
@@ -352,7 +429,8 @@ class GuardedMutationOrchestrator:
     def reconcile(
         self,
         *,
-        remote_ref_path: Path,
+        remote_ref_path: Optional[Path] = None,
+        remote_url: Optional[str] = None,
     ) -> grm.GuardedMutationPlan:
         """Re-read the actual ref and update the plan with the
         new outcome.
@@ -362,6 +440,12 @@ class GuardedMutationOrchestrator:
         transition to RECONCILING (the actual is still at
         expected_before so the retry is safe). INDETERMINATE
         can transition to RECONCILING (reconcile retry only).
+
+        Round-60 P1 fix (Reconcile configured remotes without a
+        local bare path): the caller may supply either
+        `remote_ref_path` (local bare) OR `remote_url` (a Git
+        URL resolved via `git ls-remote`). At least one must
+        be supplied; both is also acceptable.
         """
         current = grm.LifecycleState(self.plan.status)
         if current not in TERMINAL_STATES_FOR_RECONCILE:
@@ -372,9 +456,13 @@ class GuardedMutationOrchestrator:
         self.plan.status = grm.LifecycleState.RECONCILING.value
         _persist_plan(self.plan, self.workspace)
 
-        # Re-read the actual ref.
-        read_result = _read_remote_ref_via_query(
-            remote_ref_path, self.plan.target_ref
+        # Re-read the actual ref via the unified reader
+        # (Round-60 P1 fix): prefer the local path, fall
+        # back to ls-remote over remote_url.
+        read_result = read_remote_ref_unified(
+            remote_ref_path,
+            remote_url=remote_url,
+            ref=self.plan.target_ref,
         )
         if read_result.indeterminate:
             outcome = grm.LifecycleState.INDETERMINATE

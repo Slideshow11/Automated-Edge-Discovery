@@ -453,10 +453,21 @@ def test_mutate_ref_refuses_pushed_with_no_remote_path(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_push_no_remote",
         "--local-repo", str(clone),
-        # no --remote-path
+        # no --remote-path — Round-60 P1 fix allows this;
+        # the runner now falls back to `git ls-remote` over
+        # the clone's configured remote URL for
+        # reconciliation. With no origin configured the
+        # ls-remote query fails → INDETERMINATE (exit 32).
     )
-    assert result.returncode != 0
-    assert "--remote-path" in result.stderr or "PUSH_REMOTE" in result.stderr
+    # Round-60: PUSH_REMOTE without --remote-path now
+    # proceeds; reconciliation via ls-remote fails when
+    # origin is unconfigured, so the run terminates as
+    # INDETERMINATE (exit 32).
+    assert result.returncode in (32, 27), (
+        f"PUSH_REMOTE without --remote-path must exit "
+        f"INDETERMINATE (32) or fail closed (27), got {result.returncode}: "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

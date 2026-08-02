@@ -508,6 +508,83 @@ def resolve_local_repo_origin_identity(local_repo: Path) -> Optional[RepositoryI
     return canonical_repository_identity(url)
 
 
+def resolve_local_repo_remote_identity(
+    local_repo: Path, remote_name: str
+) -> Optional[RepositoryIdentity]:
+    """Resolve the canonical identity of --local-repo's remote_name.
+
+    Round-60 P1 fix (Validate the selected remote instead of
+    origin). Reads `git -C local_repo config --get
+    remote.<remote_name>.url` to verify the actual remote that
+    guarded_push will mutate. Returns None if the remote is
+    unconfigured or points to a non-GitHub host.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(local_repo),
+             "config", "--get", f"remote.{remote_name}.url"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    url = result.stdout.strip()
+    if not url:
+        return None
+    return canonical_repository_identity(url)
+
+
+def resolve_remote_ref_via_query(
+    remote_url: str, ref: str
+) -> "RemoteRefQueryResult":
+    """Query a remote ref via `git ls-remote` instead of requiring
+    a local bare repository path.
+
+    Round-60 P1 fix (Reconcile configured remotes without a local
+    bare path). When --remote-path is not supplied (production
+    mutations against real GitHub), the controller must still be
+    able to verify the authoritative remote ref. Use `git ls-remote`
+    to query the ref's current SHA directly from the remote.
+
+    Returns a RemoteRefQueryResult with three states:
+      - sha=None, indeterminate=False: the ref does not exist.
+      - sha=<sha>, indeterminate=False: ref's current value read.
+      - sha=None, indeterminate=True: read failed (network error,
+        auth failure, timeout).
+    """
+    import re as _re
+    result = RemoteRefQueryResult(sha=None, indeterminate=True)
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", remote_url, ref],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return result
+    # ls-remote output: "<sha>\t<refname>"
+    for line in proc.stdout.splitlines():
+        m = _re.match(r"^([0-9a-f]{40})\t", line)
+        if m:
+            return RemoteRefQueryResult(sha=m.group(1), indeterminate=False)
+    # No matching line: ref does not exist.
+    return RemoteRefQueryResult(sha=None, indeterminate=False)
+
+
+class RemoteRefQueryResult:
+    """Tristate result of querying a remote ref via `git ls-remote`.
+
+    is_indeterminate=True means the read failed. The caller
+    MUST classify this as INDETERMINATE.
+    """
+
+    __slots__ = ("sha", "indeterminate")
+
+    def __init__(self, *, sha: Optional[str], indeterminate: bool):
+        self.sha = sha
+        self.indeterminate = indeterminate
+
+
 def repository_identities_match(
     a: Optional[RepositoryIdentity],
     b: Optional[RepositoryIdentity],

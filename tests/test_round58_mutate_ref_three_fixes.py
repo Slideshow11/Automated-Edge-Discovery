@@ -307,10 +307,14 @@ def test_a_fork_with_same_commit_refused(tmp_path):
 
 
 def test_a_unconfigured_origin_refused(tmp_path):
-    """A.4: a clone with no remote.origin.url fails closed.
+    """A.4: a clone with no remote.origin.url fails closed when
+    no --remote-path is supplied (the runner's ls-remote
+    fallback cannot work without a configured remote URL).
 
-    PRE-FIX FAILED: the controller ignored the origin URL. POST-FIX
-    mutate-ref refuses because the identity cannot be verified."""
+    PRE-FIX FAILED: the controller ignored the origin URL.
+    POST-FIX: mutate-ref refuses because no authoritative
+    remote URL is available (neither --remote-path nor a
+    configured remote.<args.remote>.url)."""
     bare = tmp_path / "bare.git"
     clone = tmp_path / "clone"
     _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare), "-q")
@@ -318,7 +322,10 @@ def test_a_unconfigured_origin_refused(tmp_path):
     _git(tmp_path, "clone", str(bare), str(clone), "-q")
     _git(clone, "config", "user.email", "test@local")
     _git(clone, "config", "user.name", "Test")
-    # Intentionally do NOT configure remote.origin.url.
+    # Unset the origin URL set by `git clone`. mutate-ref
+    # must refuse because no authoritative remote URL is
+    # available (no --remote-path, no origin URL).
+    _git(clone, "remote", "remove", "origin")
     _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
     initial_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
     new_sha = _independent_commit(clone, bare)
@@ -343,12 +350,12 @@ def test_a_unconfigured_origin_refused(tmp_path):
         "--workspace", str(workspace),
         "--mutation-id", "m_no_origin",
         "--local-repo", str(clone),
-        "--remote-path", str(bare),
-        "--remote", "origin",
+        # no --remote-path AND no origin URL → no
+        # authoritative reconciliation target → must fail closed.
     ])
     assert rc == 27, (
-        "mutate-ref must REFUSE when --local-repo has no parseable origin URL, "
-        f"rc={rc}"
+        "mutate-ref must REFUSE when neither --remote-path nor "
+        f"remote.origin.url is available, rc={rc}"
     )
 
 

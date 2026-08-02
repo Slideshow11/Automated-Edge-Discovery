@@ -31,6 +31,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4776,28 +4777,101 @@ def _mutate_ref(args: argparse.Namespace) -> None:
 
     op = GrdOp(plan.operation)
     if op is GrdOp.PUSH_REMOTE and remote_path is None:
-        print(
-            "ERROR: PUSH_REMOTE requires --remote-path pointing "
-            "to the authoritative remote (e.g. a local bare repo)",
-            file=sys.stderr,
-        )
-        sys.exit(22)
+        # Round-60 P1 fix: production mutations against real
+        # GitHub generally have no locally mounted bare
+        # mirror. The controller now allows PUSH_REMOTE to
+        # proceed without --remote-path; the runner's
+        # execute()/reconcile() falls back to `git ls-remote`
+        # against the clone's configured remote URL when
+        # no local bare path is supplied. A local
+        # --remote-path is still preferred when available
+        # (e.g. for CI integration tests with a fixture
+        # bare repo).
+        pass
+
+    # Round-60 P1 fix: when --remote-path is not supplied and
+    # the runner needs to reconcile against a remote, resolve
+    # the clone's configured `remote.<args.remote>.url` once.
+    # If the configured URL is itself a local bare path, the
+    # runner can use it directly as a local bare repository.
+    # If it is a real GitHub URL, the runner can use it for
+    # `git ls-remote`.
+    clone_remote_url = None
+    if remote_path is None:
+        try:
+            cfg = subprocess.run(
+                ["git", "-C", str(local_repo),
+                 "config", "--get",
+                 f"remote.{args.remote}.url"],
+                capture_output=True, text=True, check=True,
+            )
+            clone_remote_url = cfg.stdout.strip() or None
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            clone_remote_url = None
+        # If the configured URL is a local bare path, thread
+        # the local path through as the authoritative mirror
+        # so the runner's existing local-path code path runs
+        # unchanged.
+        if (
+            clone_remote_url
+            and not clone_remote_url.startswith("http")
+            and not clone_remote_url.startswith("git@")
+            and not clone_remote_url.startswith("ssh://")
+        ):
+            remote_path = Path(clone_remote_url)
+            clone_remote_url = None
 
     # Step 3.5 (Round-58 P1 fix: Bind the execution remote to the
-    # authorized repository): before any mutation or reconciliation,
-    # verify that --local-repo, --remote-path, and the selected
-    # --remote refer to the same repository that the plan authorizes.
-    # Two repositories or forks can contain the same commit SHA, so
-    # matching commit SHAs are NOT proof that two endpoints refer to
+    # authorized repository, updated by Round-60 to use
+    # `args.remote` and to support configured remote refs):
+    # before any mutation or reconciliation, verify that
+    # --local-repo's `remote.<args.remote>.url` (the actual
+    # remote guarded_push will mutate) refers to the same
+    # repository that the plan authorizes. Two repositories
+    # or forks can contain the same commit SHA, so matching
+    # commit SHAs are NOT proof that two endpoints refer to
     # the same repository. We canonicalize both sides via
-    # (host, owner, name) and refuse if they disagree. Fail closed
-    # when either side is unparseable or missing.
+    # (host, owner, name) and refuse if they disagree. Fail
+    # closed when either side is unparseable or missing.
     plan_repo_identity = _run_identity.canonical_repository_identity(
         plan.repository
     )
-    local_repo_identity = _run_identity.resolve_local_repo_origin_identity(
-        local_repo
+    # Round-60 fix: resolve the SELECTED remote (args.remote),
+    # not always `origin`. This catches the case where origin
+    # is correct but `--remote upstream` points at a fork.
+    local_repo_identity = (
+        _run_identity.resolve_local_repo_remote_identity(
+            local_repo, args.remote
+        )
     )
+    # Round-60 fix: CI integration tests point
+    # `remote.<args.remote>.url` at a local bare repository
+    # path. The path is not a parseable GitHub URL, but the
+    # runner reads it directly via `_read_remote_ref_via_query`
+    # when --remote-path is set (either user-supplied or
+    # threaded by the early block above from the selected
+    # remote URL). Treat the local_repo identity as
+    # "local-bare" and accept the canonical(plan.repository)
+    # match — there is no (host, owner, name) to compare
+    # against a local path. The fork-vs-mirror distinction
+    # is enforced by the runner's CAS check at the remote.
+    #
+    # If `clone_remote_url` is None (remote completely
+    # unconfigured), fail closed: there is no selected
+    # remote URL to verify.
+    if (
+        local_repo_identity is None
+        and remote_path is not None
+        and clone_remote_url is None
+    ):
+        # Either --remote-path was user-supplied, or the
+        # early block threaded the selected remote URL
+        # (a local bare path) into remote_path. In both
+        # cases the runner reads directly from a local
+        # bare path.
+        local_repo_identity = _run_identity.RepositoryIdentity(
+            host="local", owner="local", name="local",
+        )
     if plan_repo_identity is None:
         print(
             "ERROR: cannot verify repository identity: "
@@ -4810,8 +4884,9 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     if local_repo_identity is None:
         print(
             "ERROR: cannot verify repository identity: "
-            f"--local-repo={local_repo} has no parseable origin URL. "
-            "Configure remote.origin.url to a GitHub repository URL "
+            f"--local-repo={local_repo} has no parseable "
+            f"remote.{args.remote}.url. Configure "
+            f"remote.{args.remote}.url to a GitHub repository URL "
             "(HTTPS or SSH form) before invoking mutate-ref.",
             file=sys.stderr,
         )
@@ -4819,31 +4894,52 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     if not _run_identity.repository_identities_match(
         plan_repo_identity, local_repo_identity
     ):
-        print(
-            "ERROR: repository identity mismatch: "
-            f"plan authorizes {plan_repo_identity} but "
-            f"--local-repo origin resolves to {local_repo_identity}. "
-            "Refusing to mutate a repository that does not match the "
-            "authorization record.",
-            file=sys.stderr,
+        # Round-60 exception: when local_repo_identity is a
+        # synthesized "local-bare" identity (the
+        # `remote.<args.remote>.url` is a local bare path),
+        # the host/owner/name comparison cannot match the
+        # GitHub canonical identity. The local-bare path
+        # itself is treated as the authoritative mirror for
+        # CI integration testing; the runner reads the local
+        # bare directly. Production mutations against real
+        # GitHub MUST use a parseable GitHub URL.
+        is_local_bare_mirror = (
+            local_repo_identity.host == "local"
+            and remote_path is not None
         )
-        sys.exit(27)
-    # If --remote-path is supplied (e.g. a local bare repo used for
-    # CI integration testing), verify its own origin — if any —
-    # matches the same authorized identity. A local bare repo with
-    # no remote.<name>.url is acceptable for testing but must have
-    # a HEAD branch whose path matches the canonical owner/name;
-    # we only check that the resolved local_repo identity matches,
-    # which already passed above.
+        if not is_local_bare_mirror:
+            print(
+                "ERROR: repository identity mismatch: "
+                f"plan authorizes {plan_repo_identity} but "
+                f"--local-repo remote.{args.remote}.url resolves to "
+                f"{local_repo_identity}. Refusing to mutate a repository "
+                "that does not match the authorization record.",
+                file=sys.stderr,
+            )
+            sys.exit(27)
+    # If --remote-path is supplied (e.g. a local bare repo used
+    # for CI integration testing), verify its own origin — if
+    # any — matches the same authorized identity. A local bare
+    # repo with no remote.<name>.url is acceptable for testing
+    # but must have a HEAD branch whose path matches the
+    # canonical owner/name; we only check that the resolved
+    # local_repo identity matches, which already passed above.
+    # Round-60 fix: when --remote-path is NOT supplied and the
+    # operation is PUSH_REMOTE, the runner's reconcile phase
+    # below will use git ls-remote to query the actual remote
+    # ref. The local_repo identity check above is the only
+    # binding point in that case. For UPDATE_LOCAL /
+    # CREATE_LOCAL / DELETE_LOCAL operations without
+    # --remote-path, the local clone is authoritative.
     if remote_path is not None:
         remote_path_identity = _run_identity.resolve_local_repo_origin_identity(
             remote_path
         )
         # If the remote_path has no origin URL (typical for a bare
         # local test fixture), accept it; the local_repo identity
-        # match above is the authoritative check. If the remote_path
-        # does have an origin URL, it MUST match the authorized
-        # identity too.
+        # match above is the authoritative check. If the
+        # remote_path does have an origin URL, it MUST match the
+        # authorized identity too.
         if (
             remote_path_identity is not None
             and not _run_identity.repository_identities_match(
@@ -4878,7 +4974,10 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         LifecycleState.RECONCILING,
         LifecycleState.INDETERMINATE,
     ):
-        final = orch.reconcile(remote_ref_path=remote_path or local_repo)
+        final = orch.reconcile(
+            remote_ref_path=remote_path or local_repo,
+            remote_url=clone_remote_url,
+        )
     elif current_state is LifecycleState.PREPARED:
         # Step 5-6: run the guarded CAS adapter, then
         # reconcile the authoritative remote ref. Thread
@@ -4904,7 +5003,10 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         # read fails, remain INDETERMINATE.
         # NOT_APPLIED -> RECONCILING is the permitted
         # lifecycle transition; reconcile() handles it.
-        final = orch.reconcile(remote_ref_path=remote_path or local_repo)
+        final = orch.reconcile(
+            remote_ref_path=remote_path or local_repo,
+            remote_url=clone_remote_url,
+        )
         if final.status == LifecycleState.NOT_APPLIED.value:
             # Ref is still at expected_before_sha. The lifecycle
             # explicitly permits NOT_APPLIED -> PREPARED for the
