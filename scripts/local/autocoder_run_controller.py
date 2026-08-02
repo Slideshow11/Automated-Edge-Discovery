@@ -4628,11 +4628,20 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             )
             _validate_plan(plan)
             tmp = plan_path.with_suffix(plan_path.suffix + ".tmp")
-            tmp.write_text(plan.to_json())
-            os.fsync(tmp.open("rb").fileno()) if False else None
-            # Robust fsync: open in binary, write, flush, fsync.
-            with open(tmp, "rb+") as f:
-                f.write(plan.to_json().encode("utf-8"))
+            # Round-80 P2 fix (V00-P continuation): use the
+            # restrictive writer for the INITIAL plan
+            # publication, not just the rewrite. The previous
+            # Path.write_text created the tmp file with the
+            # process umask (typically 0o644 on POSIX with
+            # umask 0o022), which exposed the plan's
+            # sensitive fields even before the subsequent
+            # _persist_plan rewrite. The restrictive writer
+            # opens the file with mode 0o600 directly.
+            from scripts.local.aed_run_identity import (
+                safe_restrictive_open,
+            )
+            with safe_restrictive_open(tmp, "w") as f:
+                f.write(plan.to_json())
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, plan_path)
@@ -5000,11 +5009,48 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # Step 1: load the durable plan by mutation_id.
     plan_path = guarded_ref_mutation_plan_path(workspace, args.mutation_id)
     if not plan_path.exists():
-        print(
-            f"ERROR: no durable plan for mutation_id={args.mutation_id} "
-            f"at {plan_path}",
-            file=sys.stderr,
+        # Round-81 P1 fix (V00-F continuation): recover from
+        # a partial authorize-mutation transaction. If the
+        # journal record exists but the plan was never
+        # written (e.g. process killed between the journal
+        # fsync and the plan publish), the plan is missing.
+        # Rather than leaving the controller stranded
+        # (finalize-run blocked, mutate-ref refused, manual
+        # operator intervention required), the controller can
+        # detect the partial state and offer recovery:
+        # suggest record-mutation-result --status failure
+        # to clean up the outstanding journal record. This
+        # is fail-safe: it does NOT mutate the plan (it
+        # doesn't exist) and it does NOT delete the journal
+        # without operator confirmation.
+        outstanding_records = _mutation_auth.outstanding_mutations(
+            workspace
         )
+        matching = [
+            r for r in outstanding_records
+            if r.get("mutation_id") == args.mutation_id
+        ]
+        if matching:
+            print(
+                f"ERROR: no durable plan for mutation_id="
+                f"{args.mutation_id} at {plan_path}, but a "
+                "matching outstanding journal record exists. "
+                "This is a partial authorize-mutation "
+                "transaction (journal appended, plan "
+                "publication interrupted). To recover, run:\n"
+                f"  record-mutation-result "
+                f"--workspace {args.workspace} "
+                f"--mutation-id {args.mutation_id} "
+                "--status failure --evidence 'partial "
+                "authorize-mutation transaction; cleaning up'",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: no durable plan for mutation_id={args.mutation_id} "
+                f"at {plan_path}",
+                file=sys.stderr,
+            )
         sys.exit(20)
     plan = GuardedMutationPlan.from_json(plan_path.read_text())
 
@@ -5142,6 +5188,19 @@ def _mutate_ref(args: argparse.Namespace) -> None:
         clone_remote_url = cfg.stdout.strip() or None
     except (subprocess.CalledProcessError, FileNotFoundError):
         clone_remote_url = None
+    # Round-82 P1 fix (V00-J continuation): when
+    # `remote.<name>.url` is a RELATIVE local path (e.g.
+    # `../remote.git`), Git interprets it relative to the
+    # local clone's working directory. The controller
+    # reads it raw (via git config) and then re-interprets
+    # it relative to the controller's CWD, not the clone's.
+    # Resolve relative paths here so subsequent
+    # reconciliation uses the same path Git does.
+    if clone_remote_url and not clone_remote_url.startswith("http"):
+        if not clone_remote_url.startswith("git@") and not clone_remote_url.startswith("ssh://") and not clone_remote_url.startswith("file://"):
+            p = Path(clone_remote_url)
+            if not p.is_absolute():
+                clone_remote_url = str((local_repo / p).resolve())
     # Round-63 P2 fix (Keep file URLs on the URL
     # reconciliation path): `file://...` URLs match none
     # of the standard prefixes and would be incorrectly
