@@ -4119,352 +4119,372 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     lock_base_for_check = None
     if rid.get("lock_dir"):
         lock_base_for_check = Path(rid["lock_dir"])
-    if not _supervisor_lock.is_lease_held_by_run(
-        scope=scope, owner_run_id=run_id, base_dir=lock_base_for_check
-    ):
+    # Round-72 P1 fix (Hold the scope sentinel through
+    # authorization): use check_lease_held_keeping_sentinel
+    # instead of is_lease_held_by_run so the supervisor
+    # lease sentinel is held through the journal append
+    # (a concurrent recover_stale cannot transfer the
+    # lease between validation and append).
+    lease_held, lease_sentinel_fd, lease_sentinel_path = (
+        _supervisor_lock.check_lease_held_keeping_sentinel(
+            scope=scope, owner_run_id=run_id,
+            base_dir=lock_base_for_check,
+        )
+    )
+    if not lease_held:
         print(
             f"ERROR: cannot authorize mutation: no live supervisor "
             f"lock held by run_id={run_id} for scope={scope}",
             file=sys.stderr,
         )
         sys.exit(11)
-    # Round-120 P1 fix (round 4): reject mutation targets outside
-    # the locked scope. If the state scope is repo+A but the
-    # caller supplies --mutation-target B, we would authorize a
-    # mutation against B while another controller legitimately
-    # holds B's lock.
-    #
-    # Round-20 P2 fix: when the run was initialized WITHOUT a
-    # mutation target (e.g. a PR-scoped run), `state_mutation_target`
-    # is None. The previous check accepted any caller-supplied
-    # --mutation-target in that case because the guard
-    # `state_mutation_target` short-circuited the comparison.
-    # The caller could then authorize a mutation against an
-    # arbitrary target while the held lease protects a different
-    # PR/repository-run lock path, letting another controller
-    # holding the target-specific lock mutate the same target
-    # concurrently. Treat a supplied target as a mismatch
-    # whenever it is not exactly the target recorded in the
-    # state scope (including the None case where the scope has
-    # no target).
-    state_mutation_target = _state_mutation_target(state)
-    # Round-52 P1 fix (Allow PR-scoped pushes to obtain the
-    # target lease): for a PR-scoped run authorizing an
-    # executor-pushed mutation (force_push, push,
-    # branch_delete, branch_create_force), the operator
-    # supplies --mutation-target to identify the head
-    # branch. The Round-20 check below would reject the
-    # target because state_mutation_target is None (PR
-    # runs reject combining PR + target scopes at init
-    # time). The fix: when the mutation is executor-
-    # pushed AND args.mutation_target is supplied AND
-    # state_mutation_target is None, accept the target
-    # and treat the scope as if it were PR + target for
-    # this authorization. The cross-scope conflict check
-    # then picks up the additional target-scoped lock and
-    # two controllers cannot simultaneously authorize
-    # ref-changing mutations on the same head branch.
-    EXECUTOR_PUSHED_MUTATION_TYPES = {
-        "force_push",
-        "push",
-        "branch_delete",
-        "branch_create_force",
-    }
-    if (
-        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
-        and not state_mutation_target
-        and not args.mutation_target
-    ):
-        print(
-            "ERROR: cannot authorize mutation: "
-            f"{args.mutation_type} on a PR-scoped run requires "
-            "--mutation-target. The cross-scope lease conflict "
-            "check uses --mutation-target to identify the head "
-            "branch; without it, two controllers can mutate the "
-            "same ref concurrently.",
-            file=sys.stderr,
-        )
-        sys.exit(14)
-    # Allow the supplied --mutation-target to upgrade a
-    # PR-scoped run to a PR+target scope for this
-    # authorization. The previous Round-20 strict check
-    # would reject this; the Round-52 fix removes the
-    # restriction for executor-pushed mutations.
-    if (
-        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
-        and not state_mutation_target
-        and args.mutation_target
-    ):
-        # Override the scope mismatch: state the target
-        # matches the supplied one (the operator is
-        # upgrading the scope).
-        state_mutation_target = args.mutation_target
-    if args.mutation_target and args.mutation_target != state_mutation_target:
-        print(
-            f"ERROR: --mutation-target={args.mutation_target} does not "
-            f"match state scope mutation_target={state_mutation_target}",
-            file=sys.stderr,
-        )
-        sys.exit(12)
-    # Round-51 P1 fix (Require a target-scoped lease for
-    # ref-changing mutations): when a PR-scoped run
-    # authorizes force_push, push, or branch_delete with
-    # --mutation-target omitted, the previous condition
-    # passed and the authorization records no branch
-    # target. _check_cross_scope_conflict only conflicts
-    # repository-wide leases with narrower leases, so a
-    # second controller can hold a target-scoped lease for
-    # the same PR's head branch at the same time. Both
-    # leases are acquired and the PR-scoped force-push
-    # authorization succeeds, allowing two controllers to
-    # mutate the same ref concurrently. The fix: when
-    # authorizing an executor-pushed mutation
-    # (force_push, push, branch_delete, branch_create_force)
-    # on a PR-scoped run (no --mutation-target in state),
-    # REQUIRE --mutation-target on the CLI so the
-    # authorization records a target-scoped lock path.
-    # The target-scoped lease is then properly acquired
-    # and conflicts with other target-scoped leases via
-    # the existing cross-scope check. Note: squash_merge
-    # is NOT in this list — it is the controller's merge
-    # action, not an executor push, and the PR's head is
-    # already implicit in the PR's identity.
-    EXECUTOR_PUSHED_MUTATION_TYPES = {
-        "force_push",
-        "push",
-        "branch_delete",
-        "branch_create_force",
-    }
-    if (
-        args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
-        and not state_mutation_target
-        and not args.mutation_target
-    ):
-        print(
-            "ERROR: cannot authorize mutation: "
-            f"{args.mutation_type} on a PR-scoped run requires "
-            "--mutation-target. The cross-scope lease conflict "
-            "check uses --mutation-target to identify the head "
-            "branch; without it, two controllers can mutate the "
-            "same ref concurrently.",
-            file=sys.stderr,
-        )
-        sys.exit(14)
-    # Round-120 P1 fix (round 6): canonicalize the repository
-    # used in the authorization record. When the state has no
-    # repository, two lexically different --workspace paths
-    # (e.g. /tmp/ws vs /tmp/../tmp/ws) would produce different
-    # duplicate keys, allowing two calls to authorize the same
-    # mutation. Use the state.workspace value, which is
-    # canonicalized at init time.
-    state_workspace_for_repo = state.get("workspace")
-    if rid.get("repository"):
-        repository = rid["repository"]
-    elif state_workspace_for_repo:
-        # Canonical path → the state workspace is the implicit
-        # "repository" scope. This matches the existing fallback
-        # below, but the value is now the canonical absolute path
-        # recorded at init.
-        repository = str(Path(state_workspace_for_repo).resolve())
-    else:
-        repository = args.workspace
-    # Round-21 P1 fix (Bind mutation authorization to the pending
-    # controller action): require args.pending_action to exactly
-    # match state.next_action.action, AND require the mutation
-    # type to be compatible with the recorded merge_policy. The
-    # previous code accepted any --pending-action value (even
-    # `merge` when the state is on `run_task` or `request_human`)
-    # and recorded it as the authorization's pending_action. An
-    # executor consuming the record could then perform a merge
-    # the controller state machine never selected — in particular
-    # squash_merge would succeed for the default
-    # `stop_before_merge` policy. Compare action + policy before
-    # authorizing.
-    state_pending_action = str(state.get("next_action", {}).get("action", ""))
-    if args.pending_action != state_pending_action:
-        print(
-            "ERROR: cannot authorize mutation: --pending-action "
-            f"{args.pending_action!r} does not match the active "
-            f"state's next action {state_pending_action!r}",
-            file=sys.stderr,
-        )
-        sys.exit(14)
-    merge_policy = str(state.get("merge_policy", "stop_before_merge"))
-    if args.mutation_type == "squash_merge":
-        # Round-19 P1 fix: require a full 40-char lowercase hex
-        # SHA (already checked above).
-        # Round-21 P1 fix: require merge_policy=allow_merge.
-        if merge_policy != "allow_merge":
-            print(
-                "ERROR: cannot authorize mutation: squash_merge "
-                f"requires merge_policy=allow_merge, but the active "
-                f"state's merge_policy={merge_policy!r}",
-                file=sys.stderr,
-            )
-            sys.exit(14)
-        # Round-22 P1 fix: require the active state's
-        # overall_status to be RUN_READY_FOR_SUMMARY. The
-        # earlier checks verified only that args.pending_action
-        # matches the action and that merge_policy is
-        # allow_merge, but neither guarantees the controller
-        # has actually reached the merge-ready phase. If the
-        # status is RUN_ACTIVE (still running tasks),
-        # RUN_BLOCKED (waiting for human), or any non-terminal
-        # state that isn't ready-for-summary, an executor
-        # receiving squash_merge would perform a merge the
-        # controller never selected. RUN_READY_FOR_SUMMARY
-        # means all non-skipped tasks are promoted or ready,
-        # which is the natural precondition for a merge.
-        overall_status = str(state.get("overall_status", ""))
-        if overall_status != "RUN_READY_FOR_SUMMARY":
-            print(
-                "ERROR: cannot authorize mutation: squash_merge "
-                f"requires the active state to be "
-                f"RUN_READY_FOR_SUMMARY, but overall_status="
-                f"{overall_status!r}",
-                file=sys.stderr,
-            )
-            sys.exit(14)
-    req = _mutation_auth.AuthorizationRequest(
-        run_id=state.get("run_id", "unknown"),
-        repository=repository,
-        target_pr_number=_state_target_pr_number(state),
-        mutation_target=args.mutation_target or _state_mutation_target(state),
-        mutation_type=args.mutation_type,
-        expected_main_sha=args.expected_main_sha,
-        expected_target_sha=args.expected_target_sha,
-        pending_action=args.pending_action,
-    )
-    outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
-    if not outcome.ok:
-        print(
-            f"ERROR: mutation authorization rejected: {outcome.reason}; "
-            f"existing_mutation_id={outcome.record.get('mutation_id') if outcome.record else None!r}",
-            file=sys.stderr,
-        )
-        sys.exit(3)
-    assert outcome.record is not None
-    # Repair 1: emit the durable GuardedMutationPlan as part
-    # of the serialized authorization transaction. The plan
-    # is consumed by mutate-ref. Without this emission,
-    # mutate-ref cannot find a durable plan and exits with
-    # code 20. The journal sentinel is still held; the plan
-    # file is written atomically.
     try:
-        from scripts.local.guarded_ref_mutation import (
-            GuardedMutationPlan,
-            LifecycleState,
-        )
-        from scripts.local.mutation_policy import (
-            derive_plan as _derive_plan,
-            get_policy as _get_policy,
-            derive_target_ref as _derive_target_ref,
-            supported_mutation_types as _supported_mt,
-        )
-        if args.mutation_type not in _supported_mt():
-            # Non-ref-changing mutation (pr_body_update, label_change,
-            # etc.). No durable GuardedMutationPlan is emitted; the
-            # authorization record in MUTATIONS.jsonl is sufficient.
-            print(f"Authorized mutation {outcome.mutation_id}")
-            print(f"  type:                {outcome.record.get('mutation_type')}")
-            print(f"  run_id:              {outcome.record.get('run_id')}")
-            print(f"  repository:          {outcome.record.get('repository')}")
-            print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
-            print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
-            print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
-            print(f"  pending_action:      {outcome.record.get('pending_action')}")
-            return
-        derived = _derive_plan(
-            mutation_type=args.mutation_type,
-            mutation_target=(
-                args.mutation_target
-                or _state_mutation_target(state)
-            ),
-            expected_target_sha=args.expected_target_sha,
-            expected_main_sha=args.expected_main_sha,
-            desired_after_sha=args.desired_after_sha,
-        )
-        plan_dir = Path(args.workspace) / "GUARDED_REF_MUTATIONS"
-        plan_dir.mkdir(parents=True, exist_ok=True)
-        plan_path = plan_dir / f"{outcome.mutation_id}.json"
-        plan = GuardedMutationPlan(
-            mutation_id=outcome.mutation_id,
-            owner_run_id=state.get("run_id", "unknown"),
-            repository=repository,
-            target_ref=derived.target_ref,
-            operation=derived.operation.value,
-            expected_before_sha=derived.expected_before_sha,
-            desired_after_sha=derived.desired_after_sha,
-            status=LifecycleState.PREPARED.value,
-            created_at=datetime.now(
-                timezone.utc
-            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        )
-        from scripts.local.guarded_ref_mutation import (
-            validate_plan as _validate_plan,
-        )
-        _validate_plan(plan)
-        tmp = plan_path.with_suffix(plan_path.suffix + ".tmp")
-        tmp.write_text(plan.to_json())
-        os.fsync(tmp.open("rb").fileno()) if False else None
-        # Robust fsync: open in binary, write, flush, fsync.
-        with open(tmp, "rb+") as f:
-            f.write(plan.to_json().encode("utf-8"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, plan_path)
-    except (ValueError, KeyError, OSError) as plan_err:
-        # Repair 6: if plan publication failed AFTER the
-        # journal append succeeded, the authorization record
-        # in MUTATIONS.jsonl is now stranded (the controller
-        # holds an outstanding authorization but no
-        # executable plan). Retrying authorize-mutation is
-        # rejected as a duplicate, and finalize-run is blocked
-        # by the outstanding record. Append a terminal
-        # CANCELLED result to the journal so the
-        # outstanding_mutations list returns an empty set.
+        # Round-120 P1 fix (round 4): reject mutation targets outside
+        # the locked scope. If the state scope is repo+A but the
+        # caller supplies --mutation-target B, we would authorize a
+        # mutation against B while another controller legitimately
+        # holds B's lock.
         #
-        # Repair 2 (round-55): the journal sentinel is still
-        # held by this controller invocation. Pass
-        # sentinel_fd=sentinel_fd so record_result shares the
-        # existing flock rather than re-acquiring it through
-        # a second descriptor (which would exhaust retries
-        # and leave the authorization stranded).
+        # Round-20 P2 fix: when the run was initialized WITHOUT a
+        # mutation target (e.g. a PR-scoped run), `state_mutation_target`
+        # is None. The previous check accepted any caller-supplied
+        # --mutation-target in that case because the guard
+        # `state_mutation_target` short-circuited the comparison.
+        # The caller could then authorize a mutation against an
+        # arbitrary target while the held lease protects a different
+        # PR/repository-run lock path, letting another controller
+        # holding the target-specific lock mutate the same target
+        # concurrently. Treat a supplied target as a mismatch
+        # whenever it is not exactly the target recorded in the
+        # state scope (including the None case where the scope has
+        # no target).
+        state_mutation_target = _state_mutation_target(state)
+        # Round-52 P1 fix (Allow PR-scoped pushes to obtain the
+        # target lease): for a PR-scoped run authorizing an
+        # executor-pushed mutation (force_push, push,
+        # branch_delete, branch_create_force), the operator
+        # supplies --mutation-target to identify the head
+        # branch. The Round-20 check below would reject the
+        # target because state_mutation_target is None (PR
+        # runs reject combining PR + target scopes at init
+        # time). The fix: when the mutation is executor-
+        # pushed AND args.mutation_target is supplied AND
+        # state_mutation_target is None, accept the target
+        # and treat the scope as if it were PR + target for
+        # this authorization. The cross-scope conflict check
+        # then picks up the additional target-scoped lock and
+        # two controllers cannot simultaneously authorize
+        # ref-changing mutations on the same head branch.
+        EXECUTOR_PUSHED_MUTATION_TYPES = {
+            "force_push",
+            "push",
+            "branch_delete",
+            "branch_create_force",
+        }
+        if (
+            args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+            and not state_mutation_target
+            and not args.mutation_target
+        ):
+            print(
+                "ERROR: cannot authorize mutation: "
+                f"{args.mutation_type} on a PR-scoped run requires "
+                "--mutation-target. The cross-scope lease conflict "
+                "check uses --mutation-target to identify the head "
+                "branch; without it, two controllers can mutate the "
+                "same ref concurrently.",
+                file=sys.stderr,
+            )
+            sys.exit(14)
+        # Allow the supplied --mutation-target to upgrade a
+        # PR-scoped run to a PR+target scope for this
+        # authorization. The previous Round-20 strict check
+        # would reject this; the Round-52 fix removes the
+        # restriction for executor-pushed mutations.
+        if (
+            args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+            and not state_mutation_target
+            and args.mutation_target
+        ):
+            # Override the scope mismatch: state the target
+            # matches the supplied one (the operator is
+            # upgrading the scope).
+            state_mutation_target = args.mutation_target
+        if args.mutation_target and args.mutation_target != state_mutation_target:
+            print(
+                f"ERROR: --mutation-target={args.mutation_target} does not "
+                f"match state scope mutation_target={state_mutation_target}",
+                file=sys.stderr,
+            )
+            sys.exit(12)
+        # Round-51 P1 fix (Require a target-scoped lease for
+        # ref-changing mutations): when a PR-scoped run
+        # authorizes force_push, push, or branch_delete with
+        # --mutation-target omitted, the previous condition
+        # passed and the authorization records no branch
+        # target. _check_cross_scope_conflict only conflicts
+        # repository-wide leases with narrower leases, so a
+        # second controller can hold a target-scoped lease for
+        # the same PR's head branch at the same time. Both
+        # leases are acquired and the PR-scoped force-push
+        # authorization succeeds, allowing two controllers to
+        # mutate the same ref concurrently. The fix: when
+        # authorizing an executor-pushed mutation
+        # (force_push, push, branch_delete, branch_create_force)
+        # on a PR-scoped run (no --mutation-target in state),
+        # REQUIRE --mutation-target on the CLI so the
+        # authorization records a target-scoped lock path.
+        # The target-scoped lease is then properly acquired
+        # and conflicts with other target-scoped leases via
+        # the existing cross-scope check. Note: squash_merge
+        # is NOT in this list — it is the controller's merge
+        # action, not an executor push, and the PR's head is
+        # already implicit in the PR's identity.
+        EXECUTOR_PUSHED_MUTATION_TYPES = {
+            "force_push",
+            "push",
+            "branch_delete",
+            "branch_create_force",
+        }
+        if (
+            args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
+            and not state_mutation_target
+            and not args.mutation_target
+        ):
+            print(
+                "ERROR: cannot authorize mutation: "
+                f"{args.mutation_type} on a PR-scoped run requires "
+                "--mutation-target. The cross-scope lease conflict "
+                "check uses --mutation-target to identify the head "
+                "branch; without it, two controllers can mutate the "
+                "same ref concurrently.",
+                file=sys.stderr,
+            )
+            sys.exit(14)
+        # Round-120 P1 fix (round 6): canonicalize the repository
+        # used in the authorization record. When the state has no
+        # repository, two lexically different --workspace paths
+        # (e.g. /tmp/ws vs /tmp/../tmp/ws) would produce different
+        # duplicate keys, allowing two calls to authorize the same
+        # mutation. Use the state.workspace value, which is
+        # canonicalized at init time.
+        state_workspace_for_repo = state.get("workspace")
+        if rid.get("repository"):
+            repository = rid["repository"]
+        elif state_workspace_for_repo:
+            # Canonical path → the state workspace is the implicit
+            # "repository" scope. This matches the existing fallback
+            # below, but the value is now the canonical absolute path
+            # recorded at init.
+            repository = str(Path(state_workspace_for_repo).resolve())
+        else:
+            repository = args.workspace
+        # Round-21 P1 fix (Bind mutation authorization to the pending
+        # controller action): require args.pending_action to exactly
+        # match state.next_action.action, AND require the mutation
+        # type to be compatible with the recorded merge_policy. The
+        # previous code accepted any --pending-action value (even
+        # `merge` when the state is on `run_task` or `request_human`)
+        # and recorded it as the authorization's pending_action. An
+        # executor consuming the record could then perform a merge
+        # the controller state machine never selected — in particular
+        # squash_merge would succeed for the default
+        # `stop_before_merge` policy. Compare action + policy before
+        # authorizing.
+        state_pending_action = str(state.get("next_action", {}).get("action", ""))
+        if args.pending_action != state_pending_action:
+            print(
+                "ERROR: cannot authorize mutation: --pending-action "
+                f"{args.pending_action!r} does not match the active "
+                f"state's next action {state_pending_action!r}",
+                file=sys.stderr,
+            )
+            sys.exit(14)
+        merge_policy = str(state.get("merge_policy", "stop_before_merge"))
+        if args.mutation_type == "squash_merge":
+            # Round-19 P1 fix: require a full 40-char lowercase hex
+            # SHA (already checked above).
+            # Round-21 P1 fix: require merge_policy=allow_merge.
+            if merge_policy != "allow_merge":
+                print(
+                    "ERROR: cannot authorize mutation: squash_merge "
+                    f"requires merge_policy=allow_merge, but the active "
+                    f"state's merge_policy={merge_policy!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(14)
+            # Round-22 P1 fix: require the active state's
+            # overall_status to be RUN_READY_FOR_SUMMARY. The
+            # earlier checks verified only that args.pending_action
+            # matches the action and that merge_policy is
+            # allow_merge, but neither guarantees the controller
+            # has actually reached the merge-ready phase. If the
+            # status is RUN_ACTIVE (still running tasks),
+            # RUN_BLOCKED (waiting for human), or any non-terminal
+            # state that isn't ready-for-summary, an executor
+            # receiving squash_merge would perform a merge the
+            # controller never selected. RUN_READY_FOR_SUMMARY
+            # means all non-skipped tasks are promoted or ready,
+            # which is the natural precondition for a merge.
+            overall_status = str(state.get("overall_status", ""))
+            if overall_status != "RUN_READY_FOR_SUMMARY":
+                print(
+                    "ERROR: cannot authorize mutation: squash_merge "
+                    f"requires the active state to be "
+                    f"RUN_READY_FOR_SUMMARY, but overall_status="
+                    f"{overall_status!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(14)
+        req = _mutation_auth.AuthorizationRequest(
+            run_id=state.get("run_id", "unknown"),
+            repository=repository,
+            target_pr_number=_state_target_pr_number(state),
+            mutation_target=args.mutation_target or _state_mutation_target(state),
+            mutation_type=args.mutation_type,
+            expected_main_sha=args.expected_main_sha,
+            expected_target_sha=args.expected_target_sha,
+            pending_action=args.pending_action,
+        )
+        outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
+        if not outcome.ok:
+            print(
+                f"ERROR: mutation authorization rejected: {outcome.reason}; "
+                f"existing_mutation_id={outcome.record.get('mutation_id') if outcome.record else None!r}",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        assert outcome.record is not None
+        # Repair 1: emit the durable GuardedMutationPlan as part
+        # of the serialized authorization transaction. The plan
+        # is consumed by mutate-ref. Without this emission,
+        # mutate-ref cannot find a durable plan and exits with
+        # code 20. The journal sentinel is still held; the plan
+        # file is written atomically.
         try:
-            _mutation_auth.record_result(
-                Path(args.workspace),
-                mutation_id=outcome.mutation_id,
-                status=_mutation_auth.RESULT_FAILURE,
-                evidence=(
-                    f"durable plan emission failed: {plan_err}; "
-                    f"authorization cancelled"
+            from scripts.local.guarded_ref_mutation import (
+                GuardedMutationPlan,
+                LifecycleState,
+            )
+            from scripts.local.mutation_policy import (
+                derive_plan as _derive_plan,
+                get_policy as _get_policy,
+                derive_target_ref as _derive_target_ref,
+                supported_mutation_types as _supported_mt,
+            )
+            if args.mutation_type not in _supported_mt():
+                # Non-ref-changing mutation (pr_body_update, label_change,
+                # etc.). No durable GuardedMutationPlan is emitted; the
+                # authorization record in MUTATIONS.jsonl is sufficient.
+                print(f"Authorized mutation {outcome.mutation_id}")
+                print(f"  type:                {outcome.record.get('mutation_type')}")
+                print(f"  run_id:              {outcome.record.get('run_id')}")
+                print(f"  repository:          {outcome.record.get('repository')}")
+                print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
+                print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
+                print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
+                print(f"  pending_action:      {outcome.record.get('pending_action')}")
+                return
+            derived = _derive_plan(
+                mutation_type=args.mutation_type,
+                mutation_target=(
+                    args.mutation_target
+                    or _state_mutation_target(state)
                 ),
-                actual_main_sha=None,
-                actual_target_sha=None,
-                error_detail=str(plan_err),
-                sentinel_fd=sentinel_fd,
+                expected_target_sha=args.expected_target_sha,
+                expected_main_sha=args.expected_main_sha,
+                desired_after_sha=args.desired_after_sha,
             )
-            print(
-                f"ERROR: durable plan emission failed: {plan_err}; "
-                f"authorization cancelled via terminal result",
-                file=sys.stderr,
+            plan_dir = Path(args.workspace) / "GUARDED_REF_MUTATIONS"
+            plan_dir.mkdir(parents=True, exist_ok=True)
+            plan_path = plan_dir / f"{outcome.mutation_id}.json"
+            plan = GuardedMutationPlan(
+                mutation_id=outcome.mutation_id,
+                owner_run_id=state.get("run_id", "unknown"),
+                repository=repository,
+                target_ref=derived.target_ref,
+                operation=derived.operation.value,
+                expected_before_sha=derived.expected_before_sha,
+                desired_after_sha=derived.desired_after_sha,
+                status=LifecycleState.PREPARED.value,
+                created_at=datetime.now(
+                    timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
-        except Exception as rollback_err:
-            print(
-                f"ERROR: durable plan emission failed: {plan_err}; "
-                f"rollback also failed: {rollback_err}; "
-                f"outstanding authorization is now stranded",
-                file=sys.stderr,
+            from scripts.local.guarded_ref_mutation import (
+                validate_plan as _validate_plan,
             )
-        sys.exit(24)
-    print(f"Authorized mutation {outcome.mutation_id}")
-    print(f"  type:                {outcome.record.get('mutation_type')}")
-    print(f"  run_id:              {outcome.record.get('run_id')}")
-    print(f"  repository:          {outcome.record.get('repository')}")
-    print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
-    print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
-    print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
-    print(f"  pending_action:      {outcome.record.get('pending_action')}")
+            _validate_plan(plan)
+            tmp = plan_path.with_suffix(plan_path.suffix + ".tmp")
+            tmp.write_text(plan.to_json())
+            os.fsync(tmp.open("rb").fileno()) if False else None
+            # Robust fsync: open in binary, write, flush, fsync.
+            with open(tmp, "rb+") as f:
+                f.write(plan.to_json().encode("utf-8"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, plan_path)
+        except (ValueError, KeyError, OSError) as plan_err:
+            # Repair 6: if plan publication failed AFTER the
+            # journal append succeeded, the authorization record
+            # in MUTATIONS.jsonl is now stranded (the controller
+            # holds an outstanding authorization but no
+            # executable plan). Retrying authorize-mutation is
+            # rejected as a duplicate, and finalize-run is blocked
+            # by the outstanding record. Append a terminal
+            # CANCELLED result to the journal so the
+            # outstanding_mutations list returns an empty set.
+            #
+            # Repair 2 (round-55): the journal sentinel is still
+            # held by this controller invocation. Pass
+            # sentinel_fd=sentinel_fd so record_result shares the
+            # existing flock rather than re-acquiring it through
+            # a second descriptor (which would exhaust retries
+            # and leave the authorization stranded).
+            try:
+                _mutation_auth.record_result(
+                    Path(args.workspace),
+                    mutation_id=outcome.mutation_id,
+                    status=_mutation_auth.RESULT_FAILURE,
+                    evidence=(
+                        f"durable plan emission failed: {plan_err}; "
+                        f"authorization cancelled"
+                    ),
+                    actual_main_sha=None,
+                    actual_target_sha=None,
+                    error_detail=str(plan_err),
+                    sentinel_fd=sentinel_fd,
+                )
+                print(
+                    f"ERROR: durable plan emission failed: {plan_err}; "
+                    f"authorization cancelled via terminal result",
+                    file=sys.stderr,
+                )
+            except Exception as rollback_err:
+                print(
+                    f"ERROR: durable plan emission failed: {plan_err}; "
+                    f"rollback also failed: {rollback_err}; "
+                    f"outstanding authorization is now stranded",
+                    file=sys.stderr,
+                )
+            sys.exit(24)
+        print(f"Authorized mutation {outcome.mutation_id}")
+        print(f"  type:                {outcome.record.get('mutation_type')}")
+        print(f"  run_id:              {outcome.record.get('run_id')}")
+        print(f"  repository:          {outcome.record.get('repository')}")
+        print(f"  target_pr_number:    {outcome.record.get('target_pr_number')}")
+        print(f"  expected_main_sha:   {outcome.record.get('expected_main_sha') or '—'}")
+        print(f"  expected_target_sha: {outcome.record.get('expected_target_sha') or '—'}")
+        print(f"  pending_action:      {outcome.record.get('pending_action')}")
+
+    finally:
+        # Round-72 P1 fix: release the supervisor lease
+        # sentinel at the END of the function. The outer
+        # try/finally ensures all sys.exit paths (early
+        # errors) AND the success path release the
+        # sentinel without leaking it.
+        if lease_sentinel_fd is not None and lease_sentinel_path is not None:
+            _supervisor_lock._release_sentinel_fd(lease_sentinel_fd, lease_sentinel_path)
 
 
 def _record_mutation_result(args: argparse.Namespace) -> None:
