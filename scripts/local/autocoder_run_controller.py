@@ -1277,6 +1277,19 @@ def _init(args: argparse.Namespace) -> None:
         "lock_dir": (str(Path(lock_dir_arg).resolve())
                      if lock_dir_arg else None),
     }
+    # Track which artifacts WERE actually published by
+    # THIS invocation. The bootstrap_artifacts dict above
+    # contains PREDICTED paths (the paths the receipts and
+    # state WOULD use), but pre-existing files at those
+    # paths must NOT be unlinked on rollback — they belong
+    # to a prior invocation. Without this guard, a
+    # rejected retry deletes the active run's state and
+    # both launch receipts (Round-75 P1 fix).
+    _rollback_published = {
+        "state_path": False,
+        "receipt_json_path": False,
+        "receipt_md_path": False,
+    }
     lock_to_release_on_failure = lock_outcome
     try:
         # Round-59 P1 fix (Recheck artifacts after acquiring the
@@ -1509,27 +1522,66 @@ def _init(args: argparse.Namespace) -> None:
             bootstrap_artifacts["receipt_md_path"] = (
                 str(receipt_md_path) if receipt_md_path else None
             )
+            # Round-75 P1 fix: the receipt.emit call above
+            # succeeded, so the receipts are fresh — mark
+            # them as published so the rollback unlinks
+            # only THIS invocation's writes, not pre-existing
+            # artifacts at the same paths.
+            if receipt_json_path:
+                _rollback_published["receipt_json_path"] = True
+            if receipt_md_path:
+                _rollback_published["receipt_md_path"] = True
             _save_state(state, out_path)
-            # Round-43 P2 fix (Remove the workspace sentinel
-            # after successful publication): the sentinel
-            # was created above to serialize concurrent
-            # initializers. After all three artifacts are
-            # durably published, the sentinel is no longer
-            # needed; remove it so a future successor init
-            # (e.g. after finalization, with
-            # --replace-stale-state) does not see a stale
-            # sentinel and report that "another
-            # initialization is currently running".
-            try:
-                os.unlink(workspace_owned_path)
-            except OSError:
-                pass
-            # Round-44 P1 fix (continued): unlink the
-            # output-state sentinel on success.
-            try:
-                os.unlink(out_state_sentinel_path)
-            except OSError:
-                pass
+            # Round-75 P1 fix: state was just published, so
+            # mark it as published.
+            _rollback_published["state_path"] = True
+        except Exception:
+            # Round-75 P1 fix: _launch_receipt.emit may have
+            # partially succeeded (JSON written, MD failed).
+            # Inspect the disk to determine which artifacts
+            # were actually written by THIS invocation. The
+            # simplest check: the receipts are written under
+            # <workspace>/ and have a known run_id. The
+            # bootstrap_artifacts dict is empty (the
+            # exception was raised before the assignments),
+            # so we read the predicted paths and set the
+            # _rollback_published flag if a file exists at
+            # the predicted path.
+            predicted_json = workspace / "LAUNCH_RECEIPT.json"
+            predicted_md = workspace / "LAUNCH_RECEIPT.md"
+            if predicted_json.exists():
+                _rollback_published["receipt_json_path"] = True
+                bootstrap_artifacts["receipt_json_path"] = str(
+                    predicted_json
+                )
+            if predicted_md.exists():
+                _rollback_published["receipt_md_path"] = True
+                bootstrap_artifacts["receipt_md_path"] = str(
+                    predicted_md
+                )
+            # Re-raise the original exception for the
+            # outer rollback.
+            raise
+        # Round-43 P2 fix (Remove the workspace sentinel
+        # after successful publication): the sentinel
+        # was created above to serialize concurrent
+        # initializers. After all three artifacts are
+        # durably published, the sentinel is no longer
+        # needed; remove it so a future successor init
+        # (e.g. after finalization, with
+        # --replace-stale-state) does not see a stale
+        # sentinel and report that "another
+        # initialization is currently running".
+        try:
+            os.unlink(workspace_owned_path)
+        except OSError:
+            pass
+        # Round-44 P1 fix (continued): unlink the
+        # output-state sentinel on success.
+        try:
+            os.unlink(out_state_sentinel_path)
+        except OSError:
+            pass
         except _OwnershipRejectedError:
             # The ownership guard raised _OwnershipRejectedError
             # via the patched sys.exit(16) or (17). Re-raise to
@@ -1548,6 +1600,21 @@ def _init(args: argparse.Namespace) -> None:
             for key in ("receipt_md_path", "receipt_json_path", "state_path"):
                 path = bootstrap_artifacts.get(key)
                 if not path:
+                    continue
+                # Round-75 P1 fix (Preserve artifacts when
+                # rejecting a repeated init): only unlink
+                # artifacts that THIS invocation actually
+                # published. The bootstrap_artifacts dict
+                # contains PREDICTED paths (the paths the
+                # receipts and state WOULD use), so an
+                # unlink based on path alone would delete
+                # pre-existing artifacts from a prior
+                # invocation. Without this guard, a
+                # rejected retry deletes the active run's
+                # state and both launch receipts. Use the
+                # _rollback_published flag set right after
+                # the corresponding write succeeded.
+                if not _rollback_published.get(key):
                     continue
                 # Round-14 P1 fix (Revalidate the predecessor
                 # before writing the recovery stub) — also
