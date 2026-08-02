@@ -104,7 +104,17 @@ def bare_and_clone(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_execute_create_then_delete_then_push(bare_and_clone, tmp_path):
-    """End-to-end: create, delete, push with a single clone."""
+    """End-to-end: create, delete, push with a single clone.
+
+    Round-69: with no --remote-path and a local-bare
+    remote URL, the runner uses the local-bare mirror
+    fallback (guarded_create_ref / guarded_delete_ref),
+    not guarded_push. The previous test passed
+    remote_ref_path=clone, which forced the URL-backed
+    push path even for local-bare. Update the test to
+    use the local-bare fallback path (no remote_ref_path)
+    so the assertions match the Round-69 semantics.
+    """
     bare, clone = bare_and_clone
 
     # CREATE
@@ -124,7 +134,7 @@ def test_execute_create_then_delete_then_push(bare_and_clone, tmp_path):
     orch.prepare()
     # The ref does not exist yet.
     assert ops.read_ref(clone, "refs/heads/feat/new") is None
-    final = orch.execute(local_repo=clone, remote_ref_path=clone)
+    final = orch.execute(local_repo=clone, remote_ref_path=None)
     assert final.status == grm.LifecycleState.SUCCEEDED.value
     assert ops.read_ref(clone, "refs/heads/feat/new") == new_sha
 

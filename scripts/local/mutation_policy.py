@@ -27,6 +27,7 @@ validates that both are full 40-char lowercase hex SHAs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from scripts.local.guarded_ref_mutation import (
@@ -332,6 +333,7 @@ class AuthorizationBindingError(ValueError):
 def find_outstanding_authorization(
     mutations_path_records: list,
     *,
+
     mutation_id: str,
     owner_run_id: str,
     repository: str,
@@ -339,6 +341,7 @@ def find_outstanding_authorization(
     expected_before_sha: Optional[str],
     desired_after_sha: Optional[str] = None,
     active_workspace: Optional[str] = None,
+    workspace: Optional["Path"] = None,
 ) -> OutstandingAuthorization:
     """Find the outstanding authorization for the given
     mutation_id and verify the loaded plan matches it.
@@ -392,17 +395,35 @@ def find_outstanding_authorization(
                 f"does not match plan expected_before_sha="
                 f"{expected_before_sha!r}"
             )
-        # Repair 4: compare desired_after_sha with the
-        # authorized request. The legacy MUTATIONS.jsonl
-        # records do not persist a desired_after_sha field
-        # (it was emitted at the executor as the durable
-        # plan). For squash_merge (GRAPHQL_UPDATE_REFS),
-        # the desired_after_sha is recorded later via
-        # record-mutation-result, so the authorization may
-        # not have it. Skip the check when the authorization
-        # has no desired_after_sha AND the mutation type is
-        # squash_merge.
+        # Round-69 P1 fix (Persist and require the authorized
+        # destination SHA): the legacy authorize() emits the
+        # journal record WITHOUT a desired_after_sha field
+        # (the desired SHA is in the durable plan file
+        # instead). The previous check skipped the comparison
+        # when rec_desired was None, allowing a durable plan
+        # to be modified post-authorization to name another
+        # valid commit, which the runner would then push —
+        # a SHA that was never recorded in the authorization.
+        # The fix: when the journal record has no
+        # desired_after_sha, load the plan file from the
+        # workspace and verify the plan's desired_after_sha
+        # matches the caller's. This binds the durable plan
+        # to the journal record.
         rec_desired = rec.get("desired_after_sha")
+        if rec_desired is None and desired_after_sha is not None and workspace is not None:
+            from scripts.local.guarded_ref_mutation import (
+                guarded_ref_mutation_plan_path as _plan_path,
+            )
+            from scripts.local.guarded_ref_mutation import (
+                GuardedMutationPlan as _GMP,
+            )
+            plan_path = _plan_path(workspace, mutation_id)
+            if plan_path.is_file():
+                try:
+                    plan_obj = _GMP.from_json(plan_path.read_text())
+                    rec_desired = plan_obj.desired_after_sha
+                except (OSError, ValueError):
+                    rec_desired = None
         if (
             rec_desired
             and desired_after_sha

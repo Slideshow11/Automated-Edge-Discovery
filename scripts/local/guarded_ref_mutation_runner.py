@@ -151,6 +151,39 @@ def _read_remote_ref_via_ls_remote(
     return _ReadResult(sha=None, indeterminate=False)
 
 
+def is_url_backed_remote(local_repo: Path, remote_name: str) -> bool:
+    """Return True iff the configured remote.<remote_name>.url
+    in `local_repo` is URL-backed
+    (http/https/git@/ssh/file). Local-bare filesystem paths
+    return False.
+
+    Round-69 P1 fix (Create authorized branches on the
+    remote): the runner's CREATE_LOCAL dispatcher used to
+    dispatch guarded_create_ref against only the local clone
+    for ANY configured remote, including URL-backed ones.
+    Reconciliation then read that clone and reported
+    SUCCEEDED, even though the remote branch was never
+    created. The fix: detect URL-backed remotes and route the
+    create through guarded_push.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(local_repo),
+             "config", "--get",
+             f"remote.{remote_name}.url"],
+            capture_output=True, text=True, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    url = result.stdout.strip()
+    return (
+        url.startswith("http")
+        or url.startswith("git@")
+        or url.startswith("ssh://")
+        or url.startswith("file://")
+    )
+
+
 def read_remote_ref_unified(
     remote_ref_path: Optional[Path],
     *,
@@ -425,6 +458,13 @@ class GuardedMutationOrchestrator:
         remote_ref_path: Optional[Path] = None,
     ) -> ops.RefMutationResult:
         """Perform the actual git operation."""
+        # Round-69 P1 fix: helper for the URL-backed
+        # detection used by both CREATE_LOCAL and
+        # DELETE_LOCAL dispatch below. The configured
+        # remote URL is URL-backed if it starts with
+        # http/https/git@/ssh/file. Local-bare paths
+        # (filesystem paths) are NOT URL-backed; they
+        # use the local-bare mirror path.
         if op == grm.Operation.PUSH_REMOTE:
             # Push to the selected remote. The remote is
             # threaded from the caller so a clone with multiple
@@ -445,6 +485,33 @@ class GuardedMutationOrchestrator:
                 expected_old_sha=self.plan.expected_before_sha,
             )
         elif op == grm.Operation.CREATE_LOCAL:
+            # Round-69 P1 fix (Create authorized branches on
+            # the remote): for a CREATE_LOCAL plan with a
+            # URL-backed configured remote and no
+            # --remote-path, the previous code dispatched
+            # guarded_create_ref against only the local clone.
+            # Reconciliation then read that clone and
+            # reported SUCCEEDED, even though the remote
+            # branch was never created. Route URL-backed
+            # creates through guarded_push with
+            # expected_remote_sha=None (the create refspec is
+            # `refs/heads/<branch>` with no expected prior
+            # state). Local-bare URLs and UPDATE_LOCAL are
+            # unchanged.
+            if remote_ref_path is not None or is_url_backed_remote(
+                local_repo, remote
+            ):
+                # Route through push. The create refspec
+                # is `<new_sha>:refs/heads/<branch>`. For
+                # CREATE the expected_remote_sha is None
+                # (no prior ref).
+                return ops.guarded_push(
+                    repo=local_repo,
+                    remote=remote,
+                    ref=self.plan.target_ref,
+                    expected_remote_sha=None,
+                    new_local_sha=self.plan.desired_after_sha or "",
+                )
             return ops.guarded_create_ref(
                 repo=local_repo,
                 ref=self.plan.target_ref,

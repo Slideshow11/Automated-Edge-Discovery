@@ -4803,6 +4803,7 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             expected_before_sha=plan.expected_before_sha,
             desired_after_sha=plan.desired_after_sha,
             active_workspace=str(workspace.resolve()),
+            workspace=workspace,
         )
     except AuthorizationBindingError as e:
         print(
