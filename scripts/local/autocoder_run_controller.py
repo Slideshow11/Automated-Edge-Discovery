@@ -4654,11 +4654,44 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                             )
                         except (OSError, KeyError):
                             pass
+                    # Round-102 P1 fix (V42aA continuation):
+                    # only remove the dedicated upgrade
+                    # state file after confirming that no
+                    # other outstanding journal record still
+                    # references an upgrade lease. The
+                    # upgrade state file is shared liveness
+                    # evidence for all upgrade target
+                    # leases for this workspace; removing
+                    # it prematurely leaves the other
+                    # mutations' upgrade leases without
+                    # liveness evidence. The same
+                    # outstanding-record guard used in
+                    # record-mutation-result applies here.
                     if _upgrade_state_path is not None:
+                        _other_outstanding = False
                         try:
-                            _upgrade_state_path.unlink(missing_ok=True)
+                            with open(
+                                Path(args.workspace)
+                                / _mutation_auth.MUTATIONS_FILENAME
+                            ) as _probe_mf:
+                                for _probe_jline in _probe_mf.read().splitlines():
+                                    try:
+                                        _probe_rec = json.loads(_probe_jline)
+                                    except (json.JSONDecodeError, ValueError):
+                                        continue
+                                    if (
+                                        _probe_rec.get("result") is None
+                                        and _probe_rec.get("upgrade_target_lease")
+                                    ):
+                                        _other_outstanding = True
+                                        break
                         except OSError:
                             pass
+                        if not _other_outstanding:
+                            try:
+                                _upgrade_state_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                     holder_owner = (
                         existing_target_outcome.owner.get("owner_run_id")
                         if isinstance(existing_target_outcome.owner, dict)
