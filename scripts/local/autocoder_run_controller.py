@@ -5579,13 +5579,61 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
 
 
 def _record_mutation_result(args: argparse.Namespace) -> None:
+    # Round-108 P1 fix (Hold the journal sentinel during
+    # the cleanup scan): the previous round-107 P1 fix
+    # moved the cleanup scan before record_result() so
+    # the scan would run before record_result released
+    # its internally-acquired sentinel. That fix was
+    # insufficient because record_result only acquires
+    # the journal sentinel INSIDE its call (not from
+    # the controller's main flow), so a concurrent
+    # authorize-mutation could still acquire the
+    # sentinel and create its evidence between the
+    # controller's scan and its record_result call. The
+    # proper fix is to acquire the journal sentinel in
+    # this function, hold it through the scan, and pass
+    # it to record_result via the sentinel_fd parameter
+    # so the entire scan + record_result sequence runs
+    # under the same exclusive flock. This matches the
+    # pattern already used in authorize-mutation (see
+    # _authorize_mutation_locked which is invoked under
+    # the same sentinel acquired at line 4540).
+    workspace_path = Path(args.workspace)
+    mutations_path_file = workspace_path / _mutation_auth.MUTATIONS_FILENAME
+    _sentinel_path = mutations_path_file.with_suffix(
+        mutations_path_file.suffix + ".auth-sentinel"
+    )
+    from scripts.local.aed_supervisor_lock import (
+        _acquire_sentinel_fd,
+        _release_sentinel_fd,
+    )
+    _sentinel_fd = _acquire_sentinel_fd(_sentinel_path, max_attempts=20)
+    if _sentinel_fd is None:
+        print(
+            "ERROR: cannot record mutation result: mutation journal lock busy",
+            file=sys.stderr,
+        )
+        sys.exit(12)
+    try:
+        _record_mutation_result_locked(args, _sentinel_fd)
+    finally:
+        _release_sentinel_fd(_sentinel_fd, _sentinel_path)
+
+
+def _record_mutation_result_locked(args: argparse.Namespace, sentinel_fd: int) -> None:
+    # Round-108 P1 fix: this is the body of the previous
+    # _record_mutation_result, executed under the
+    # mutation-journal sentinel acquired above. The
+    # sentinel is held for the entire scan + record_result
+    # + cleanup sequence, serializing against any
+    # concurrent authorize-mutation.
     # Round-107 P1 fix (Keep journal serialization through
     # evidence cleanup): the upgrade-state cleanup scan
     # below iterates the journal to detect other
     # outstanding upgrade leases before removing the
     # shared state file. The pre-fix code called
     # _mutation_auth.record_result() FIRST (which
-    # releases the journal sentinel as part of its
+    # released the journal sentinel as part of its
     # internal finally block) and then did the scan.
     # Between the sentinel release and the scan, a new
     # authorize-mutation could acquire the journal
@@ -5597,13 +5645,10 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
     # mutation's leases immediately become non-live.
     # The fix: perform the scan BEFORE calling
     # record_result() so that the journal sentinel held
-    # by the controller's main flow is still effective
-    # during the scan, serializing against any concurrent
-    # authorize-mutation. (The cleanup logic is
-    # idempotent — if a new mutation's record appears
-    # after the scan but before the unlink, the next
-    # record_result() or init call will still find the
-    # state file if any other upgrade record exists.)
+    # by this function is still effective during the
+    # scan, serializing against any concurrent
+    # authorize-mutation. Pass sentinel_fd to
+    # record_result so it shares our sentinel.
     _upgrade_state_cleanup = (
         Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
     )
@@ -5611,9 +5656,9 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
         # Count outstanding mutations that still
         # reference an upgrade lease. This scan runs
         # BEFORE record_result() so the journal sentinel
-        # is held by the controller's main flow (it has
-        # not been released yet by record_result's
-        # internal finally block).
+        # is held by this function (it has not been
+        # released yet by record_result's internal
+        # finally block).
         with open(Path(args.workspace) / _mutation_auth.MUTATIONS_FILENAME) as _mf:
             _outstanding_journal = _mf.read().splitlines()
         _still_using_upgrade = False
@@ -5654,6 +5699,12 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
             actual_main_sha=args.actual_main_sha,
             actual_target_sha=args.actual_target_sha,
             error_detail=args.error_detail,
+            # Round-108 P1 fix: share our sentinel with
+            # record_result so it does not acquire a
+            # separate descriptor (which would race with
+            # any concurrent authorize-mutation holding
+            # the sentinel).
+            sentinel_fd=sentinel_fd,
         )
     except KeyError as e:
         print(f"ERROR: {e}", file=sys.stderr)

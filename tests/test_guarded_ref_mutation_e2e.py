@@ -1941,6 +1941,74 @@ def test_round_105_reconcile_resumed_url_backed_create_local(tmp_path):
     )
 
 
+def test_round_108_journal_sentinel_held_during_scan(tmp_path):
+    """Round-108 P1 fix: _record_mutation_result must
+    acquire the mutation-journal sentinel BEFORE the
+    cleanup scan and hold it through the scan + the
+    record_result call. Pre-fix (round-107) moved the
+    scan before record_result() but record_result only
+    acquired the sentinel INSIDE its own finally block,
+    so a concurrent authorize-mutation could still
+    interleave its evidence creation between the scan
+    and the record_result call. The fix threads an
+    externally-acquired sentinel_fd through to
+    record_result so the entire sequence runs under the
+    same exclusive flock.
+
+    This test exercises the source-level invariant: the
+    controller's _record_mutation_result function must
+    call _acquire_sentinel_fd on the auth-sentinel path
+    before the cleanup scan, and must pass sentinel_fd
+    to record_result.
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-108 P1 fix (Hold the journal sentinel"
+        in _src_text
+    ), (
+        "Round-108 P1 fix source invariant missing: "
+        "the 'Hold the journal sentinel during the "
+        "cleanup scan' comment was not found."
+    )
+    # The fix must acquire the sentinel in the main
+    # _record_mutation_result function (not just in
+    # record_result).
+    _main_fn_start = _src_text.index("def _record_mutation_result(args:")
+    _main_fn_end = _src_text.index(
+        "def _record_mutation_result_locked("
+    )
+    _main_fn_body = _src_text[_main_fn_start:_main_fn_end]
+    assert "_acquire_sentinel_fd" in _main_fn_body, (
+        "Round-108 P1 fix: _record_mutation_result must "
+        "call _acquire_sentinel_fd to acquire the journal "
+        "sentinel before invoking the locked body."
+    )
+    assert "auth-sentinel" in _main_fn_body, (
+        "Round-108 P1 fix: _record_mutation_result must "
+        "acquire the auth-sentinel (matching the pattern "
+        "used by _authorize_mutation)."
+    )
+    # The record_result call must pass sentinel_fd.
+    _locked_fn_start = _src_text.index(
+        "def _record_mutation_result_locked("
+    )
+    _locked_fn_end = _locked_fn_start + 5000
+    _locked_fn_body = _src_text[_locked_fn_start:_locked_fn_end]
+    assert "sentinel_fd=sentinel_fd" in _locked_fn_body, (
+        "Round-108 P1 fix: _record_mutation_result_locked "
+        "must pass sentinel_fd=sentinel_fd to record_result "
+        "so it shares the sentinel we acquired."
+    )
+
+
 def test_round_107_atomic_evidence_publish(tmp_path):
     """Round-107 P1 finding 2: the shared upgrade
     evidence file (UPGRADE_TARGET_LEASE_STATE.json)
@@ -2026,14 +2094,11 @@ def test_round_107_journal_serialization_before_cleanup(tmp_path):
         "the 'Keep journal serialization through "
         "evidence cleanup' comment was not found."
     )
-    # Locate _record_mutation_result function and
-    # verify the scan comes BEFORE record_result.
-    # _mutation_auth.record_result appears in multiple
-    # contexts (rollback handler at line ~5513, the
-    # function we're testing at line ~5649, and the
-    # doc comment). Find the first occurrence INSIDE
-    # _record_mutation_result.
-    _fn_start = _src_text.index("def _record_mutation_result")
+    # Round-108 P1 fix: the body was extracted into a
+    # `_record_mutation_result_locked` helper that takes
+    # a sentinel_fd parameter. Locate that helper.
+    _fn_start = _src_text.index("def _record_mutation_result_locked")
+    # Find the next top-level def after this one.
     # Find the next top-level def after this one.
     _next_def_search = _fn_start + 1
     while True:
