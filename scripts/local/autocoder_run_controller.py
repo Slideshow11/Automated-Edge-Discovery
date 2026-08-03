@@ -1374,6 +1374,14 @@ def _init(args: argparse.Namespace) -> None:
         # ownership rejection (above) or any other failure
         # the sentinel is released in the existing cleanup
         # path.
+        # Round-103 P1 fix (Make the init sentinel
+        # crash-recoverable): the sentinel now also records
+        # the owner's process evidence (pid + /proc/<pid>/stat
+        # start_time) and an ISO-8601 created_at timestamp, so
+        # a later init can detect a STALE owner (the pid is
+        # dead or the start_time does not match a live proc)
+        # and recover the sentinel instead of failing with
+        # rc=17 on a permanently-locked workspace.
         workspace_owned_path = workspace / ".aed-workspace-owned.json"
         out_state_sentinel_path = Path(out_path).with_suffix(
             Path(out_path).suffix + ".aed-write-sentinel"
@@ -1390,23 +1398,184 @@ def _init(args: argparse.Namespace) -> None:
             )
             with os.fdopen(workspace_owned_fd, "w") as _wf:
                 _wf.write(
-                    json.dumps({"held_by": args.run_id}) + "\n"
+                    json.dumps({
+                        "held_by": args.run_id,
+                        "process": proc_evidence,
+                        "created_at": _utcnow(),
+                    }) + "\n"
                 )
             # NOTE: os.fdopen takes ownership of the fd and
             # closes it on exit; reassign to None to skip
             # the duplicate close below.
             workspace_owned_fd = None
         except FileExistsError:
-            # Another init currently holds the workspace.
-            # Reject with rc=17.
+            # Round-103 P1 fix (continued): before failing
+            # with rc=17, decide whether the existing
+            # sentinel is recoverable (its owner is dead or
+            # missing process evidence) or genuinely
+            # in-flight (a different live pid owns it).
+            #
+            # Three recovery paths are accepted here, in
+            # increasing order of restrictiveness:
+            #   1. --replace-stale-state is set: force
+            #      recovery (operator's explicit override).
+            #   2. The existing sentinel's held_by is the
+            #      SAME run_id (the prior init for this run
+            #      was killed mid-flight and the operator is
+            #      retrying with the same run_id).
+            #   3. The existing sentinel's recorded PID is
+            #      DEAD per os.kill(pid, 0) and the recorded
+            #      stat_start_time does not match any live
+            #      /proc/<pid>/stat entry (or is missing).
+            #
+            # If none of these hold, fail closed with rc=17:
+            # a live concurrent init owns the workspace and
+            # must be allowed to finish.
+            replace_stale = bool(
+                getattr(args, "replace_stale_state", False)
+            )
+            recoverable = False
+            recovery_reason = ""
+            existing_payload: dict = {}
+            try:
+                with open(workspace_owned_path) as _rf:
+                    raw = _rf.read()
+                if raw:
+                    existing_payload = json.loads(raw)
+            except (OSError, json.JSONDecodeError):
+                existing_payload = {}
+            existing_held_by = (
+                existing_payload.get("held_by")
+                if isinstance(existing_payload, dict) else None
+            )
+            existing_process = (
+                existing_payload.get("process")
+                if isinstance(existing_payload, dict) else None
+            )
+            existing_pid = (
+                int(existing_process.get("pid"))
+                if isinstance(existing_process, dict)
+                and existing_process.get("pid") is not None
+                else None
+            )
+            existing_start_time = (
+                int(existing_process.get("stat_start_time"))
+                if isinstance(existing_process, dict)
+                and existing_process.get("stat_start_time") is not None
+                else None
+            )
+            if replace_stale:
+                recoverable = True
+                recovery_reason = (
+                    f"--replace-stale-state set; forced recovery"
+                )
+            elif existing_held_by == args.run_id:
+                # Same-run retry: the prior init for this run
+                # was killed before its cleanup could unlink
+                # the sentinel. The operator is retrying with
+                # the same run_id, so it is safe to remove the
+                # sentinel and re-acquire.
+                recoverable = True
+                recovery_reason = (
+                    f"existing held_by ({existing_held_by!r}) "
+                    f"matches args.run_id; same-run retry"
+                )
+            elif existing_pid is None or not _supervisor_lock._pid_exists(existing_pid):
+                # No recorded pid, or the recorded pid is
+                # dead. The original init is gone; the
+                # sentinel is orphaned.
+                recoverable = True
+                recovery_reason = (
+                    f"existing owner pid {existing_pid!r} is dead; "
+                    f"orphaned sentinel"
+                )
+            else:
+                # The recorded pid exists. Verify its
+                # /proc/<pid>/stat start_time matches what the
+                # sentinel recorded; if it differs the pid was
+                # reused by a different process and the sentinel
+                # is stale.
+                live_evidence = (
+                    _run_identity.capture_process_start_evidence(
+                        existing_pid
+                    )
+                )
+                live_start_time = (
+                    live_evidence.get("stat_start_time")
+                    if isinstance(live_evidence, dict) else None
+                )
+                if (
+                    existing_start_time is None
+                    or live_start_time is None
+                    or int(existing_start_time) != int(live_start_time)
+                ):
+                    recoverable = True
+                    recovery_reason = (
+                        f"existing owner pid {existing_pid} has "
+                        f"start_time {live_start_time}, expected "
+                        f"{existing_start_time}; pid reuse detected"
+                    )
+            if not recoverable:
+                # Another init currently holds the workspace
+                # with a live pid and a matching start_time.
+                # Reject with rc=17.
+                print(
+                    f"ERROR: workspace {workspace!r} is currently "
+                    f"being initialized by another run "
+                    f"(held_by={existing_held_by!r}, pid={existing_pid}). "
+                    f"Wait for it to finish, pass "
+                    f"--replace-stale-state, or remove "
+                    f"{workspace_owned_path!r} to override.",
+                    file=sys.stderr,
+                )
+                sys.exit(17)
+            # Recovery path: unlink the stale sentinel and
+            # re-acquire with O_EXCL. Race with another
+            # recovery attempt: bounded retry on FileExistsError.
             print(
-                f"ERROR: workspace {workspace!r} is currently "
-                f"being initialized by another run. Wait for "
-                f"it to finish or remove "
-                f"{workspace_owned_path!r} to override.",
+                f"NOTE: Round-103 P1 stale-sentinel recovery: "
+                f"{recovery_reason}",
                 file=sys.stderr,
             )
-            sys.exit(17)
+            recovery_attempts = 0
+            while True:
+                recovery_attempts += 1
+                try:
+                    os.unlink(workspace_owned_path)
+                except FileNotFoundError:
+                    pass
+                try:
+                    workspace_owned_fd = os.open(
+                        str(workspace_owned_path),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    with os.fdopen(workspace_owned_fd, "w") as _wf:
+                        _wf.write(
+                            json.dumps({
+                                "held_by": args.run_id,
+                                "process": proc_evidence,
+                                "created_at": _utcnow(),
+                                "recovered_from": existing_held_by,
+                            }) + "\n"
+                        )
+                    workspace_owned_fd = None
+                    break
+                except FileExistsError:
+                    if recovery_attempts >= 5:
+                        # Another recovery attempt beat us
+                        # five times; treat as concurrent
+                        # init and fail closed.
+                        print(
+                            f"ERROR: workspace {workspace!r} "
+                            f"is currently being initialized by "
+                            f"another run (recovery race; "
+                            f"attempts={recovery_attempts}).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(17)
+                    time.sleep(0.05)
         try:
             out_path_parent = Path(out_path).parent
             out_path_parent.mkdir(parents=True, exist_ok=True)
