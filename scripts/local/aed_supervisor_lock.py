@@ -1335,6 +1335,66 @@ def recover_stale(
                 reason=f"live_lock_held_by:{existing.get('owner_run_id')}",
             )
 
+    # Round-87 P1 fix (V08XW continuation): serialize stale
+    # recovery with concurrent cross-scope acquisition by
+    # acquiring the per-repository sentinel BEFORE the scope
+    # sentinel. The previous code only acquired the scope
+    # sentinel, allowing a concurrent narrower initializer
+    # for the same repository to win the cross-scope race
+    # and publish its scope while recovery publishes the
+    # repository-wide lease, leaving both live leases
+    # present. Acquire the per-repo sentinel and re-check
+    # cross-scope conflicts before publishing the
+    # recovered lease. Per-repo sentinel is auto-released
+    # by the kernel on process death via flock.
+    # Note: the recheck is skipped when the existing lock
+    # is corrupt (indeterminate state) because the corrupt
+    # file is itself the evidence the lock is stale; the
+    # scope sentinel below provides the atomic CAS for
+    # the recovery.
+    repo_sentinel_fd: Optional[int] = None
+    repo_sentinel_path: Optional["Path"] = None
+    if not bypass_sentinel and not corrupt_lease:
+        try:
+            repo_sentinel_path = _repo_sentinel_path(
+                scope["repository"], base_dir
+            )
+            repo_sentinel_fd = _acquire_sentinel_fd(
+                repo_sentinel_path, max_attempts=20
+            )
+            if repo_sentinel_fd is None:
+                # Another worker is performing
+                # cross-scope operation on this
+                # repository. Bypass and report.
+                return LockOutcome(
+                    ok=False, path=path, owner=None,
+                    reason=(
+                        "recovery_repo_sentinel_busy"
+                    ),
+                )
+            # Recheck cross-scope conflict while holding
+            # the per-repo sentinel. A concurrent
+            # narrower initializer for the same
+            # repository that started AFTER our
+            # sentinel acquisition is blocked; any
+            # narrower that started before will have
+            # published by now and we see it here.
+            cross_scope_recheck = _check_cross_scope_conflict(
+                scope, base_dir=base_dir,
+            )
+            if cross_scope_recheck is not None:
+                if repo_sentinel_fd is not None:
+                    _release_sentinel_fd(
+                        repo_sentinel_fd, repo_sentinel_path
+                    )
+                return cross_scope_recheck
+        except (OSError, KeyError):
+            # If repo sentinel acquisition fails for any
+            # reason, fail closed without the repo sentinel
+            # (the scope sentinel still provides the
+            # atomic CAS for the recovery itself).
+            pass
+
     # Strict CAS: acquire an exclusive sentinel file lock using
     # fcntl.flock so the sentinel self-releases on process death.
     # The first contender to acquire the sentinel wins the
@@ -1485,6 +1545,13 @@ def recover_stale(
             reason=f"recovered_from:{existing2.get('owner_run_id')}",
         )
     finally:
+        if repo_sentinel_fd is not None and repo_sentinel_path is not None:
+            try:
+                _release_sentinel_fd(
+                    repo_sentinel_fd, repo_sentinel_path
+                )
+            except (OSError, NameError):
+                pass
         _release_sentinel_fd(sentinel_fd, sentinel_path)
 
 

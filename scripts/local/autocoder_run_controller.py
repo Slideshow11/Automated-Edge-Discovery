@@ -3493,6 +3493,41 @@ def _finalize_run(args: argparse.Namespace) -> None:
         # Doing this AFTER the release (rather than before)
         # ensures we never leave the state marked complete
         # while the lease is still held.
+        # Round-88 P1 fix (V08XX continuation): re-check
+        # the state file's run_identity before overwriting.
+        # A successor init --replace-stale-state may have
+        # acquired a new scope and published its own active
+        # state in the gap between the lease release
+        # above and this save. If the state file's run_id
+        # is no longer our own, refuse to overwrite —
+        # overwriting would clobber the successor's
+        # RUN_ACTIVE state with this predecessor's
+        # RUN_COMPLETE, leaving the successor's lease
+        # immediately stale. Fail closed.
+        try:
+            with open(args.state) as _sf:
+                _state_now = json.load(_sf)
+            _rid_now = (
+                (_state_now.get("run_identity") or {}).get("run_id")
+                if isinstance(_state_now, dict)
+                else None
+            )
+            if _rid_now and _rid_now != state.get("run_id"):
+                print(
+                    f"ERROR: refusing to finalize: state file's "
+                    f"run_identity.run_id={_rid_now!r} no longer "
+                    f"matches this run's run_id="
+                    f"{state.get('run_id')!r}. A successor "
+                    "init --replace-stale-state has published a "
+                    "new active state; this finalizer must not "
+                    "clobber it with RUN_COMPLETE. The successor's "
+                    "lease is now responsible for the workflow; "
+                    "this predecessor is now stale.",
+                    file=sys.stderr,
+                )
+                sys.exit(13)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
         state["overall_status"] = "RUN_COMPLETE"
         state["updated_at"] = _utcnow()
         state["next_action"] = {"action": "stop", "task_id": None, "reason": "run finalized"}

@@ -80,37 +80,41 @@ def test_repo_sentinel_serializes_concurrent_acquires(tmp_path):
     race_count = 0
     TRIALS = 20
     for trial in range(TRIALS):
-        with _trial_base_dir(tmp_path, trial) as base_dir:
-            repo_scope = {"repository": "owner/repo"}
-            pr_scope = {
-                "repository": "owner/repo",
-                "target_pr_number": 416,
-            }
+        # Round-86 P2 fix (V08Xa continuation): the previous
+        # code used `with _trial_base_dir(...) as base_dir:`
+        # but _trial_base_dir returns a Path, not a context
+        # manager. Use the returned path directly.
+        base_dir = _trial_base_dir(tmp_path, trial)
+        repo_scope = {"repository": "owner/repo"}
+        pr_scope = {
+        "repository": "owner/repo",
+        "target_pr_number": 416,
+        }
 
-            barrier = threading.Barrier(2)
+        barrier = threading.Barrier(2)
 
-            def attempt(scope: dict, run_id: str):
-                # Wait at the barrier so both contenders
-                # enter the cross-scope check as close
-                # together as possible.
-                barrier.wait(timeout=5)
-                return sl.try_acquire(
-                    **_make_contender_args(
-                        scope=scope,
-                        run_id=run_id,
-                        base_dir=base_dir,
-                    )
+        def attempt(scope: dict, run_id: str):
+            # Wait at the barrier so both contenders
+            # enter the cross-scope check as close
+            # together as possible.
+            barrier.wait(timeout=5)
+            return sl.try_acquire(
+                **_make_contender_args(
+                    scope=scope,
+                    run_id=run_id,
+                    base_dir=base_dir,
                 )
+            )
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-                f_repo = ex.submit(attempt, repo_scope, "r_repo")
-                f_pr = ex.submit(attempt, pr_scope, "r_pr")
-                outcome_repo = f_repo.result(timeout=30)
-                outcome_pr = f_pr.result(timeout=30)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_repo = ex.submit(attempt, repo_scope, "r_repo")
+            f_pr = ex.submit(attempt, pr_scope, "r_pr")
+            outcome_repo = f_repo.result(timeout=30)
+            outcome_pr = f_pr.result(timeout=30)
 
-            succeeded = sum(1 for o in (outcome_repo, outcome_pr) if o.ok)
-            if succeeded > 1:
-                race_count += 1
+        succeeded = sum(1 for o in (outcome_repo, outcome_pr) if o.ok)
+        if succeeded > 1:
+            race_count += 1
     # Exactly one of the two acquisitions must succeed
     # in EVERY trial. The pre-fix code exhibits the race
     # in ~25% of trials; this assertion fails on the
@@ -122,8 +126,8 @@ def test_repo_sentinel_serializes_concurrent_acquires(tmp_path):
     )
 
 
-def _trial_base_dir(tmp_path: Path, trial_idx: int):
-    """Yield a fresh base_dir for each trial to ensure
+def _trial_base_dir(tmp_path: Path, trial_idx: int) -> Path:
+    """Return a fresh base_dir for each trial to ensure
     isolation (no leaked state across trials)."""
     base_dir = tmp_path / f"locks_{trial_idx}"
     if base_dir.exists():
