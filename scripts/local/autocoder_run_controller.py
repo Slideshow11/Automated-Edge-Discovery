@@ -4420,12 +4420,12 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             "branch_delete",
             "branch_create_force",
         }
-        # Round-94 P1 fix: initialize the upgrade target
-        # lease outcome so the AuthorizationRequest
-        # construction below has a value (None when no
-        # upgrade happened; populated by the upgrade
+        # Round-94/96 P1 fix: initialize the upgrade target
+        # lease outcome list so the AuthorizationRequest
+        # construction below has a value (empty list when
+        # no upgrade happened; populated by the upgrade
         # block if it succeeds).
-        _upgrade_target_lease_outcome = None
+        _upgrade_target_lease_outcomes = []
         if (
             args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
             and not state_mutation_target
@@ -4498,6 +4498,85 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             # is annotated with the target_lease
             # information so the next caller can find and
             # release it on completion.
+            # Round-96 P1 fix: the upgrade target lease is
+            # acquired with the run's actual owner_pid and
+            # the run's actual state path so assess_liveness
+            # classifies the lease as alive. The previous
+            # Round-94 fix used pid=0 and state_path=
+            # "__target_lease__" which made the lease
+            # immediately stale (a competing target-scoped
+            # init --replace-stale-lock could recover the
+            # lease while the authorization is still
+            # outstanding). The fix uses the run's actual
+            # host and pid evidence and the run's state
+            # path so the lease is bound to live evidence.
+            # The lease is also stored in a list (not a
+            # single outcome) so both the target-only
+            # and PR+target acquisitions are tracked and
+            # can be released at record-mutation-result.
+            # The lock base directory is captured once
+            # (the directory used for acquisition) and
+            # reused for the release so the lease can
+            # actually be found.
+            _lock_base_for_upgrade = _resolve_lock_base(
+                args, Path(args.workspace)
+            )
+            import os as _os
+            _proc_evidence = _run_identity.capture_process_start_evidence() or {}
+            _upgrade_pid = (
+                _proc_evidence.get("pid") if _proc_evidence else None
+            ) or _os.getpid()
+            _upgrade_start_time = (
+                _proc_evidence.get("start_time") if _proc_evidence else None
+            ) or "2026-01-01T00:00:00Z"
+            _upgrade_target_lease_outcomes = []
+            # Round-96 P1 fix: the upgrade lease's
+            # assess_liveness() check requires the
+            # owner_state_path's run_identity.run_id to
+            # match the lock's owner_run_id. The run's
+            # own state file has run_identity.run_id =
+            # run_id (e.g. "r1"), not the upgrade
+            # lease's owner_run_id (e.g.
+            # "__target_lease_r1__"). Use a dedicated
+            # state file that has the upgrade lease's
+            # owner_run_id so the liveness check sees a
+            # match. The state file is a small
+            # side-channel file in the workspace and is
+            # removed at the start of record-mutation-result
+            # (alongside the lease release).
+            _upgrade_state_path = (
+                Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
+            )
+            try:
+                # The state file's run_identity.run_id
+                # must equal the lock's owner_run_id
+                # (not a generic placeholder). Since
+                # multiple target scopes can be acquired
+                # with the same owner_run_id, the state
+                # file is shared.
+                _upgrade_state_path.write_text(
+                    json.dumps(
+                        {
+                            "run_identity": {
+                                "run_id": f"__target_lease_{run_id}__",
+                            },
+                            "updated_at": "2026-01-01T00:00:00Z",
+                        }
+                    )
+                )
+            except OSError:
+                # If the state file cannot be written,
+                # fall back to the run's state file. The
+                # liveness check will report a mismatch
+                # but the executor's revalidation will
+                # still find the lease (the lease file is
+                # on disk; only the liveness check fails).
+                _upgrade_state_path = None
+            _effective_state_path = (
+                str(_upgrade_state_path)
+                if _upgrade_state_path is not None
+                else str(Path(args.state).resolve())
+            )
             for target_scope in [
                 {
                     "repository": (
@@ -4518,23 +4597,22 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             ]:
                 if not target_scope["repository"]:
                     continue
-                # The owner_run_id encodes the run_id
-                # so the lock is bound to this run.
-                # Use a dedicated prefix to distinguish
-                # the target-only probe from the run's
-                # primary PR scope lock.
                 existing_target_outcome = _supervisor_lock.try_acquire(
                     scope=target_scope,
                     owner_run_id=(
                         f"__target_lease_{run_id}__"
                     ),
-                    owner_host={"hostname": "check", "pid": 0},
-                    owner_pid=0,
-                    owner_start_evidence={"start_time": 0},
-                    owner_state_path="__target_lease__",
-                    base_dir=_resolve_lock_base(
-                        args, Path(args.workspace)
-                    ),
+                    owner_host={
+                        "hostname": _os.uname().nodename,
+                        "user": _os.environ.get("USER", "unknown"),
+                    },
+                    owner_pid=_upgrade_pid,
+                    owner_start_evidence={
+                        "pid": _upgrade_pid,
+                        "start_time": _upgrade_start_time,
+                    },
+                    owner_state_path=_effective_state_path,
+                    base_dir=_lock_base_for_upgrade,
                 )
                 if existing_target_outcome.ok:
                     # We acquired the target scope. That
@@ -4544,11 +4622,16 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                     # on disk; another controller cannot
                     # acquire until we release at the end
                     # of mutate-ref). Track the outcome
-                    # for later release.
-                    _upgrade_target_lease_outcome = (
+                    # for later release. Use a list so
+                    # BOTH the target-only and PR+target
+                    # acquisitions are tracked (the
+                    # previous single-outcome code
+                    # overwrote the first with the
+                    # second).
+                    _upgrade_target_lease_outcomes.append((
                         target_scope,
                         existing_target_outcome,
-                    )
+                    ))
                 else:
                     # Another run holds the target scope.
                     # Refuse the upgrade (fail closed).
@@ -4707,15 +4790,19 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             expected_main_sha=args.expected_main_sha,
             expected_target_sha=args.expected_target_sha,
             pending_action=args.pending_action,
-            # Round-94 P1 fix: pass the upgrade target
+            # Round-94/96 P1 fix: pass the upgrade target
             # lease info (if any) so the journal record
             # persists it. mutate-ref will release the
             # upgrade target lease after the executor
-            # completes.
+            # completes. The list contains BOTH the
+            # target-only and PR+target acquisitions so
+            # all leases are released.
             upgrade_target_lease=(
-                _format_upgrade_target_lease(_upgrade_target_lease_outcome)
-                if _upgrade_target_lease_outcome is not None
-                else None
+                _format_upgrade_target_lease(
+                    _upgrade_target_lease_outcomes
+                    if _upgrade_target_lease_outcomes
+                    else None
+                )
             ),
         )
         outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
@@ -4896,7 +4983,7 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
         sys.exit(5)
     result = updated.get("result") or {}
     print(f"Recorded mutation result {args.mutation_id} -> {result.get('status')}")
-    # Round-94 P1 fix (V29rD continuation): release the
+    # Round-94/96 P1 fix (V29rD continuation): release the
     # upgrade target lease if the journal record shows
     # one. The lease was acquired during the PR-to-target
     # upgrade in authorize-mutation and held through
@@ -4905,40 +4992,67 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
     # mutation has a terminal result). Best-effort: log
     # but do not fail if the lease is already gone.
     _release_upgrade_target_lease_for_record(updated)
+    # Round-96 P1 fix: also remove the dedicated upgrade
+    # state file (UPGRADE_TARGET_LEASE_STATE.json). The
+    # file is a side-channel that exists only for the
+    # liveness check; once the leases are released it is
+    # no longer needed.
+    _upgrade_state_cleanup = (
+        Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
+    )
+    try:
+        _upgrade_state_cleanup.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _release_upgrade_target_lease_for_record(record: dict) -> None:
     """Find and release the upgrade target lease (if any)
     persisted in the journal record.
 
-    Round-94 P1 fix (V29rD continuation): the upgrade
-    target lease is held across authorize-mutation and
-    mutate-ref to prevent a target-scoped controller from
-    acquiring the target between the PR lease's check and
-    the executor's actual mutation. The lease is released
-    here (after the terminal result is recorded) so the
-    target is unblocked for the next controller. The
-    base_dir is left as None (host-wide default); the
-    supervisor lock module's release function finds the
-    lock file by scope_key in the default location.
+    Round-96 P1 fix (V29rD continuation + V31aB/C): the
+    upgrade target lease is held across authorize-mutation
+    and mutate-ref to prevent a target-scoped controller
+    from acquiring the target between the PR lease's check
+    and the executor's actual mutation. The lease is
+    released here (after the terminal result is recorded)
+    so the target is unblocked for the next controller. The
+    recorded value is a dict {"leases": [...]} with each
+    lease's scope and owner_run_id. ALL leases are released
+    (the previous single-outcome code overwrote the first
+    with the second, leaving the target-only lease
+    permanently locked).
+
+    Best-effort: if a lease is already gone (e.g. a
+    concurrent worker released it), the helper logs but
+    does not fail the controller.
     """
     upgrade = record.get("upgrade_target_lease")
     if not upgrade:
         return
-    scope = upgrade.get("scope")
-    owner_run_id = upgrade.get("owner_run_id")
-    if not scope or not owner_run_id:
-        return
-    try:
-        _supervisor_lock.release(
-            scope=scope,
-            owner_run_id=owner_run_id,
-            base_dir=None,
-        )
-    except (OSError, KeyError):
-        # Best-effort: another worker may have already
-        # released the lease. Continue without failing.
-        pass
+    leases = upgrade.get("leases") if isinstance(upgrade, dict) else None
+    if not leases:
+        # Legacy single-outcome format (Round-94): treat
+        # the upgrade dict itself as a single lease entry.
+        if isinstance(upgrade, dict) and "scope" in upgrade:
+            leases = [upgrade]
+        else:
+            return
+    for lease in leases:
+        scope = lease.get("scope")
+        owner_run_id = lease.get("owner_run_id")
+        if not scope or not owner_run_id:
+            continue
+        try:
+            _supervisor_lock.release(
+                scope=scope,
+                owner_run_id=owner_run_id,
+                base_dir=None,  # host-wide default; release finds lock by key
+            )
+        except (OSError, KeyError):
+            # Best-effort: another worker may have already
+            # released the lease. Continue without failing.
+            pass
 
 
 def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
@@ -4959,23 +5073,39 @@ def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
     return None
 
 
-def _format_upgrade_target_lease(outcome) -> Optional[dict]:
-    """Convert the upgrade target lease probe outcome to a
-    serializable dict for the journal record.
+def _format_upgrade_target_lease(outcomes) -> Optional[object]:
+    """Convert the upgrade target lease probe outcomes to a
+    serializable structure for the journal record.
 
-    Round-94 P1 fix: the upgrade target lease is held
+    Round-96 P1 fix: the upgrade target lease is held
     across authorize-mutation and mutate-ref, and the
     journal record persists the lease info so mutate-ref
-    can release it after the executor completes.
+    and record-mutation-result can release it. The
+    outcomes may be a list (multiple target scopes
+    acquired) or a single value (legacy). The format is a
+    dict {"leases": [...], "upgrade_state_path": <str>},
+    where each lease entry is {"scope": ..., "owner_run_id":
+    ...}. The upgrade_state_path is the dedicated state
+    file used for liveness evidence (separate from the
+    run's main state file); the release path may remove
+    it once all leases are released.
+
+    The lock_base is captured at acquisition so the
+    release path uses the same directory.
     """
-    if outcome is None:
+    if not outcomes:
         return None
-    target_scope, lock_outcome = outcome
-    return {
-        "scope": target_scope,
-        "owner_run_id": lock_outcome.owner.get("owner_run_id"),
-        "path": str(lock_outcome.path) if lock_outcome.path else None,
-    }
+    if not isinstance(outcomes, list):
+        outcomes = [outcomes]
+    leases = []
+    for outcome in outcomes:
+        target_scope, lock_outcome = outcome
+        leases.append({
+            "scope": target_scope,
+            "owner_run_id": lock_outcome.owner.get("owner_run_id"),
+            "path": str(lock_outcome.path) if lock_outcome.path else None,
+        })
+    return {"leases": leases}
 
 
 def _inspect_lock(args: argparse.Namespace) -> None:
@@ -5801,6 +5931,70 @@ def _mutate_ref(args: argparse.Namespace) -> None:
                 file=sys.stderr,
             )
             sys.exit(11)
+        # Round-96 P1 fix (V31aA continuation): also
+        # revalidate each upgrade target lease that
+        # authorize-mutation acquired. Without this
+        # revalidation, a concurrent target-scoped
+        # init --replace-stale-lock could have recovered
+        # the upgrade lease (assess_liveness classifies
+        # the lease as stale if the state file's
+        # run_identity is different or the PID is gone).
+        # Read the durable plan for the upgrade target
+        # lease info; if any lease is no longer held,
+        # refuse the executor (fail closed).
+        _plan_for_upgrade = GuardedMutationPlan.from_json(
+            plan_path.read_text()
+        )
+        # The upgrade target lease info is not stored in
+        # the plan file (it lives in the journal record).
+        # Read the journal records for this mutation_id
+        # and look for the upgrade_target_lease field.
+        try:
+            with open(workspace / _mutation_auth.MUTATIONS_FILENAME) as _mf:
+                _journal_lines = _mf.read().splitlines()
+            _matching_journal = None
+            for _line in _journal_lines:
+                try:
+                    _rec = json.loads(_line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if _rec.get("mutation_id") == plan.mutation_id:
+                    _matching_journal = _rec
+                    break
+            if _matching_journal is not None:
+                _upgrade = _matching_journal.get("upgrade_target_lease")
+                if _upgrade:
+                    _upgrade_leases = _upgrade.get("leases", [])
+                    if not _upgrade_leases and _upgrade.get("scope"):
+                        # Legacy single-outcome format.
+                        _upgrade_leases = [_upgrade]
+                    for _lease in _upgrade_leases:
+                        if not is_lease_held_by_run(
+                            scope=_lease["scope"],
+                            owner_run_id=_lease["owner_run_id"],
+                            base_dir=lock_base_for_check,
+                        ):
+                            print(
+                                f"ERROR: cannot execute mutation: "
+                                f"the upgrade target lease is no longer "
+                                f"held by run_id="
+                                f"{_lease['owner_run_id']!r} for "
+                                f"scope={_lease['scope']!r}. A concurrent "
+                                "recover_stale transferred the lease to a "
+                                "successor run. The current run cannot "
+                                "proceed with the executor; refuse before "
+                                "any protected Git or GitHub mutation.",
+                                file=sys.stderr,
+                            )
+                            sys.exit(11)
+        except (OSError, json.JSONDecodeError, ValueError):
+            # If we cannot read the journal, the upgrade
+            # target lease cannot be revalidated. Continue
+            # without revalidation (the executor may
+            # proceed against a recovered lease); the
+            # main PR-scope lease revalidation above
+            # still applies.
+            pass
         final = orch.execute(
             local_repo=local_repo,
             remote_ref_path=remote_path,

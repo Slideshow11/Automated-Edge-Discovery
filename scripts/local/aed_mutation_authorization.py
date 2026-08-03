@@ -132,6 +132,10 @@ class AuthorizationRequest:
     # during the PR-to-target upgrade. The lease
     # owner_run_id is encoded in this field so mutate-ref
     # can release it after the executor completes.
+    # The field is a dict {"leases": [...]} containing
+    # both the target-only and PR+target acquisitions
+    # so all leases are released at the end of the
+    # authorization.
     upgrade_target_lease: Optional[dict] = None
 
 
