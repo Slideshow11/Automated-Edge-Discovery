@@ -5373,6 +5373,34 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 # upgrade target leases and the dedicated
                 # evidence file so the target is unblocked
                 # for the next controller.
+                #
+                # Round-109 P1 fix (Preserve shared evidence
+                # when authorization cleanup runs): the
+                # previous code unconditionally unlinked
+                # UPGRADE_TARGET_LEASE_STATE.json in the
+                # failure path. But the state file is
+                # SHARED — it serves as liveness evidence
+                # for ANY outstanding upgraded mutation
+                # in the workspace, not just the one being
+                # authorized. If another upgraded mutation
+                # was already outstanding (e.g. waiting on
+                # mutate-ref), this cleanup would destroy
+                # the first mutation's liveness evidence;
+                # after its authorizer PID exits, the
+                # first mutation's leases would be
+                # recoverable as stale while the first
+                # mutation is still authorized.
+                #
+                # The fix mirrors the same outstanding-
+                # journal guard used by the probe-failure
+                # and result-cleanup paths: scan the
+                # journal for other outstanding upgrade
+                # records BEFORE unlinking the shared
+                # state file. If any other upgrade
+                # record exists, keep the state file in
+                # place (the first mutation will clean it
+                # up later when it records its own
+                # result).
                 _cleanup_outcomes = list(_upgrade_target_lease_outcomes)
                 _cleanup_state_path = _upgrade_state_path
                 for _tlo in _cleanup_outcomes:
@@ -5386,10 +5414,30 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                     except (OSError, KeyError):
                         pass
                 if _cleanup_state_path is not None:
+                    _other_outstanding = False
                     try:
-                        _cleanup_state_path.unlink(missing_ok=True)
+                        with open(
+                            Path(args.workspace)
+                            / _mutation_auth.MUTATIONS_FILENAME
+                        ) as _cf:
+                            for _cline in _cf.read().splitlines():
+                                try:
+                                    _crec = json.loads(_cline)
+                                except (json.JSONDecodeError, ValueError):
+                                    continue
+                                if _crec.get("upgrade_target_lease"):
+                                    _other_outstanding = True
+                                    break
                     except OSError:
-                        pass
+                        # If we cannot read the journal,
+                        # leave the state file in place
+                        # to be safe.
+                        _other_outstanding = True
+                    if not _other_outstanding:
+                        try:
+                            _cleanup_state_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
         assert outcome.record is not None
         # Repair 1: emit the durable GuardedMutationPlan as part
         # of the serialized authorization transaction. The plan
@@ -5543,6 +5591,14 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 # will not be called; we must release
                 # here. Without this, the leases remain
                 # live until stale recovery.
+                #
+                # Round-109 P1 fix (continued): apply the
+                # same outstanding-journal guard before
+                # unlinking the shared state file. The
+                # state file is shared across all
+                # outstanding upgraded mutations in the
+                # workspace; only unlink it if no other
+                # upgrade record exists.
                 for _rb_tlo in _upgrade_target_lease_outcomes:
                     _rb_ts, _rb_lo = _rb_tlo
                     try:
@@ -5554,10 +5610,27 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                     except (OSError, KeyError):
                         pass
                 if _upgrade_state_path is not None:
+                    _rb_other_outstanding = False
                     try:
-                        _upgrade_state_path.unlink(missing_ok=True)
+                        with open(
+                            Path(args.workspace)
+                            / _mutation_auth.MUTATIONS_FILENAME
+                        ) as _rb_cf:
+                            for _rb_cline in _rb_cf.read().splitlines():
+                                try:
+                                    _rb_crec = json.loads(_rb_cline)
+                                except (json.JSONDecodeError, ValueError):
+                                    continue
+                                if _rb_crec.get("upgrade_target_lease"):
+                                    _rb_other_outstanding = True
+                                    break
                     except OSError:
-                        pass
+                        _rb_other_outstanding = True
+                    if not _rb_other_outstanding:
+                        try:
+                            _upgrade_state_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
             sys.exit(24)
         print(f"Authorized mutation {outcome.mutation_id}")
         print(f"  type:                {outcome.record.get('mutation_type')}")

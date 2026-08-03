@@ -1941,6 +1941,77 @@ def test_round_105_reconcile_resumed_url_backed_create_local(tmp_path):
     )
 
 
+def test_round_109_preserve_shared_evidence_on_cleanup(tmp_path):
+    """Round-109 P1 fix: when authorize-mutation's
+    post-acquisition checks fail (or the durable plan
+    emission fails), the cleanup releases the upgrade
+    target leases. Before this fix, it ALSO
+    unconditionally unlinked UPGRADE_TARGET_LEASE_STATE.json
+    — but that state file is shared across all
+    outstanding upgraded mutations in the workspace.
+    If another upgraded mutation was already outstanding
+    (e.g. waiting on mutate-ref), this cleanup would
+    destroy the first mutation's liveness evidence;
+    after its authorizer PID exits, the first mutation's
+    leases would be recoverable as stale while the first
+    mutation is still authorized.
+
+    The fix applies the same outstanding-journal guard
+    used by the probe-failure and result-cleanup paths:
+    scan the journal for other upgrade records before
+    unlinking the shared state file. This test exercises
+    the source-level invariant: both cleanup-failure
+    paths (response_to_acquisition_checks and
+    plan_emission_failure) must unconditionally scan
+    the journal before unlinking.
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-109 P1 fix (Preserve shared evidence"
+        in _src_text
+    ), (
+        "Round-109 P1 fix source invariant missing: "
+        "the 'Preserve shared evidence when authorization "
+        "cleanup runs' comment was not found."
+    )
+    # The fix must appear in BOTH cleanup paths: the
+    # post-acquisition-checks failure (Round-97 P1
+    # block) and the durable-plan-emission failure
+    # (Round-24 block).
+    assert _src_text.count(
+        "Round-109 P1 fix"
+    ) >= 2, (
+        f"Round-109 P1 fix: expected the fix to be "
+        f"applied in BOTH cleanup paths (post-acquisition "
+        f"and post-plan-emission), but only "
+        f"{_src_text.count('Round-109 P1 fix')} "
+        f"instances were found."
+    )
+    # Both paths must have the outstanding-journal guard.
+    assert _src_text.count(
+        "_other_outstanding = False"
+    ) >= 1, (
+        "Round-109 P1 fix: expected the outstanding-"
+        "journal guard (_other_outstanding = False) "
+        "in the post-acquisition-checks cleanup path."
+    )
+    assert _src_text.count(
+        "_rb_other_outstanding = False"
+    ) >= 1, (
+        "Round-109 P1 fix: expected the outstanding-"
+        "journal guard (_rb_other_outstanding = False) "
+        "in the post-plan-emission cleanup path."
+    )
+
+
 def test_round_108_journal_sentinel_held_during_scan(tmp_path):
     """Round-108 P1 fix: _record_mutation_result must
     acquire the mutation-journal sentinel BEFORE the
