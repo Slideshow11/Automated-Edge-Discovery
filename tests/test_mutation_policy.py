@@ -158,6 +158,54 @@ def test_derive_plan_squash_merge():
     assert plan.controller_performs is True
 
 
+def test_derive_target_ref_uses_state_target_pr_for_squash_merge():
+    """Round-93 P2 fix: when squash_merge is authorized
+    WITHOUT --mutation-target but the state has a
+    target_pr_number, the derived target_ref must
+    include the PR number (refs/pull/<N>/head), not the
+    sentinel refs/pull//head. The previous code emitted
+    refs/pull//head, losing the PR identity.
+    """
+    # mutation_target=None, target_pr_number=416 →
+    # refs/pull/416/head
+    ref = mp.derive_target_ref(
+        "squash_merge",
+        None,
+        target_pr_number=416,
+    )
+    assert ref == "refs/pull/416/head"
+    # mutation_target="416" (also valid) → same result
+    ref = mp.derive_target_ref(
+        "squash_merge",
+        "416",
+        target_pr_number=416,
+    )
+    assert ref == "refs/pull/416/head"
+    # mutation_target=None, target_pr_number=None → sentinel
+    ref = mp.derive_target_ref(
+        "squash_merge",
+        None,
+        target_pr_number=None,
+    )
+    assert ref == "refs/pull//head"
+
+
+def test_derive_plan_squash_merge_uses_state_target_pr():
+    """Round-93 P2 fix: derive_plan for squash_merge must
+    pass target_pr_number through to derive_target_ref so
+    the durable plan records refs/pull/<N>/head.
+    """
+    plan = mp.derive_plan(
+        mutation_type="squash_merge",
+        mutation_target=None,
+        expected_target_sha=None,
+        expected_main_sha=_full_sha("a"),
+        desired_after_sha=None,
+        target_pr_number=416,
+    )
+    assert plan.target_ref == "refs/pull/416/head"
+
+
 def test_derive_plan_rejects_short_sha():
     with pytest.raises(ValueError):
         mp.derive_plan(

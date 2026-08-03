@@ -56,6 +56,9 @@ from scripts.local import (
 )
 from scripts.local.aed_supervisor_lock import LockOutcome
 from scripts.local.aed_pr_lib import is_full_sha as _is_full_sha
+from scripts.local.aed_run_identity import (
+    canonical_repository_identity as _canon_repo,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +154,54 @@ _CODEX_REPAIR_SENSITIVE_KEYWORDS = frozenset([
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _sanitize_repo_for_scope(repo: str) -> str:
+    """Strip credentials (URL userinfo) from a repository string
+    so it is safe to use as a scope key and persist to disk.
+
+    Round-92 P2 fix (continuation of Round-89 V1BqI):
+    canonical_repository_identity() does NOT strip URL
+    userinfo; it only matches against GitHub regexes (which
+    do not allow userinfo). This helper explicitly removes
+    any userinfo (e.g. `https://alice:token@github.com/owner/name`)
+    before the value reaches the lock or the state. Fail
+    closed: if the cleaned value does NOT canonicalize to
+    an owner/name identity, raise ValueError so the caller
+    refuses the operation.
+
+    Returns the cleaned repository string (typically the
+    owner/name shorthand, or the original if no userinfo
+    was present).
+    """
+    if not repo or not isinstance(repo, str):
+        return repo
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(repo)
+    except (ValueError, TypeError):
+        return repo
+    if not (parsed.username or parsed.password):
+        # No credentials — return as-is.
+        return repo
+    # Reconstruct the URL without userinfo.
+    cleaned = (
+        f"{parsed.scheme}://{parsed.hostname}"
+        + (f":{parsed.port}" if parsed.port else "")
+        + parsed.path
+    )
+    # Validate that the cleaned value canonicalizes to an
+    # owner/name identity. If not, the credentials may have
+    # been hiding critical information; refuse.
+    canonical = _canon_repo(cleaned)
+    if canonical is None:
+        raise ValueError(
+            f"repository URL contains userinfo credentials; "
+            f"strip them before persistence: {repo!r}"
+        )
+    return canonical.shorthand
+
+
 
 
 def _load_state(path: str) -> dict:
@@ -674,7 +725,7 @@ def _init(args: argparse.Namespace) -> None:
             )
             sys.exit(14)
         scope = {
-            "repository": getattr(args, "repository", None) or "",
+            "repository": _sanitize_repo_for_scope(getattr(args, "repository", None) or ""),
             "target_pr_number": getattr(args, "target_pr_number", None),
             "mutation_target": getattr(args, "mutation_target", None),
         }
@@ -4276,7 +4327,7 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
     if rid.get("lock_dir") and not Path(rid["lock_dir"]).is_absolute():
         rid["lock_dir"] = str(Path(rid["lock_dir"]).resolve())
     scope = {
-        "repository": rid.get("repository") or "",
+        "repository": _sanitize_repo_for_scope(rid.get("repository") or ""),
         "target_pr_number": rid.get("target_pr_number"),
         "mutation_target": rid.get("mutation_target"),
     }
@@ -4677,6 +4728,15 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 expected_target_sha=args.expected_target_sha,
                 expected_main_sha=args.expected_main_sha,
                 desired_after_sha=args.desired_after_sha,
+                # Round-93 P2 fix: pass the state's PR number
+                # so the durable plan records the PR
+                # identity as refs/pull/<N>/head for
+                # squash_merge even when --mutation-target
+                # is not given. Falls back to the sentinel
+                # refs/pull//head only if BOTH
+                # --mutation-target and the state's
+                # target_pr_number are absent.
+                target_pr_number=_state_target_pr_number(state),
             )
             plan_dir = Path(args.workspace) / "GUARDED_REF_MUTATIONS"
             plan_dir.mkdir(parents=True, exist_ok=True)
@@ -4971,7 +5031,7 @@ def _recover_stale_lock(args: argparse.Namespace) -> None:
     # Apply CLI overrides for scope (in case legacy state scope
     # was empty but CLI flags give us the scope).
     if not scope.get("repository") and getattr(args, "repository", None):
-        scope["repository"] = args.repository
+        scope["repository"] = _sanitize_repo_for_scope(args.repository)
     if scope.get("target_pr_number") is None and getattr(args, "target_pr_number", None):
         scope["target_pr_number"] = args.target_pr_number
     if not scope.get("mutation_target") and getattr(args, "mutation_target", None):

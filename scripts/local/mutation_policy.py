@@ -113,13 +113,22 @@ def supported_mutation_types() -> tuple:
 # ---------------------------------------------------------------------------
 
 
-def derive_target_ref(mutation_type: str, mutation_target: Optional[str]) -> str:
+def derive_target_ref(
+    mutation_type: str,
+    mutation_target: Optional[str],
+    *,
+    target_pr_number: Optional[int] = None,
+) -> str:
     """Derive the full refname from the mutation_target.
 
     For squash_merge, the mutation_target is the PR number;
     the target ref is refs/pull/<N>/head. If mutation_target
     is None, derive from the policy table's target_ref_template
-    with an empty branch placeholder.
+    with the state's target_pr_number (if provided) so the
+    PR identity is preserved in the durable plan. If neither
+    mutation_target nor target_pr_number is available, the
+    sentinel `refs/pull//head` is emitted (the executor
+    resolves this against the active PR).
     For force_push/push/branch_delete/branch_create_force,
     the mutation_target is a branch name; the target ref is
     refs/heads/<branch>.
@@ -129,10 +138,22 @@ def derive_target_ref(mutation_type: str, mutation_target: Optional[str]) -> str
     policy = POLICY_TABLE[mutation_type]
     if not mutation_target:
         if mutation_type == "squash_merge":
-            # squash_merge without a specific PR: the durable
-            # plan uses a sentinel ref. The executor (Layer 4+)
-            # resolves this against the active PR.
-            return "refs/pull//head"
+            # Round-93 P2 fix: prefer the state's
+            # target_pr_number when mutation_target is
+            # None, so the durable plan records the PR
+            # identity as refs/pull/<N>/head. The previous
+            # code emitted refs/pull//head (empty PR number),
+            # losing the PR identity and leaving the audit
+            # plan unbound. Without this PR identity, no
+            # executor path can resolve the sentinel against
+            # the active PR. Fail closed only if NEITHER
+            # mutation_target nor target_pr_number is
+            # available.
+            if target_pr_number is None:
+                return "refs/pull//head"
+            return policy.target_ref_template.format(
+                branch=target_pr_number
+            )
         raise ValueError(
             f"mutation_target is required for {mutation_type}"
         )
@@ -161,6 +182,7 @@ def derive_plan(
     expected_target_sha: Optional[str],
     expected_main_sha: Optional[str],
     desired_after_sha: Optional[str],
+    target_pr_number: Optional[int] = None,
 ) -> DerivedPlan:
     """Derive the durable plan fields from the CLI inputs.
 
@@ -205,7 +227,11 @@ def derive_plan(
             f"lowercase hex SHA or None; got {desired_after_sha!r}"
         )
 
-    target_ref = derive_target_ref(mutation_type, mutation_target)
+    target_ref = derive_target_ref(
+        mutation_type,
+        mutation_target,
+        target_pr_number=target_pr_number,
+    )
 
     if policy.operation == GrdOp.PUSH_REMOTE:
         # The remote ref must currently point to expected_target_sha.
