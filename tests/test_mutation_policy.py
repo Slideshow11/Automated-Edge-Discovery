@@ -25,6 +25,11 @@ def test_policy_table_covers_all_supported_mutation_types():
         "push",
         "branch_delete",
         "branch_create_force",
+        # Round-112 P0 fix: UPDATE_LOCAL is a legitimate runner
+        # operation (git update-ref). The policy table now
+        # covers it explicitly so journal records with
+        # mutation_type="update_local" bind to UPDATE_LOCAL plans.
+        "update_local",
     }
     assert set(mp.POLICY_TABLE.keys()) == expected
 
@@ -477,3 +482,53 @@ def test_find_outstanding_authorization_raises_for_missing_mutation_id():
             target_ref="refs/heads/feat/x",
             expected_before_sha=_full_sha("a"),
         )
+
+
+def test_round111_mutation_type_to_operation_mapping_is_consistent():
+    """Round-112 P0 fix: the expected-ops mapping in
+    find_outstanding_authorization must be derived from POLICY_TABLE
+    (not a hardcoded dict that can drift). Each mutation_type in
+    POLICY_TABLE must map to a superset of its POLICY_TABLE operation;
+    any other operation must be rejected."""
+    # For each mutation_type in POLICY_TABLE, the binding
+    # accepts any plan operation in the corresponding
+    # expected-ops set. The mapping MUST be derived from
+    # POLICY_TABLE (not hardcoded) so the two cannot drift.
+    for mt in mp.POLICY_TABLE:
+        rec_mt = mt
+        # Build a record for this mutation_type
+        records = [
+            {
+                "mutation_id": "m1",
+                "run_id": "r1",
+                "repository": "owner/name",
+                "mutation_type": rec_mt,
+                "mutation_target": "feat/x",
+                "expected_target_sha": _full_sha("a"),
+                "authorization_status": "AUTHORIZED",
+            }
+        ]
+        # The PLAN's operation MUST equal the POLICY's operation
+        policy_op = mp.get_policy(rec_mt).operation.value
+        out = mp.find_outstanding_authorization(
+            records,
+            mutation_id="m1",
+            owner_run_id="r1",
+            repository="owner/name",
+            target_ref="refs/heads/feat/x",
+            expected_before_sha=_full_sha("a"),
+            plan_operation=policy_op,
+        )
+        assert out.mutation_id == "m1"
+        # A WRONG plan operation MUST be rejected.
+        # Choose a known-bogus operation string.
+        with pytest.raises(mp.AuthorizationBindingError):
+            mp.find_outstanding_authorization(
+                records,
+                mutation_id="m1",
+                owner_run_id="r1",
+                repository="owner/name",
+                target_ref="refs/heads/feat/x",
+                expected_before_sha=_full_sha("a"),
+                plan_operation="THIS_IS_NOT_A_VALID_OPERATION",
+            )

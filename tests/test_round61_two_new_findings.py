@@ -95,9 +95,10 @@ def _write_workspace(
     #   CREATE_LOCAL  -> branch_create_force
     _OP_TO_MUTATION_TYPE = {
         "PUSH_REMOTE": "force_push",
-        "UPDATE_LOCAL": "push",
+        "UPDATE_LOCAL": "update_local",
         "SQUASH_MERGE": "squash_merge",
         "CREATE_LOCAL": "branch_create_force",
+        "DELETE_LOCAL": "branch_delete",
     }
     _mutation_type = _OP_TO_MUTATION_TYPE.get(plan.operation, "force_push")
     auth_record = {

@@ -647,7 +647,40 @@ class GuardedMutationOrchestrator:
         be supplied; both is also acceptable.
         """
         current = grm.LifecycleState(self.plan.status)
-        if current not in TERMINAL_STATES_FOR_RECONCILE:
+        if current not in RECONCILABLE_FROM_STATES:
+            # Round-112 P0 fix (CodeRabbit finding #15): fail
+            # closed when reconcile() is called from a state
+            # outside RECONCILABLE_FROM_STATES. Previously the
+            # set was mis-named TERMINAL_STATES_FOR_RECONCILE
+            # and erroneously contained PREPARED, allowing the
+            # orchestrator to silently bypass the lifecycle
+            # module's PREPARED -> RECONCILING prohibition.
+            raise grm.LifecycleError(
+                f"reconcile() not allowed from {current.value!r}; "
+                f"allowed source states: "
+                f"{sorted(s.value for s in RECONCILABLE_FROM_STATES)}"
+            )
+        # Allow the no-op RECONCILING -> RECONCILING transition
+        # (a reconcile retry while already in RECONCILING is
+        # valid; the lifecycle module's assert_allowed_transition
+        # forbids self-transitions). All other source states in
+        # RECONCILABLE_FROM_STATES have an allowed transition to
+        # RECONCILING, EXCEPT NOT_APPLIED -> RECONCILING which
+        # must walk via PREPARED -> EXECUTING -> RECONCILING.
+        if current == grm.LifecycleState.NOT_APPLIED:
+            # Walk via PREPARED -> EXECUTING -> RECONCILING per
+            # ALLOWED_TRANSITIONS. These self-transitions through
+            # intermediate states are all allowed by the
+            # lifecycle module.
+            self.plan.status = grm.LifecycleState.PREPARED.value
+            _persist_plan(self.plan, self.workspace)
+            self.plan.status = grm.LifecycleState.EXECUTING.value
+            _persist_plan(self.plan, self.workspace)
+            grm.assert_allowed_transition(
+                grm.LifecycleState.EXECUTING,
+                grm.LifecycleState.RECONCILING,
+            )
+        elif current != grm.LifecycleState.RECONCILING:
             grm.assert_allowed_transition(
                 current, grm.LifecycleState.RECONCILING
             )
@@ -684,15 +717,29 @@ class GuardedMutationOrchestrator:
 
 
 # States from which reconcile() can be called.
-TERMINAL_STATES_FOR_RECONCILE = frozenset({
-    grm.LifecycleState.PREPARED,
+# States from which `reconcile()` is allowed. PREPARED is
+# INTENTIONALLY EXCLUDED: a PREPARED plan has not yet been
+# executed, so reconciliation makes no sense and the lifecycle
+# module forbids the PREPARED -> RECONCILING transition (see
+# guarded_ref_mutation.ALLOWED_TRANSITIONS and the test
+# `test_cannot_skip_states`). The orchestrator must walk
+# PREPARED -> EXECUTING -> RECONCILING instead.
+RECONCILABLE_FROM_STATES = frozenset({
     grm.LifecycleState.EXECUTING,
     grm.LifecycleState.RECONCILING,
     grm.LifecycleState.NOT_APPLIED,
     grm.LifecycleState.INDETERMINATE,
 })
 
+# Backward-compat alias: the old name "TERMINAL_STATES_FOR_RECONCILE"
+# was misleading (these are NOT terminal states). Renamed to
+# RECONCILABLE_FROM_STATES. The legacy alias is kept so external
+# callers importing it still work; new code MUST use
+# RECONCILABLE_FROM_STATES.
+TERMINAL_STATES_FOR_RECONCILE = RECONCILABLE_FROM_STATES
+
 
 __all__ = (
     "GuardedMutationOrchestrator",
+    "RECONCILABLE_FROM_STATES",
 )

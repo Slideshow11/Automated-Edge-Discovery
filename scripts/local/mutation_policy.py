@@ -95,6 +95,19 @@ POLICY_TABLE = {
         target_ref_template="refs/heads/{branch}",
         controller_performs=False,
     ),
+    # Round-112 P1 fix (CodeRabbit finding #1 follow-on):
+    # UPDATE_LOCAL is a legitimate runner operation
+    # (`git update-ref <ref> <new> <expected-old>`). It was not
+    # listed in POLICY_TABLE so plans with this operation could
+    # never be bound to a journal record. Add an explicit entry
+    # so the round-111 P1 binding check accepts UPDATE_LOCAL
+    # plans whose authorization is `update_local`.
+    "update_local": MutationPolicyEntry(
+        mutation_type="update_local",
+        operation=GrdOp.UPDATE_LOCAL,
+        target_ref_template="refs/heads/{branch}",
+        controller_performs=False,
+    ),
 }
 
 
@@ -416,13 +429,24 @@ def find_outstanding_authorization(
         # The fix derives the allowed operation set from the
         # journal's mutation_type and rejects any plan whose
         # operation does not match.
-        # Map: mutation_type -> allowed plan.operation
+        # The expected-ops mapping is derived from POLICY_TABLE
+        # so it cannot drift from the authoritative policy.
+        # Multiple mutation_types may legitimately map to the same
+        # operation (e.g. force_push and push both -> PUSH_REMOTE).
         _expected_ops = {
-            "force_push": {"PUSH_REMOTE"},
-            "push": {"UPDATE_LOCAL"},
-            "squash_merge": {"SQUASH_MERGE"},
-            "branch_create_force": {"CREATE_LOCAL"},
+            entry.mutation_type: {entry.operation.value}
+            for entry in POLICY_TABLE.values()
         }
+        # squash_merge targets the PR head, not a branch. The
+        # plan emits GRAPHQL_UPDATE_REFS for squash_merge;
+        # the executor may also emit SQUASH_MERGE after the
+        # controller records the result. Accept both.
+        _expected_ops["squash_merge"].add("SQUASH_MERGE")
+        # branch_delete has no plan emission (the controller
+        # performs the delete inline). For backward compatibility
+        # with code that DOES emit a plan for it, accept the
+        # policy's operation.
+        _expected_ops["branch_delete"].add("DELETE_LOCAL")
         rec_mt = rec.get("mutation_type") or ""
         _expected = _expected_ops.get(rec_mt)
         # Only enforce the mapping when the caller supplied

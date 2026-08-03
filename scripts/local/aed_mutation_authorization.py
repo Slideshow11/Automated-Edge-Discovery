@@ -294,6 +294,14 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
     """Atomically rewrite MUTATIONS.jsonl so that the authorization
     record with the matching mutation_id is replaced with `updated`.
     Other records (journal entries) are preserved."""
+    # Round-112 P0 fix (CodeRabbit finding #1): _rewrite_record
+    # MUST call assert_no_secrets on the updated record before
+    # writing it to disk. Previously only _append_record did
+    # this; the rewrite path silently persisted whatever
+    # record the caller passed in (potentially with embedded
+    # credentials).
+    path = mutations_path(workspace)
+    assert_no_secrets(updated, context=str(path))
     records = _read_all_records(workspace)
     found = False
     new_lines: list[str] = []
@@ -308,7 +316,6 @@ def _rewrite_record(workspace: Path, updated: dict) -> None:
             new_lines.append(json.dumps(rec, sort_keys=True))
     if not found:
         new_lines.append(json.dumps(updated, sort_keys=True))
-    path = mutations_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(

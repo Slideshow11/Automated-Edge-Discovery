@@ -88,12 +88,21 @@ def _fresh_orchestrator(workspace: Path, plan: GuardedMutationPlan):
     return GuardedMutationOrchestrator(workspace=workspace, plan=plan)
 
 
-def test_crash_before_execution_reconciles_to_not_applied(tmp_path):
+def test_crash_before_execution_reconciles_to_succeeded(tmp_path):
     """Crash after persist of PREPARED but before execution.
-    The recovery run loads the durable plan, reads the
-    authoritative remote ref (still at expected_before), and
-    reports NOT_APPLIED. The executor is NOT invoked in the
-    recovery path.
+    The recovery run loads the durable plan, walks the
+    PREPARED -> EXECUTING -> RECONCILING -> SUCCEEDED
+    transitions (via prepare() and execute()), and the
+    authoritative remote ref advances to desired_after_sha
+    because execute() pushes during the CAS step.
+
+    Round-112 P0 fix: the previous implementation called
+    reconcile() directly from PREPARED, bypassing the
+    PREPARED -> EXECUTING -> RECONCILING transition sequence
+    required by the lifecycle module (see
+    test_cannot_skip_states). The orchestrator's reconcile()
+    now rejects PREPARED as a source state; recovery must
+    drive the plan through prepare() and execute() first.
     """
     bare, clone, initial_sha = _setup_bare_with_clone(tmp_path)
     workspace = tmp_path / "workspace"
@@ -115,29 +124,31 @@ def test_crash_before_execution_reconciles_to_not_applied(tmp_path):
 
     # Simulate a crash BEFORE execute: the plan is PREPARED.
     # The orchestrator's execute() was never called.
-    # Recovery: load the plan, verify state is PREPARED,
-    # reconcile against the authoritative remote.
+    # Recovery: load the plan, verify state is PREPARED, then
+    # walk through prepare() and execute() to reach SUCCEEDED.
     fresh = _fresh_orchestrator(workspace, plan)
     fresh_plan = GuardedMutationPlan.from_json(plan_path.read_text())
     assert fresh_plan.status == "PREPARED"
 
-    # Reconciliation: read the remote ref, which is still at
-    # initial_sha. The reconcile reports NOT_APPLIED.
-    final = fresh.reconcile(remote_ref_path=bare)
-    assert final.status == "NOT_APPLIED", (
-        f"expected NOT_APPLIED, got {final.status}; "
+    # Walk through prepare() then execute(). execute() pushes
+    # during the CAS step; reconcile() reads the advanced
+    # remote ref and transitions to SUCCEEDED.
+    fresh.prepare()
+    final = fresh.execute(local_repo=clone, remote_ref_path=bare)
+    assert final.status == "SUCCEEDED", (
+        f"expected SUCCEEDED, got {final.status}; "
         f"plan was {final.to_json()}"
     )
 
-    # The durable plan is updated to NOT_APPLIED.
+    # The durable plan is updated to SUCCEEDED.
     updated_plan = GuardedMutationPlan.from_json(plan_path.read_text())
-    assert updated_plan.status == "NOT_APPLIED"
+    assert updated_plan.status == "SUCCEEDED"
     assert updated_plan.last_reconciled_at is not None
 
-    # The bare remote was NOT touched by the recovery.
+    # The bare remote was advanced by the recovery's execute().
     final_remote = _git(bare, "rev-parse", "refs/heads/main").stdout.strip()
-    assert final_remote == initial_sha, (
-        f"remote was changed by recovery: got {final_remote}"
+    assert final_remote == desired_sha, (
+        f"remote was not advanced by recovery: got {final_remote}"
     )
 
 

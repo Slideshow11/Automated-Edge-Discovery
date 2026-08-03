@@ -218,6 +218,16 @@ def capture_run_identity(
         # canonicalize to the bare owner/name form via
         # canonical_repository_identity.
         from urllib.parse import urlparse
+        # Round-112 P0 fix (CodeRabbit finding #3): the previous
+        # `try / except (ValueError, TypeError) / pass` block
+        # swallowed the ValueError raised below when the
+        # cleaned URL was not canonicalizable. The original
+        # repository variable still contained userinfo
+        # credentials, which then persisted to disk. Fix:
+        # raise the rejection OUTSIDE the try block (using a
+        # captured flag) so the except handler cannot
+        # accidentally swallow it.
+        credential_strip_failed = False
         try:
             parsed = urlparse(repository)
             if parsed.username or parsed.password:
@@ -241,15 +251,17 @@ def capture_run_identity(
                     else:
                         # Last resort: reject userinfo
                         # strings entirely.
-                        raise ValueError(
-                            f"repository URL contains userinfo "
-                            f"credentials; strip them before "
-                            f"persistence: {repository!r}"
-                        )
+                        credential_strip_failed = True
         except (ValueError, TypeError):
             # If urlparse fails (e.g. plain owner/repo),
             # the value is fine.
             pass
+        if credential_strip_failed:
+            raise ValueError(
+                f"repository URL contains userinfo "
+                f"credentials; strip them before "
+                f"persistence: {repository!r}"
+            )
 
     return {
         "run_id": run_id,
@@ -307,6 +319,14 @@ def assert_no_secrets_in_argv(argv: Optional[list[str]] = None, *, context: str 
     """
     Raise ValueError if any argv element is a known secret-bearing
     command-line token or contains a secret pattern.
+
+    Round-112 P0 fix (CodeRabbit finding #4): the previous
+    implementation only flagged a value that BOTH followed a
+    secret-bearing token AND matched a known secret pattern. That
+    was useless for opaque strings (most real credentials don't
+    match the small set of literal patterns). Now any token that
+    follows a secret-bearing argv token is flagged regardless of
+    pattern match.
     """
     if argv is None:
         argv = sys.argv
@@ -316,10 +336,27 @@ def assert_no_secrets_in_argv(argv: Optional[list[str]] = None, *, context: str 
             # Check whether the next arg looks secret-like
             if i + 1 < len(argv):
                 nxt = argv[i + 1]
+                # Flag any value following a known secret-bearing
+                # token regardless of pattern match. This is the
+                # fix: even opaque strings like "abc123def456"
+                # that match no pattern MUST be flagged because
+                # they are the actual credential being passed.
+                pattern_matched = False
                 for pat in _SECRET_PATTERNS:
                     if pat.search(nxt):
-                        violations.append(f"{context}: argv[{i+1}] follows {tok!r}")
+                        pattern_matched = True
                         break
+                if pattern_matched:
+                    violations.append(
+                        f"{context}: argv[{i+1}] follows {tok!r} "
+                        f"and matches a secret pattern"
+                    )
+                else:
+                    violations.append(
+                        f"{context}: argv[{i+1}] follows {tok!r} "
+                        f"(known secret-bearing argv token)"
+                    )
+                break  # do not report the same argv twice
         for pat in _SECRET_PATTERNS:
             if pat.search(tok):
                 violations.append(f"{context}: argv[{i}] matches {pat.pattern!r}")
@@ -604,12 +641,24 @@ def resolve_remote_ref_via_query(
     """
     import re as _re
     result = RemoteRefQueryResult(sha=None, indeterminate=True)
+    # Round-112 P0 fix (CodeRabbit finding #5): add a bounded
+    # timeout to `git ls-remote`. The default subprocess.run
+    # timeout=None means an unresponsive remote, a hung TLS
+    # handshake, or a credential prompt can hang the controller
+    # indefinitely. Use 60s (matches the controller subprocess
+    # timeout convention). On timeout, return an indeterminate
+    # result so the caller treats it as a known-unknown.
     try:
         proc = subprocess.run(
             ["git", "ls-remote", remote_url, ref],
             capture_output=True, text=True, check=True,
+            timeout=60,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
+        return result
+    except subprocess.TimeoutExpired:
+        # Indeterminate: caller treats it as a known-unknown
+        # and may retry with stale-lock recovery.
         return result
     # ls-remote output: "<sha>\t<refname>"
     for line in proc.stdout.splitlines():
