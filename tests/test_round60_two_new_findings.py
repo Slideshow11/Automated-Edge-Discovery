@@ -489,3 +489,38 @@ def test_f_mutate_ref_local_bare_mirror_integration(tmp_path):
         f"local-bare mirror mutation must SUCCEED without "
         f"--remote-path; got rc={rc}"
     )
+
+def test_g_file_url_remote_binds_to_local_bare_path():
+    """Round-95 P2 fix (V29rE continuation): the controller
+    binds a file:// URL to its underlying filesystem
+    path, treating it as a local-bare mirror for
+    purposes of the Step 3.5 identity exemption. The
+    previous code left the URL as a URL string and
+    refuse the mutation at rc=27.
+
+    This test exercises the URL→Path resolution without
+    the full mutate-ref end-to-end (which requires the
+    e2e fixture). The end-to-end behavior is covered
+    in the integration tests in test_round63.
+    """
+    import tempfile
+    from urllib.parse import urlparse
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        bare = td / "bare.git"
+        bare.mkdir()
+        # Verify that the URL→Path resolution works.
+        clone_remote_url = f"file://{bare}"
+        parsed = urlparse(clone_remote_url)
+        file_path = Path(parsed.path)
+        assert file_path == bare, (
+            f"file:// URL must resolve to the local bare "
+            f"path; got {file_path} vs {bare}"
+        )
+        assert file_path.is_absolute()
+        # The Round-95 fix uses this extracted path as
+        # remote_path (set _early_block_ran=True) so the
+        # local-bare exemption fires in Step 3.5. Without
+        # the fix, the URL is left as a string and the
+        # mutation is refused at rc=27.

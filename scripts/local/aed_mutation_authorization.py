@@ -127,6 +127,12 @@ class AuthorizationRequest:
     expected_target_sha: Optional[str]
     pending_action: str
     desired_after_sha: Optional[str] = None
+    # Round-94 P1 fix (V29rD continuation): track the
+    # upgrade target-only lease (if any) acquired
+    # during the PR-to-target upgrade. The lease
+    # owner_run_id is encoded in this field so mutate-ref
+    # can release it after the executor completes.
+    upgrade_target_lease: Optional[dict] = None
 
 
 @dataclass
@@ -507,6 +513,13 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
             "authorization_status": AUTHORIZED,
             "result": None,
         }
+        # Round-94 P1 fix: persist the upgrade target lease
+        # info in the journal record so mutate-ref can
+        # release it after the executor completes. The
+        # field is None when no upgrade happened
+        # (PR-scoped run without target upgrade).
+        if req.upgrade_target_lease is not None:
+            record["upgrade_target_lease"] = req.upgrade_target_lease
         _append_record(workspace, record)
         return AuthorizationOutcome(ok=True, mutation_id=mutation_id, record=record)
     finally:

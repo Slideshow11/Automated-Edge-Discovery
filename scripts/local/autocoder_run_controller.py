@@ -4420,6 +4420,12 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             "branch_delete",
             "branch_create_force",
         }
+        # Round-94 P1 fix: initialize the upgrade target
+        # lease outcome so the AuthorizationRequest
+        # construction below has a value (None when no
+        # upgrade happened; populated by the upgrade
+        # block if it succeeds).
+        _upgrade_target_lease_outcome = None
         if (
             args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
             and not state_mutation_target
@@ -4464,18 +4470,34 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             # mutation_target) tuple. If another run
             # holds it, refuse the upgrade (fail closed).
             target_pr = _state_target_pr_number(state)
-            # Round-79 P1 fix (V0sD0 continuation): probe
-            # BOTH the target-only scope (repo, None,
-            # mutation_target) and the PR+target scope
-            # (repo, target_pr, mutation_target). The
-            # previous Round-73 fix only checked the
-            # PR+target scope, but another controller
-            # could hold the target-only scope (a
-            # --mutation-target main run without a
-            # --target-pr-number). The two scopes have
-            # different scope_keys (since Round-74 includes
-            # mutation_target in the key), so a single
-            # probe would miss the other.
+            # Round-94 P1 fix (V29rD continuation): retain
+            # an actual target lease for the authorization
+            # lifetime, not an acquire-and-release probe.
+            # The previous code released the probe
+            # immediately after checking it, leaving a
+            # window where a target-scoped controller could
+            # acquire the target between the release and
+            # the PR-scoped run's append/execute. The fix
+            # acquires a real target-only lease (under a
+            # separate owner_run_id that is then
+            # transferred to the current run's lease
+            # record) and holds it for the duration of the
+            # authorization. mutate-ref (the executor's
+            # caller) is responsible for releasing the
+            # upgrade target lease after the executor
+            # completes — the release is performed at the
+            # start of mutate-ref's reconciliation
+            # bookkeeping.
+            # The acquire-and-release probe is replaced
+            # with an acquire-and-hold sequence: the
+            # target-only scope is acquired with a
+            # dedicated owner_run_id
+            # ("__target_lease_<run_id>__"), and the lock
+            # file is left on disk for the lifetime of
+            # the authorization. The run's journal record
+            # is annotated with the target_lease
+            # information so the next caller can find and
+            # release it on completion.
             for target_scope in [
                 {
                     "repository": (
@@ -4496,30 +4518,36 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             ]:
                 if not target_scope["repository"]:
                     continue
+                # The owner_run_id encodes the run_id
+                # so the lock is bound to this run.
+                # Use a dedicated prefix to distinguish
+                # the target-only probe from the run's
+                # primary PR scope lock.
                 existing_target_outcome = _supervisor_lock.try_acquire(
                     scope=target_scope,
                     owner_run_id=(
-                        "__round73_check__"
+                        f"__target_lease_{run_id}__"
                     ),
                     owner_host={"hostname": "check", "pid": 0},
                     owner_pid=0,
                     owner_start_evidence={"start_time": 0},
-                    owner_state_path="__check__",
+                    owner_state_path="__target_lease__",
                     base_dir=_resolve_lock_base(
                         args, Path(args.workspace)
                     ),
                 )
                 if existing_target_outcome.ok:
                     # We acquired the target scope. That
-                    # means no other run held it. Release
-                    # our sentinel and proceed with the
-                    # upgrade.
-                    _supervisor_lock.release(
-                        scope=target_scope,
-                        owner_run_id="__round73_check__",
-                        base_dir=_resolve_lock_base(
-                            args, Path(args.workspace)
-                        ),
+                    # means no other run held it. Hold the
+                    # lease for the lifetime of the
+                    # authorization (the lock file remains
+                    # on disk; another controller cannot
+                    # acquire until we release at the end
+                    # of mutate-ref). Track the outcome
+                    # for later release.
+                    _upgrade_target_lease_outcome = (
+                        target_scope,
+                        existing_target_outcome,
                     )
                 else:
                     # Another run holds the target scope.
@@ -4679,6 +4707,16 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             expected_main_sha=args.expected_main_sha,
             expected_target_sha=args.expected_target_sha,
             pending_action=args.pending_action,
+            # Round-94 P1 fix: pass the upgrade target
+            # lease info (if any) so the journal record
+            # persists it. mutate-ref will release the
+            # upgrade target lease after the executor
+            # completes.
+            upgrade_target_lease=(
+                _format_upgrade_target_lease(_upgrade_target_lease_outcome)
+                if _upgrade_target_lease_outcome is not None
+                else None
+            ),
         )
         outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
         if not outcome.ok:
@@ -4858,6 +4896,49 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
         sys.exit(5)
     result = updated.get("result") or {}
     print(f"Recorded mutation result {args.mutation_id} -> {result.get('status')}")
+    # Round-94 P1 fix (V29rD continuation): release the
+    # upgrade target lease if the journal record shows
+    # one. The lease was acquired during the PR-to-target
+    # upgrade in authorize-mutation and held through
+    # mutate-ref; record-mutation-result is the natural
+    # cleanup point (the executor has completed, the
+    # mutation has a terminal result). Best-effort: log
+    # but do not fail if the lease is already gone.
+    _release_upgrade_target_lease_for_record(updated)
+
+
+def _release_upgrade_target_lease_for_record(record: dict) -> None:
+    """Find and release the upgrade target lease (if any)
+    persisted in the journal record.
+
+    Round-94 P1 fix (V29rD continuation): the upgrade
+    target lease is held across authorize-mutation and
+    mutate-ref to prevent a target-scoped controller from
+    acquiring the target between the PR lease's check and
+    the executor's actual mutation. The lease is released
+    here (after the terminal result is recorded) so the
+    target is unblocked for the next controller. The
+    base_dir is left as None (host-wide default); the
+    supervisor lock module's release function finds the
+    lock file by scope_key in the default location.
+    """
+    upgrade = record.get("upgrade_target_lease")
+    if not upgrade:
+        return
+    scope = upgrade.get("scope")
+    owner_run_id = upgrade.get("owner_run_id")
+    if not scope or not owner_run_id:
+        return
+    try:
+        _supervisor_lock.release(
+            scope=scope,
+            owner_run_id=owner_run_id,
+            base_dir=None,
+        )
+    except (OSError, KeyError):
+        # Best-effort: another worker may have already
+        # released the lease. Continue without failing.
+        pass
 
 
 def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
@@ -4876,6 +4957,25 @@ def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
     if rid.get("lock_dir"):
         return Path(rid["lock_dir"])
     return None
+
+
+def _format_upgrade_target_lease(outcome) -> Optional[dict]:
+    """Convert the upgrade target lease probe outcome to a
+    serializable dict for the journal record.
+
+    Round-94 P1 fix: the upgrade target lease is held
+    across authorize-mutation and mutate-ref, and the
+    journal record persists the lease info so mutate-ref
+    can release it after the executor completes.
+    """
+    if outcome is None:
+        return None
+    target_scope, lock_outcome = outcome
+    return {
+        "scope": target_scope,
+        "owner_run_id": lock_outcome.owner.get("owner_run_id"),
+        "path": str(lock_outcome.path) if lock_outcome.path else None,
+    }
 
 
 def _inspect_lock(args: argparse.Namespace) -> None:
@@ -5363,10 +5463,43 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     # runner's `git ls-remote` can use it for
     # reconciliation.
     if clone_remote_url and clone_remote_url.startswith("file://"):
-        # Leave as a URL — the runner will use it via
-        # ls-remote on the same machine, or treat the
-        # underlying path if the runner can resolve it.
-        pass
+        # Round-95 P2 fix (V29rE continuation): extract
+        # the filesystem path from the file:// URL and
+        # bind it as a local-bare mirror. The previous
+        # code left the URL as a URL string, which means
+        # the controller's local-bare exemption is never
+        # installed (resolve_local_repo_remote_identity
+        # returns None for non-GitHub URLs). The result:
+        # every mutate-ref invocation exits 27 before
+        # reaching the runner, even though the runner
+        # explicitly supports file:// pushes and
+        # reconciliation. Extract the underlying
+        # filesystem path and bind it as remote_path
+        # (set _early_block_ran=True) so the local-bare
+        # exemption fires. Keep the original URL as
+        # clone_remote_url so the runner can still use
+        # ls-remote if needed.
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(clone_remote_url)
+            file_path = Path(parsed.path)
+            if file_path.is_absolute() or local_repo:
+                # Resolve relative file:// paths against
+                # the local clone's working directory
+                # (matches Git's behavior for relative
+                # remotes).
+                if not file_path.is_absolute():
+                    file_path = (local_repo / file_path).resolve()
+                # Bind the filesystem path as a local-bare
+                # mirror. The runner's local-path code
+                # path runs unchanged against this path.
+                if remote_path is None:
+                    remote_path = file_path
+                    _early_block_ran = True
+        except (OSError, ValueError):
+            # Leave as a URL — the runner will use it
+            # via ls-remote on the same machine.
+            pass
     if remote_path is None:
         # Thread the configured URL into remote_path so the
         # runner's local-path code path runs unchanged.
