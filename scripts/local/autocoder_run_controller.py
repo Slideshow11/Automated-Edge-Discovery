@@ -4986,6 +4986,20 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             # existing flock rather than re-acquiring it through
             # a second descriptor (which would exhaust retries
             # and leave the authorization stranded).
+            # Round-101 P1 fix (V41aA continuation): when the
+            # plan publication fails AFTER the journal
+            # record is durably appended, the rollback
+            # `record_result()` cancels the authorization
+            # in the journal. The previous code did not
+            # release the upgrade target leases because
+            # the rollback bypasses _record_mutation_result
+            # (which would call _release_upgrade_target_
+            # lease_for_record). The fix: explicitly
+            # release the upgrade target leases AND
+            # remove the dedicated evidence file in the
+            # rollback path. Use a try/finally so the
+            # release happens even if the rollback
+            # itself fails.
             try:
                 _mutation_auth.record_result(
                     Path(args.workspace),
@@ -5012,6 +5026,29 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                     f"outstanding authorization is now stranded",
                     file=sys.stderr,
                 )
+            finally:
+                # Release upgrade target leases and the
+                # dedicated evidence file. The journal
+                # record was just terminated, so the
+                # normal cleanup path (record-mutation-result)
+                # will not be called; we must release
+                # here. Without this, the leases remain
+                # live until stale recovery.
+                for _rb_tlo in _upgrade_target_lease_outcomes:
+                    _rb_ts, _rb_lo = _rb_tlo
+                    try:
+                        _supervisor_lock.release(
+                            scope=_rb_ts,
+                            owner_run_id=_rb_lo.owner.get("owner_run_id"),
+                            base_dir=_lock_base_for_upgrade,
+                        )
+                    except (OSError, KeyError):
+                        pass
+                if _upgrade_state_path is not None:
+                    try:
+                        _upgrade_state_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             sys.exit(24)
         print(f"Authorized mutation {outcome.mutation_id}")
         print(f"  type:                {outcome.record.get('mutation_type')}")
