@@ -4426,6 +4426,8 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
         # no upgrade happened; populated by the upgrade
         # block if it succeeds).
         _upgrade_target_lease_outcomes = []
+        _upgrade_state_path = None  # type: ignore[assignment]
+        _lock_base_for_upgrade = None  # type: ignore[assignment]
         if (
             args.mutation_type in EXECUTOR_PUSHED_MUTATION_TYPES
             and not state_mutation_target
@@ -4746,73 +4748,117 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
             )
             sys.exit(14)
         merge_policy = str(state.get("merge_policy", "stop_before_merge"))
-        if args.mutation_type == "squash_merge":
-            # Round-19 P1 fix: require a full 40-char lowercase hex
-            # SHA (already checked above).
-            # Round-21 P1 fix: require merge_policy=allow_merge.
-            if merge_policy != "allow_merge":
-                print(
-                    "ERROR: cannot authorize mutation: squash_merge "
-                    f"requires merge_policy=allow_merge, but the active "
-                    f"state's merge_policy={merge_policy!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(14)
-            # Round-22 P1 fix: require the active state's
-            # overall_status to be RUN_READY_FOR_SUMMARY. The
-            # earlier checks verified only that args.pending_action
-            # matches the action and that merge_policy is
-            # allow_merge, but neither guarantees the controller
-            # has actually reached the merge-ready phase. If the
-            # status is RUN_ACTIVE (still running tasks),
-            # RUN_BLOCKED (waiting for human), or any non-terminal
-            # state that isn't ready-for-summary, an executor
-            # receiving squash_merge would perform a merge the
-            # controller never selected. RUN_READY_FOR_SUMMARY
-            # means all non-skipped tasks are promoted or ready,
-            # which is the natural precondition for a merge.
-            overall_status = str(state.get("overall_status", ""))
-            if overall_status != "RUN_READY_FOR_SUMMARY":
-                print(
-                    "ERROR: cannot authorize mutation: squash_merge "
-                    f"requires the active state to be "
-                    f"RUN_READY_FOR_SUMMARY, but overall_status="
-                    f"{overall_status!r}",
-                    file=sys.stderr,
-                )
-                sys.exit(14)
-        req = _mutation_auth.AuthorizationRequest(
-            run_id=state.get("run_id", "unknown"),
-            repository=repository,
-            target_pr_number=_state_target_pr_number(state),
-            mutation_target=args.mutation_target or _state_mutation_target(state),
-            mutation_type=args.mutation_type,
-            expected_main_sha=args.expected_main_sha,
-            expected_target_sha=args.expected_target_sha,
-            pending_action=args.pending_action,
-            # Round-94/96 P1 fix: pass the upgrade target
-            # lease info (if any) so the journal record
-            # persists it. mutate-ref will release the
-            # upgrade target lease after the executor
-            # completes. The list contains BOTH the
-            # target-only and PR+target acquisitions so
-            # all leases are released.
-            upgrade_target_lease=(
-                _format_upgrade_target_lease(
-                    _upgrade_target_lease_outcomes
-                    if _upgrade_target_lease_outcomes
-                    else None
-                )
-            ),
-        )
-        outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
-        if not outcome.ok:
-            print(
-                f"ERROR: mutation authorization rejected: {outcome.reason}; "
-                f"existing_mutation_id={outcome.record.get('mutation_id') if outcome.record else None!r}",
-                file=sys.stderr,
+        # Round-97 P1 fix (V31aD continuation): wrap the
+        # post-acquisition checks and authorize call in
+        # a try/finally that releases the upgrade target
+        # leases if any check fails or authorize() rejects
+        # the request. The dedicated evidence file
+        # (UPGRADE_TARGET_LEASE_STATE.json) is also removed
+        # in the failure path. Without this, a later
+        # pending-action or merge-policy mismatch would
+        # leave the upgrade target leases orphaned, blocking
+        # subsequent target-scoped controllers for up to
+        # the seven-day default.
+        _upgrade_leases_recorded = False
+        try:
+            if args.mutation_type == "squash_merge":
+                # Round-19 P1 fix: require a full 40-char lowercase hex
+                # SHA (already checked above).
+                # Round-21 P1 fix: require merge_policy=allow_merge.
+                if merge_policy != "allow_merge":
+                    print(
+                        "ERROR: cannot authorize mutation: squash_merge "
+                        f"requires merge_policy=allow_merge, but the active "
+                        f"state's merge_policy={merge_policy!r}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(14)
+                # Round-22 P1 fix: require the active state's
+                # overall_status to be RUN_READY_FOR_SUMMARY. The
+                # earlier checks verified only that args.pending_action
+                # matches the action and that merge_policy is
+                # allow_merge, but neither guarantees the controller
+                # has actually reached the merge-ready phase. If the
+                # status is RUN_ACTIVE (still running tasks),
+                # RUN_BLOCKED (waiting for human), or any non-terminal
+                # state that isn't ready-for-summary, an executor
+                # receiving squash_merge would perform a merge the
+                # controller never selected. RUN_READY_FOR_SUMMARY
+                # means all non-skipped tasks are promoted or ready,
+                # which is the natural precondition for a merge.
+                overall_status = str(state.get("overall_status", ""))
+                if overall_status != "RUN_READY_FOR_SUMMARY":
+                    print(
+                        "ERROR: cannot authorize mutation: squash_merge "
+                        f"requires the active state to be "
+                        f"RUN_READY_FOR_SUMMARY, but overall_status="
+                        f"{overall_status!r}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(14)
+            req = _mutation_auth.AuthorizationRequest(
+                run_id=state.get("run_id", "unknown"),
+                repository=repository,
+                target_pr_number=_state_target_pr_number(state),
+                mutation_target=args.mutation_target or _state_mutation_target(state),
+                mutation_type=args.mutation_type,
+                expected_main_sha=args.expected_main_sha,
+                expected_target_sha=args.expected_target_sha,
+                pending_action=args.pending_action,
+                # Round-94/96 P1 fix: pass the upgrade target
+                # lease info (if any) so the journal record
+                # persists it. mutate-ref will release the
+                # upgrade target lease after the executor
+                # completes. The list contains BOTH the
+                # target-only and PR+target acquisitions so
+                # all leases are released.
+                upgrade_target_lease=(
+                    _format_upgrade_target_lease(
+                        _upgrade_target_lease_outcomes
+                        if _upgrade_target_lease_outcomes
+                        else None
+                    )
+                ),
             )
-            sys.exit(3)
+            outcome = _mutation_auth.authorize(Path(args.workspace), req, sentinel_fd=sentinel_fd)
+            if not outcome.ok:
+                print(
+                    f"ERROR: mutation authorization rejected: {outcome.reason}; "
+                    f"existing_mutation_id={outcome.record.get('mutation_id') if outcome.record else None!r}",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+            # If authorize() succeeded, the journal record
+            # exists and mutate-ref/record-mutation-result
+            # will release the upgrade target leases via
+            # the upgrade_target_lease field. Mark the leases
+            # as recorded so the finally block skips the
+            # release.
+            _upgrade_leases_recorded = True
+        finally:
+            if not _upgrade_leases_recorded and _upgrade_target_lease_outcomes:
+                # Authorization failed before the journal
+                # record was durably appended. Release the
+                # upgrade target leases and the dedicated
+                # evidence file so the target is unblocked
+                # for the next controller.
+                _cleanup_outcomes = list(_upgrade_target_lease_outcomes)
+                _cleanup_state_path = _upgrade_state_path
+                for _tlo in _cleanup_outcomes:
+                    _ts, _lo = _tlo
+                    try:
+                        _supervisor_lock.release(
+                            scope=_ts,
+                            owner_run_id=_lo.owner.get("owner_run_id"),
+                            base_dir=_lock_base_for_upgrade,
+                        )
+                    except (OSError, KeyError):
+                        pass
+                if _cleanup_state_path is not None:
+                    try:
+                        _cleanup_state_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         assert outcome.record is not None
         # Repair 1: emit the durable GuardedMutationPlan as part
         # of the serialized authorization transaction. The plan
@@ -4992,17 +5038,55 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
     # mutation has a terminal result). Best-effort: log
     # but do not fail if the lease is already gone.
     _release_upgrade_target_lease_for_record(updated)
-    # Round-96 P1 fix: also remove the dedicated upgrade
-    # state file (UPGRADE_TARGET_LEASE_STATE.json). The
-    # file is a side-channel that exists only for the
-    # liveness check; once the leases are released it is
-    # no longer needed.
+    # Round-98 P1 fix (V31aE continuation): only remove
+    # the dedicated upgrade state file
+    # (UPGRADE_TARGET_LEASE_STATE.json) after confirming
+    # that no other outstanding journal record still
+    # references an upgrade lease. The state file is
+    # shared (used as liveness evidence for all
+    # __target_lease_<run_id>__ locks for this
+    # workspace). Removing it prematurely leaves the
+    # other mutations' upgrade leases without
+    # liveness evidence; after the short-lived
+    # authorizer PID exits they can be recovered with
+    # stale-lock replacement, and the original mutation
+    # can no longer pass its normal lease check.
     _upgrade_state_cleanup = (
         Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
     )
     try:
-        _upgrade_state_cleanup.unlink(missing_ok=True)
+        # Count outstanding mutations that still
+        # reference an upgrade lease.
+        with open(Path(args.workspace) / _mutation_auth.MUTATIONS_FILENAME) as _mf:
+            _outstanding_journal = _mf.read().splitlines()
+        _still_using_upgrade = False
+        for _jline in _outstanding_journal:
+            try:
+                _jrec = json.loads(_jline)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if _jrec.get("mutation_id") == args.mutation_id:
+                # This is the current record; the result
+                # was just updated. The upgrade_target_lease
+                # is still in the record (we haven't
+                # removed it). Skip.
+                continue
+            if (
+                _jrec.get("result") is None
+                and _jrec.get("upgrade_target_lease")
+            ):
+                # Another outstanding mutation still
+                # references an upgrade lease. Keep the
+                # state file.
+                _still_using_upgrade = True
+                break
+        if not _still_using_upgrade:
+            _upgrade_state_cleanup.unlink(missing_ok=True)
     except OSError:
+        # Best-effort: if we cannot read the journal,
+        # leave the state file in place. It will be
+        # cleaned up by a future record-mutation-result
+        # call (or by explicit stale-recovery).
         pass
 
 
@@ -6049,6 +6133,70 @@ def _mutate_ref(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(11)
+            # Round-99 P1 fix (V31aF continuation):
+            # revalidate the upgrade target leases (if
+            # any) before the NOT_APPLIED retry's execute()
+            # call. Without this, a concurrent target-scoped
+            # init --replace-stale-lock could have
+            # recovered the upgrade lease while the run was
+            # idle (waiting for the operator to retry). The
+            # PREPARED branch separately revalidates every
+            # journaled upgrade lease; this retry path
+            # omits that check, allowing the old PR-scoped
+            # runner to mutate the branch concurrently with
+            # the replacement target-scoped controller.
+            _retry_matching_journal = None
+            try:
+                with open(
+                    workspace / _mutation_auth.MUTATIONS_FILENAME
+                ) as _retry_mf:
+                    for _retry_jline in _retry_mf.read().splitlines():
+                        try:
+                            _retry_rec = json.loads(_retry_jline)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if (
+                            _retry_rec.get("mutation_id")
+                            == plan.mutation_id
+                        ):
+                            _retry_matching_journal = _retry_rec
+                            break
+            except OSError:
+                pass
+            if _retry_matching_journal is not None:
+                _retry_upgrade = _retry_matching_journal.get(
+                    "upgrade_target_lease"
+                )
+                if _retry_upgrade:
+                    _retry_upgrade_leases = _retry_upgrade.get(
+                        "leases", []
+                    )
+                    if (
+                        not _retry_upgrade_leases
+                        and _retry_upgrade.get("scope")
+                    ):
+                        _retry_upgrade_leases = [_retry_upgrade]
+                    for _retry_lease in _retry_upgrade_leases:
+                        if not is_lease_held_by_run(
+                            scope=_retry_lease["scope"],
+                            owner_run_id=_retry_lease["owner_run_id"],
+                            base_dir=lock_base_for_check,
+                        ):
+                            print(
+                                f"ERROR: cannot execute mutation "
+                                f"(NOT_APPLIED retry): the upgrade "
+                                f"target lease is no longer held by "
+                                f"run_id="
+                                f"{_retry_lease['owner_run_id']!r} for "
+                                f"scope={_retry_lease['scope']!r}. A "
+                                "concurrent recover_stale transferred "
+                                "the lease to a successor run. The "
+                                "current run cannot proceed with the "
+                                "executor; refuse before any protected "
+                                "Git or GitHub mutation.",
+                                file=sys.stderr,
+                            )
+                            sys.exit(11)
             orch.prepare()
             final = orch.execute(
                 local_repo=local_repo,

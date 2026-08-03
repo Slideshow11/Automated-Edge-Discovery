@@ -127,15 +127,12 @@ class AuthorizationRequest:
     expected_target_sha: Optional[str]
     pending_action: str
     desired_after_sha: Optional[str] = None
-    # Round-94 P1 fix (V29rD continuation): track the
-    # upgrade target-only lease (if any) acquired
-    # during the PR-to-target upgrade. The lease
-    # owner_run_id is encoded in this field so mutate-ref
-    # can release it after the executor completes.
-    # The field is a dict {"leases": [...]} containing
-    # both the target-only and PR+target acquisitions
-    # so all leases are released at the end of the
-    # authorization.
+    # The run's run_identity fields are used to construct
+    # the AuthorizationRequest and the persistent journal
+    # record. The upgrade_target_lease field carries the
+    # upgrade target lease info (if any) so mutate-ref
+    # can release the leases after the executor
+    # completes.
     upgrade_target_lease: Optional[dict] = None
 
 
