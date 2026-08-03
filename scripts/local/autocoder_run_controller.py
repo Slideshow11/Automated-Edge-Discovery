@@ -1561,6 +1561,59 @@ def _init(args: argparse.Namespace) -> None:
                             }) + "\n"
                         )
                     workspace_owned_fd = None
+                    # Round-106 P1 fix (Do not unlink a winning
+                    # workspace sentinel during recovery):
+                    # after the O_EXCL re-acquire succeeds,
+                    # re-read the file we just wrote to
+                    # confirm it still has held_by =
+                    # args.run_id. The previous code did NOT
+                    # verify this; a contender who acquired
+                    # the sentinel between our unlink and
+                    # O_EXCL re-acquire would have their
+                    # marker overwritten by our write —
+                    # which is correct, but the loser's
+                    # subsequent cleanup of an unrelated
+                    # workspace path (e.g. an output-state
+                    # or supervisor sentinel they also held)
+                    # could destroy the winner's published
+                    # state. Verify the re-acquired file is
+                    # ours by re-reading it; if not, a
+                    # contender has since re-acquired (race
+                    # recovery collision), fail closed.
+                    try:
+                        with open(workspace_owned_path) as _rf:
+                            _verify = json.loads(_rf.read())
+                    except (OSError, json.JSONDecodeError, ValueError):
+                        _verify = {}
+                    if (
+                        not isinstance(_verify, dict)
+                        or _verify.get("held_by") != args.run_id
+                    ):
+                        # A contender has re-acquired the
+                        # sentinel between our unlink and
+                        # our re-acquire. Their marker is
+                        # now in place; ours was clobbered
+                        # before the check. This is a
+                        # recovery race collision. Fail
+                        # closed and let the operator
+                        # retry.
+                        _verify_held_by = (
+                            _verify.get("held_by")
+                            if isinstance(_verify, dict)
+                            else None
+                        )
+                        print(
+                            f"ERROR: Round-106 P1 recovery "
+                            f"collision: after re-acquiring "
+                            f"the workspace sentinel, the "
+                            f"file's held_by was overwritten "
+                            f"by a concurrent recovery attempt. "
+                            f"Expected {args.run_id!r}, got "
+                            f"{_verify_held_by!r}. Aborting to "
+                            f"prevent clobbering a winner's marker.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(17)
                     break
                 except FileExistsError:
                     if recovery_attempts >= 5:
@@ -1590,20 +1643,155 @@ def _init(args: argparse.Namespace) -> None:
                     json.dumps({
                         "held_by": args.run_id,
                         "out_path": out_path,
+                        "process": proc_evidence,
+                        "created_at": _utcnow(),
                     }) + "\n"
                 )
             out_state_sentinel_fd = None
         except FileExistsError:
-            # Another init currently holds the output-state
-            # path. Reject with rc=17.
+            # Round-106 P1 fix (Recover stale output-state
+            # sentinels after crashes): mirror the
+            # round-103 P1 fix's recovery logic for the
+            # workspace sentinel. If init was killed
+            # after creating this .aed-write-sentinel
+            # but before the success or exception
+            # cleanup unlinked it, the next init for the
+            # same output path would otherwise fail with
+            # rc=17 unconditionally. Now the recovery
+            # path checks the existing sentinel's
+            # recorded process evidence and the same
+            # three recoverability conditions:
+            #   1. --replace-stale-state is set: force
+            #      recovery.
+            #   2. existing held_by == args.run_id:
+            #      same-run retry.
+            #   3. existing pid is dead per os.kill or
+            #      stat_start_time mismatches a live
+            #      /proc/<pid>/stat entry.
+            replace_stale = bool(
+                getattr(args, "replace_stale_state", False)
+            )
+            out_recoverable = False
+            out_recovery_reason = ""
+            out_existing_payload: dict = {}
+            try:
+                with open(out_state_sentinel_path) as _rf:
+                    raw = _rf.read()
+                if raw:
+                    out_existing_payload = json.loads(raw)
+            except (OSError, json.JSONDecodeError):
+                out_existing_payload = {}
+            out_existing_held_by = (
+                out_existing_payload.get("held_by")
+                if isinstance(out_existing_payload, dict) else None
+            )
+            out_existing_process = (
+                out_existing_payload.get("process")
+                if isinstance(out_existing_payload, dict) else None
+            )
+            out_existing_pid = (
+                int(out_existing_process.get("pid"))
+                if isinstance(out_existing_process, dict)
+                and out_existing_process.get("pid") is not None
+                else None
+            )
+            out_existing_start_time = (
+                int(out_existing_process.get("stat_start_time"))
+                if isinstance(out_existing_process, dict)
+                and out_existing_process.get("stat_start_time") is not None
+                else None
+            )
+            if replace_stale:
+                out_recoverable = True
+                out_recovery_reason = (
+                    f"--replace-stale-state set; forced recovery"
+                )
+            elif out_existing_held_by == args.run_id:
+                out_recoverable = True
+                out_recovery_reason = (
+                    f"existing held_by ({out_existing_held_by!r}) "
+                    f"matches args.run_id; same-run retry"
+                )
+            elif out_existing_pid is None or not _supervisor_lock._pid_exists(out_existing_pid):
+                out_recoverable = True
+                out_recovery_reason = (
+                    f"existing owner pid {out_existing_pid!r} is dead; "
+                    f"orphaned sentinel"
+                )
+            else:
+                live_evidence = (
+                    _run_identity.capture_process_start_evidence(
+                        out_existing_pid
+                    )
+                )
+                live_start_time = (
+                    live_evidence.get("stat_start_time")
+                    if isinstance(live_evidence, dict) else None
+                )
+                if (
+                    out_existing_start_time is None
+                    or live_start_time is None
+                    or int(out_existing_start_time) != int(live_start_time)
+                ):
+                    out_recoverable = True
+                    out_recovery_reason = (
+                        f"existing owner pid {out_existing_pid} has "
+                        f"start_time {live_start_time}, expected "
+                        f"{out_existing_start_time}; pid reuse detected"
+                    )
+            if not out_recoverable:
+                print(
+                    f"ERROR: output-state path {out_path!r} is "
+                    f"currently being initialized by another run "
+                    f"(held_by={out_existing_held_by!r}, "
+                    f"pid={out_existing_pid}). Wait for it to "
+                    f"finish, pass --replace-stale-state, or "
+                    f"remove {out_state_sentinel_path!r} to override.",
+                    file=sys.stderr,
+                )
+                sys.exit(17)
             print(
-                f"ERROR: output-state path {out_path!r} is "
-                f"currently being initialized by another run. "
-                f"Wait for it to finish or remove "
-                f"{out_state_sentinel_path!r} to override.",
+                f"NOTE: Round-106 P1 stale-sentinel recovery "
+                f"(output-state): {out_recovery_reason}",
                 file=sys.stderr,
             )
-            sys.exit(17)
+            out_recovery_attempts = 0
+            while True:
+                out_recovery_attempts += 1
+                try:
+                    os.unlink(out_state_sentinel_path)
+                except FileNotFoundError:
+                    pass
+                try:
+                    out_state_sentinel_fd = os.open(
+                        str(out_state_sentinel_path),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0),
+                        0o600,
+                    )
+                    with os.fdopen(out_state_sentinel_fd, "w") as _wf:
+                        _wf.write(
+                            json.dumps({
+                                "held_by": args.run_id,
+                                "out_path": out_path,
+                                "process": proc_evidence,
+                                "created_at": _utcnow(),
+                                "recovered_from": out_existing_held_by,
+                            }) + "\n"
+                        )
+                    out_state_sentinel_fd = None
+                    break
+                except FileExistsError:
+                    if out_recovery_attempts >= 5:
+                        print(
+                            f"ERROR: output-state path {out_path!r} "
+                            f"is currently being initialized by "
+                            f"another run (recovery race; "
+                            f"attempts={out_recovery_attempts}).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(17)
+                    time.sleep(0.05)
         # Round-59 P1 fix (continued): the artifact ownership
         # check below now runs WHILE both sentinels are held,
         # so a delayed second initializer cannot squeeze past
@@ -5029,6 +5217,30 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 expected_main_sha=args.expected_main_sha,
                 expected_target_sha=args.expected_target_sha,
                 pending_action=args.pending_action,
+                # Round-106 P1 fix (Pass the destination SHA into
+                # the authorization request): for force_push,
+                # push, and branch_create_force, the
+                # authorization journal must durably record
+                # the desired_after_sha so the binding code
+                # compares the authz journal against itself
+                # rather than reading the mutable plan file.
+                # Pre-fix, args.desired_after_sha was not
+                # threaded into the request, so
+                # req.desired_after_sha was None and the
+                # journal entry's desired_after_sha was null.
+                # The later binding code at the top of
+                # mutate-ref then fell back to reading
+                # plan.desired_after_sha from the mutable
+                # PLAN.json (which is not in the journal
+                # itself). An operator who modified
+                # PLAN.json after authorize-mutation would
+                # cause mutate-ref to push a SHA that was
+                # never recorded in the authorization
+                # journal. Threading args.desired_after_sha
+                # through here forces the journal entry to
+                # carry the SHA the executor is authorized
+                # to push.
+                desired_after_sha=args.desired_after_sha,
                 # Round-94/96 P1 fix: pass the upgrade target
                 # lease info (if any) so the journal record
                 # persists it. mutate-ref will release the

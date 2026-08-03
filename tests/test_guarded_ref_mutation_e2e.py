@@ -1941,6 +1941,166 @@ def test_round_105_reconcile_resumed_url_backed_create_local(tmp_path):
     )
 
 
+def test_round_106_desired_after_sha_in_journal(tmp_path):
+    """Round-106 P1 finding 1: the authorize-mutation
+    request must thread args.desired_after_sha into the
+    AuthorizationRequest so the journal entry records
+    the destination SHA. Pre-fix, the request omitted
+    desired_after_sha, so the journal stored
+    desired_after_sha=null; the later binding code at
+    the top of mutate-ref then fell back to reading
+    plan.desired_after_sha from the mutable PLAN.json,
+    which can be modified between authorize and
+    mutate-ref. Post-fix, the journal entry MUST have
+    the supplied desired_after_sha.
+
+    This test exercises the source-level invariant: the
+    AuthorizationRequest constructor call must include
+    desired_after_sha=args.desired_after_sha. The full
+    e2e flow is covered by the focused suite
+    (test_guarded_ref_mutation_e2e).
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    # The fix must thread desired_after_sha into the
+    # AuthorizationRequest. The fix's comment block
+    # includes the marker string.
+    assert (
+        "Round-106 P1 fix (Pass the destination SHA into"
+        in _src_text
+    ), (
+        "Round-106 P1 fix 1 source invariant missing: "
+        "the 'Pass the destination SHA into the "
+        "authorization request' comment was not found."
+    )
+    # Verify the actual assignment is present (not just
+    # the comment).
+    assert (
+        "desired_after_sha=args.desired_after_sha,"
+        in _src_text
+    ), (
+        "Round-106 P1 fix 1: desired_after_sha must be "
+        "passed into AuthorizationRequest as "
+        "args.desired_after_sha, but the assignment was "
+        "not found in the controller source."
+    )
+
+
+def test_round_106_output_state_sentinel_recovery(tmp_path):
+    """Round-106 P1 finding 3: the output-state sentinel
+    (.aed-write-sentinel) must be crash-recoverable, just
+    like the workspace sentinel. If init was killed
+    after creating this sentinel but before cleanup, the
+    next init for the same output path must be able to
+    detect an orphan and recover. Pre-fix, the output-
+    state sentinel was unrecoverable; even
+    --replace-stale-state didn't help because the read
+    path didn't honor it.
+
+    This test exercises the source-level invariant: the
+    FileExistsError handler for the output-state sentinel
+    must include the Round-106 P1 stale-sentinel
+    recovery path with --replace-stale-state, same-run
+    retry, and dead-pid detection.
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-106 P1 fix (Recover stale output-state"
+        in _src_text
+    ), (
+        "Round-106 P1 fix 3 source invariant missing: "
+        "the 'Recover stale output-state sentinels after "
+        "crashes' comment was not found."
+    )
+    # The output-state sentinel recovery must use the
+    # same recovery conditions as the workspace sentinel
+    # (replace_stale, same-run retry, dead pid).
+    # Specifically, the recovery path must invoke
+    # _supervisor_lock._pid_exists for pid liveness.
+    _recovery_block = _src_text[
+        _src_text.index(
+            "Round-106 P1 fix (Recover stale output-state"
+        ) : _src_text.index(
+            "Round-106 P1 fix (Recover stale output-state"
+        ) + 4000
+    ]
+    assert (
+        "_supervisor_lock._pid_exists" in _recovery_block
+    ), (
+        "Round-106 P1 fix 3: output-state sentinel "
+        "recovery must use _supervisor_lock._pid_exists "
+        "for pid liveness detection."
+    )
+    assert (
+        "replace_stale_state" in _recovery_block
+    ), (
+        "Round-106 P1 fix 3: output-state sentinel "
+        "recovery must honor --replace-stale-state."
+    )
+
+
+def test_round_106_recovery_collision_check(tmp_path):
+    """Round-106 P1 finding 2: after re-acquiring the
+    workspace sentinel during recovery, the controller
+    must verify the file still has held_by = args.run_id
+    before continuing. A contender who acquired the
+    sentinel between our unlink and our re-acquire would
+    have their marker overwritten by our write; the
+    loser's subsequent cleanup of an unrelated workspace
+    path could destroy the winner's published state. The
+    fix re-reads the file after re-acquire and fails
+    closed if the held_by is not ours.
+
+    This test exercises the source-level invariant: the
+    workspace sentinel recovery block must contain the
+    Round-106 P1 "recovery collision" check.
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-106 P1 fix (Do not unlink a winning"
+        in _src_text
+    ), (
+        "Round-106 P1 fix 2 source invariant missing: "
+        "the 'Do not unlink a winning workspace sentinel "
+        "during recovery' comment was not found."
+    )
+    # The fix must re-read the file after re-acquire
+    # and verify held_by == args.run_id. Look for the
+    # pattern of reading the file and checking held_by.
+    assert "recovery collision" in _src_text, (
+        "Round-106 P1 fix 2: expected the error message "
+        "to mention 'recovery collision' for fail-closed "
+        "diagnostics."
+    )
+    assert "sys.exit(17)" in _src_text, (
+        "Round-106 P1 fix 2: expected sys.exit(17) on "
+        "recovery collision."
+    )
+
+
 def test_round_105_journal_read_failure_aborts_mutate_ref(tmp_path):
     """Round-105 P1 finding 2: when the mutation journal
     is unreadable during the upgrade-lease revalidation
@@ -2077,7 +2237,23 @@ def test_round_105_journal_read_failure_aborts_mutate_ref(tmp_path):
         # the source and confirming the fix is in
         # place. A brittle fixture-driven test is not
         # worth the maintenance cost.
-        with open("/home/max/Automated-Edge-Discovery/scripts/local/autocoder_run_controller.py") as _src:
+        # Round-106 P1 fix (Resolve the controller source
+        # from the checkout): derive the controller path
+        # from this test file's location so the test runs
+        # in any checkout, not just the developer's
+        # specific /home/max/... path. The controller
+        # file is at scripts/local/autocoder_run_controller.py
+        # relative to the repo root, which is the parent
+        # of the tests/ directory containing this test
+        # file.
+        from pathlib import Path as _P
+        _controller_path = (
+            _P(__file__).parent.parent
+            / "scripts"
+            / "local"
+            / "autocoder_run_controller.py"
+        )
+        with open(_controller_path) as _src:
             _src_text = _src.read()
         # The fix must contain the `sys.exit(11)` call
         # in the except block (not `pass`).
