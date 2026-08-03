@@ -371,23 +371,23 @@ class GuardedMutationOrchestrator:
         if remote_ref_path is None and self.plan.operation in (
             grm.Operation.PUSH_REMOTE.value,
             grm.Operation.DELETE_LOCAL.value,
+            # Round-104 P1 fix: also detect URL-backed remotes
+            # for CREATE_LOCAL plans. The CREATE_LOCAL path in
+            # _do_execute() already routes URL-backed creates
+            # through guarded_push (Round-69), but
+            # reconciliation was missing the same detection,
+            # so it fell through to reading the local clone.
+            # A successful remote creation was then either
+            # persisted as NOT_APPLIED (target ref absent
+            # locally) or reported as SUCCEEDED from a stale
+            # local ref that happened to match the desired
+            # SHA. Include CREATE_LOCAL here so the
+            # reconciliation path below also uses ls-remote
+            # on the configured remote URL, the authoritative
+            # source of truth.
+            grm.Operation.CREATE_LOCAL.value,
         ):
-            try:
-                cfg = subprocess.run(
-                    ["git", "-C", str(local_repo),
-                     "config", "--get",
-                     f"remote.{remote}.url"],
-                    capture_output=True, text=True, check=True,
-                )
-                clone_url_check = cfg.stdout.strip() or ""
-                is_url_backed = (
-                    clone_url_check.startswith("http")
-                    or clone_url_check.startswith("git@")
-                    or clone_url_check.startswith("ssh://")
-                    or clone_url_check.startswith("file://")
-                )
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                is_url_backed = False
+            is_url_backed = is_url_backed_remote(local_repo, remote)
         if remote_ref_path is not None and not is_url_backed:
             # Round-90 P1 fix (V1BqG continuation): only use
             # remote_ref_path for reconciliation when the

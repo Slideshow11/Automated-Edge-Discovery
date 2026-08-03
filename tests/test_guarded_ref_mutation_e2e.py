@@ -1655,3 +1655,137 @@ def test_authorize_mutation_rollback_uses_existing_sentinel_fd(tmp_path):
         )
     finally:
         os.chmod(plan_dir, 0o755)
+
+
+def test_round_104_reconcile_url_backed_create_local(tmp_path):
+    """Round-104 P1 fix: for a CREATE_LOCAL plan on a
+    URL-backed remote, reconciliation must use ls-remote
+    against the configured remote URL (the authoritative
+    source of truth), not the local clone. Without the
+    fix, reconciliation fell through to reading the local
+    clone, and if a matching local ref exists, the
+    mutation was reported as SUCCEEDED without observing
+    the authoritative remote state.
+
+    This test directly exercises the
+    GuardedMutationOrchestrator.execute() flow with a
+    real, reachable file:// URL so the executor's
+    guarded_push actually succeeds, then checks that
+    reconciliation correctly observed the REMOTE state
+    (which the local clone's stale ref mirrors):
+
+    1. Set up a bare repo + clone with origin = file://bare
+       (URL-backed, actually reachable).
+    2. Build a CREATE_LOCAL plan for a NEW branch.
+    3. Pre-push the desired ref to origin so the
+       authoritative remote has the ref.
+    4. Set the LOCAL clone's branch to a STALE SHA that
+       does NOT match the desired — this is the
+       decisive test: pre-fix would report NOT_APPLIED
+       from the local ref, post-fix reports SUCCEEDED
+       from the remote ls-remote.
+    5. Run the executor. Verify SUCCEEDED.
+    """
+    import importlib
+    runner_mod = importlib.import_module(
+        "scripts.local.guarded_ref_mutation_runner"
+    )
+    grm_mod = importlib.import_module(
+        "scripts.local.guarded_ref_mutation"
+    )
+
+    # 1. Bare repo + clone with URL-backed (file://) origin.
+    bare = tmp_path / "bare.git"
+    clone = tmp_path / "clone"
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(bare), "-q")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+    _git(tmp_path, "clone", str(bare), str(clone), "-q")
+    _git(clone, "config", "user.email", "test@local")
+    _git(clone, "config", "user.name", "Test")
+    # Use a file:// URL (URL-backed AND reachable).
+    file_url = f"file://{bare}"
+    _git(clone, "remote", "set-url", "origin", file_url)
+    # Seed an initial commit.
+    _git(clone, "commit", "--allow-empty", "-m", "init", "-q")
+    _git(clone, "push", "origin", "refs/heads/main", "-q")
+    initial = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    desired = initial
+
+    # Sanity: the URL-backed detection must work on this
+    # fixture.
+    assert runner_mod.is_url_backed_remote(clone, "origin"), (
+        "test fixture wrong: origin should be URL-backed"
+    )
+
+    # 2. Build a CREATE_LOCAL plan for a NEW branch.
+    new_branch = "feat/round-104-test"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    plan = grm_mod.GuardedMutationPlan(
+        mutation_id="m_round_104",
+        owner_run_id="r104",
+        repository="owner/name",
+        target_ref=f"refs/heads/{new_branch}",
+        operation="CREATE_LOCAL",
+        expected_before_sha=None,
+        desired_after_sha=desired,
+        status="PREPARED",
+        created_at="2026-08-03T16:00:00Z",
+    )
+    # Persist the plan in the same path the orchestrator
+    # uses (GUARDED_REF_MUTATIONS/{mutation_id}.json).
+    from scripts.local.guarded_ref_mutation_runner import (
+        _persist_plan,
+    )
+    _persist_plan(plan, workspace)
+
+    # 3. Pre-push the desired ref to origin so the
+    #    authoritative remote has it. This models
+    #    "the executor's push already succeeded".
+    _git(clone, "push", "origin",
+         f"{desired}:refs/heads/{new_branch}", "-q")
+
+    # 4. Set the LOCAL clone's branch to a STALE SHA
+    #    (something OTHER than the desired) — this is
+    #    the decisive test. Pre-fix would read the
+    #    local ref and report NOT_APPLIED (the ref
+    #    exists but with a stale SHA). Post-fix
+    #    uses ls-remote on origin, which sees the
+    #    desired SHA, and reports SUCCEEDED.
+    stale_sha = "0" * 40  # the zero OID (does not exist)
+    # Don't try to create a literal zero OID branch;
+    # use a different commit instead.
+    _git(clone, "commit", "--allow-empty", "-m", "stale", "-q")
+    stale_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    assert stale_sha != desired, "stale_sha must differ from desired"
+    subprocess.run(
+        ["git", "update-ref", f"refs/heads/{new_branch}", stale_sha],
+        cwd=clone, check=True, capture_output=True,
+    )
+
+    # 5. Run the executor with --remote origin (URL-backed,
+    #    reachable). The executor's guarded_push will see
+    #    the branch already exists at `desired` on origin
+    #    and succeed (the push to file:// is local).
+    #    Reconciliation must then use ls-remote on origin
+    #    and observe desired, reporting SUCCEEDED. Pre-fix
+    #    would read the local ref (stale_sha) and report
+    #    NOT_APPLIED.
+    runner = runner_mod.GuardedMutationOrchestrator(
+        workspace=workspace, plan=plan,
+    )
+    runner.execute(
+        local_repo=clone,
+        remote="origin",
+    )
+    # The fix's invariant: reconciliation MUST observe the
+    # REMOTE state, not the local clone. With a stale local
+    # ref and a fresh remote ref, the result must be
+    # SUCCEEDED (not NOT_APPLIED).
+    assert runner.plan.status == "SUCCEEDED", (
+        f"Round-104 P1 fix missing: plan status was "
+        f"{runner.plan.status!r}, expected SUCCEEDED. "
+        f"Local ref was {stale_sha[:8]}; remote ref was "
+        f"{desired[:8]}. terminal_evidence="
+        f"{runner.plan.terminal_evidence!r}"
+    )
