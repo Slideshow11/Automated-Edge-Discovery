@@ -3337,16 +3337,28 @@ def _finalize_run(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(8)
-            # Round-67 P2 fix (Defer RUN_COMPLETE until the
-            # lease can be released): do NOT mark the state
-            # RUN_COMPLETE here. The lease release is
-            # performed below, AFTER the journal sentinel
-            # is held. Persist RUN_COMPLETE only after the
-            # lease release actually succeeded; otherwise
+            # Round-91 P1 fix (V1xNB continuation): do NOT
+            # re-save the active state here. The state is
+            # already RUN_ACTIVE (loaded from disk at the
+            # top of this function); re-saving it refreshes
+            # the mtime, which assess_liveness() then uses to
+            # declare the lease "alive" even after the
+            # finalizer PID is gone. If the finalizer exits
+            # between this save and the lease release, the
+            # lease becomes orphaned (still present on disk)
+            # but assess_liveness() says the state is fresh,
+            # so recover_stale() rejects a takeover for up
+            # to max_age_seconds. The lease release happens
+            # below, AFTER this try block; the terminal
+            # state save (which writes RUN_COMPLETE) happens
+            # after the release. Both the original state
+            # and the final RUN_COMPLETE state are durable
+            # without this intermediate save.
+            # _save_state(state, args.state)  # REMOVED: round-91
             # the state would be marked complete while the
             # lease remains held, leaving an orphan that
             # blocks the next run for up to seven days.
-            _save_state(state, args.state)
+            # _save_state(state, args.state)  # REMOVED: round-91
         finally:
             # Round-76 P1 fix: the sentinel is released
             # here at the END of the function (after the
