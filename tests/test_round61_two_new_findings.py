@@ -84,16 +84,32 @@ def _write_workspace(
         os.fsync(fd.fileno())
     finally:
         fd.close()
+    # Round-111 P1 fix: derive mutation_type from the plan's
+    # operation so the round-111 binding check
+    # (mutation_type vs plan.operation) accepts the fixture.
+    # Mapping is the inverse of the round-111 fix in
+    # mutation_policy.POLICY_TABLE:
+    #   PUSH_REMOTE   -> force_push
+    #   UPDATE_LOCAL  -> push
+    #   SQUASH_MERGE  -> squash_merge
+    #   CREATE_LOCAL  -> branch_create_force
+    _OP_TO_MUTATION_TYPE = {
+        "PUSH_REMOTE": "force_push",
+        "UPDATE_LOCAL": "push",
+        "SQUASH_MERGE": "squash_merge",
+        "CREATE_LOCAL": "branch_create_force",
+    }
+    _mutation_type = _OP_TO_MUTATION_TYPE.get(plan.operation, "force_push")
     auth_record = {
         "mutation_id": mutation_id,
         "run_id": "r1",
         "repository": repository,
         "target_pr_number": 416,
         "mutation_target": "main",
-        "mutation_type": "force_push",
+        "mutation_type": _mutation_type,
         "expected_main_sha": plan.expected_before_sha,
         "expected_target_sha": plan.expected_before_sha,
-        "pending_action": "force_push",
+        "pending_action": _mutation_type,
         "created_at": "2026-08-02T00:00:00Z",
         "authorization_status": "authorized",
         "result": None,
