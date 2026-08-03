@@ -1780,6 +1780,51 @@ def _init(args: argparse.Namespace) -> None:
                             }) + "\n"
                         )
                     out_state_sentinel_fd = None
+                    # Round-107 P1 fix (Compare-and-delete
+                    # the output-state sentinel): mirror
+                    # the round-106 P1 recovery-collision
+                    # check for the workspace sentinel. After
+                    # the O_EXCL re-acquire succeeds, re-read
+                    # the file we just wrote to confirm it
+                    # still has held_by = args.run_id. A
+                    # contender who acquired the sentinel
+                    # between our unlink and our re-acquire
+                    # would have their marker overwritten by
+                    # our write; the loser's subsequent
+                    # cleanup of an unrelated output-state
+                    # path could destroy the winner's
+                    # published state. Verify the re-acquired
+                    # file is ours; if not, a contender has
+                    # since re-acquired (race recovery
+                    # collision), fail closed.
+                    try:
+                        with open(out_state_sentinel_path) as _rf:
+                            _out_verify = json.loads(_rf.read())
+                    except (OSError, json.JSONDecodeError, ValueError):
+                        _out_verify = {}
+                    if (
+                        not isinstance(_out_verify, dict)
+                        or _out_verify.get("held_by") != args.run_id
+                    ):
+                        _out_verify_held_by = (
+                            _out_verify.get("held_by")
+                            if isinstance(_out_verify, dict)
+                            else None
+                        )
+                        print(
+                            f"ERROR: Round-107 P1 recovery "
+                            f"collision (output-state): after "
+                            f"re-acquiring the output-state "
+                            f"sentinel, the file's held_by "
+                            f"was overwritten by a concurrent "
+                            f"recovery attempt. Expected "
+                            f"{args.run_id!r}, got "
+                            f"{_out_verify_held_by!r}. Aborting "
+                            f"to prevent clobbering a winner's "
+                            f"marker.",
+                            file=sys.stderr,
+                        )
+                        sys.exit(17)
                     break
                 except FileExistsError:
                     if out_recovery_attempts >= 5:
@@ -4913,16 +4958,66 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 # multiple target scopes can be acquired
                 # with the same owner_run_id, the state
                 # file is shared.
-                _upgrade_state_path.write_text(
-                    json.dumps(
-                        {
-                            "run_identity": {
-                                "run_id": f"__target_lease_{run_id}__",
-                            },
-                            "updated_at": "2026-01-01T00:00:00Z",
-                        }
-                    )
+                #
+                # Round-107 P1 fix (Publish shared upgrade
+                # evidence atomically): the previous code
+                # used Path.write_text() which TRUNCATES
+                # the target file before writing it. A
+                # kill, disk-full error, or other write
+                # failure mid-write leaves the previous
+                # contents truncated to zero bytes — and
+                # other readers see an empty file as if
+                # the evidence had been destroyed. The
+                # atomic-publish pattern writes to a
+                # sibling .tmp file, fsyncs the file and
+                # its directory (so the metadata is
+                # durable), then os.replace()s the
+                # tmp file onto the target. os.replace()
+                # is atomic on POSIX within a single
+                # filesystem, so other readers either see
+                # the OLD file or the NEW file, never a
+                # half-written one.
+                _tmp = _upgrade_state_path.with_suffix(
+                    _upgrade_state_path.suffix + ".tmp"
                 )
+                try:
+                    with open(_tmp, "w") as _tmp_f:
+                        _tmp_f.write(
+                            json.dumps(
+                                {
+                                    "run_identity": {
+                                        "run_id": f"__target_lease_{run_id}__",
+                                    },
+                                    "updated_at": "2026-01-01T00:00:00Z",
+                                }
+                            )
+                        )
+                        _tmp_f.flush()
+                        try:
+                            os.fsync(_tmp_f.fileno())
+                        except OSError:
+                            # fsync may fail on some
+                            # filesystems; tolerate.
+                            pass
+                    try:
+                        os.replace(str(_tmp), str(_upgrade_state_path))
+                    except OSError:
+                        # If os.replace fails, try
+                        # unlinking the tmp so we don't
+                        # leave garbage.
+                        try:
+                            os.unlink(str(_tmp))
+                        except OSError:
+                            pass
+                        raise
+                except OSError:
+                    # If the atomic write fails, fall
+                    # back to the run's state file (the
+                    # older behavior). The liveness check
+                    # will report a mismatch but the
+                    # executor's revalidation will still
+                    # find the lease.
+                    _upgrade_state_path = None
             except OSError:
                 # If the state file cannot be written,
                 # fall back to the run's state file. The
@@ -5484,6 +5579,72 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
 
 
 def _record_mutation_result(args: argparse.Namespace) -> None:
+    # Round-107 P1 fix (Keep journal serialization through
+    # evidence cleanup): the upgrade-state cleanup scan
+    # below iterates the journal to detect other
+    # outstanding upgrade leases before removing the
+    # shared state file. The pre-fix code called
+    # _mutation_auth.record_result() FIRST (which
+    # releases the journal sentinel as part of its
+    # internal finally block) and then did the scan.
+    # Between the sentinel release and the scan, a new
+    # authorize-mutation could acquire the journal
+    # sentinel, create its upgrade evidence, and acquire
+    # its target leases — but NOT yet append its journal
+    # record (the append is the last step of
+    # authorize()). The scan sees no other outstanding
+    # upgrade, unlinks the evidence, and the new
+    # mutation's leases immediately become non-live.
+    # The fix: perform the scan BEFORE calling
+    # record_result() so that the journal sentinel held
+    # by the controller's main flow is still effective
+    # during the scan, serializing against any concurrent
+    # authorize-mutation. (The cleanup logic is
+    # idempotent — if a new mutation's record appears
+    # after the scan but before the unlink, the next
+    # record_result() or init call will still find the
+    # state file if any other upgrade record exists.)
+    _upgrade_state_cleanup = (
+        Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
+    )
+    try:
+        # Count outstanding mutations that still
+        # reference an upgrade lease. This scan runs
+        # BEFORE record_result() so the journal sentinel
+        # is held by the controller's main flow (it has
+        # not been released yet by record_result's
+        # internal finally block).
+        with open(Path(args.workspace) / _mutation_auth.MUTATIONS_FILENAME) as _mf:
+            _outstanding_journal = _mf.read().splitlines()
+        _still_using_upgrade = False
+        for _jline in _outstanding_journal:
+            try:
+                _jrec = json.loads(_jline)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            # Note: at this point the current mutation's
+            # record still has result=None (the result
+            # hasn't been updated yet). We skip records
+            # that reference an upgrade lease but have a
+            # final result so we don't count ourselves.
+            if _jrec.get("mutation_id") == args.mutation_id:
+                # Skip our own (pre-result) record.
+                continue
+            if (
+                _jrec.get("result") is None
+                and _jrec.get("upgrade_target_lease")
+            ):
+                # Another outstanding mutation still
+                # references an upgrade lease. Keep the
+                # state file.
+                _still_using_upgrade = True
+                break
+    except OSError:
+        # Best-effort: if we cannot read the journal,
+        # leave the state file in place. It will be
+        # cleaned up by a future record-mutation-result
+        # call (or by explicit stale-recovery).
+        _still_using_upgrade = True
     try:
         updated = _mutation_auth.record_result(
             Path(args.workspace),
@@ -5524,43 +5685,16 @@ def _record_mutation_result(args: argparse.Namespace) -> None:
     # authorizer PID exits they can be recovered with
     # stale-lock replacement, and the original mutation
     # can no longer pass its normal lease check.
-    _upgrade_state_cleanup = (
-        Path(args.workspace) / "UPGRADE_TARGET_LEASE_STATE.json"
-    )
-    try:
-        # Count outstanding mutations that still
-        # reference an upgrade lease.
-        with open(Path(args.workspace) / _mutation_auth.MUTATIONS_FILENAME) as _mf:
-            _outstanding_journal = _mf.read().splitlines()
-        _still_using_upgrade = False
-        for _jline in _outstanding_journal:
-            try:
-                _jrec = json.loads(_jline)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if _jrec.get("mutation_id") == args.mutation_id:
-                # This is the current record; the result
-                # was just updated. The upgrade_target_lease
-                # is still in the record (we haven't
-                # removed it). Skip.
-                continue
-            if (
-                _jrec.get("result") is None
-                and _jrec.get("upgrade_target_lease")
-            ):
-                # Another outstanding mutation still
-                # references an upgrade lease. Keep the
-                # state file.
-                _still_using_upgrade = True
-                break
-        if not _still_using_upgrade:
+    # Round-107 P1 fix (continued): the scan above
+    # happens BEFORE record_result() so the journal
+    # sentinel is held during the scan. Now unlink the
+    # state file only if the scan confirmed no other
+    # upgrade record exists.
+    if not _still_using_upgrade:
+        try:
             _upgrade_state_cleanup.unlink(missing_ok=True)
-    except OSError:
-        # Best-effort: if we cannot read the journal,
-        # leave the state file in place. It will be
-        # cleaned up by a future record-mutation-result
-        # call (or by explicit stale-recovery).
-        pass
+        except OSError:
+            pass
 
 
 def _release_upgrade_target_lease_for_record(record: dict) -> None:

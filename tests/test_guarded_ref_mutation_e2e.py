@@ -1941,6 +1941,205 @@ def test_round_105_reconcile_resumed_url_backed_create_local(tmp_path):
     )
 
 
+def test_round_107_atomic_evidence_publish(tmp_path):
+    """Round-107 P1 finding 2: the shared upgrade
+    evidence file (UPGRADE_TARGET_LEASE_STATE.json)
+    must be published atomically (write to .tmp +
+    fsync + os.replace), not via Path.write_text()
+    which truncates the target before writing and can
+    leave a half-written file if the process is killed
+    mid-write. Pre-fix, a kill between truncate and
+    write would leave the file empty, causing every
+    upgrade-leased mutation in the workspace to fail
+    liveness checks and require explicit stale-lock
+    recovery.
+
+    This test exercises the source-level invariant: the
+    authorize-mutation path must use the atomic
+    write+fsync+rename pattern instead of
+    _upgrade_state_path.write_text().
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-107 P1 fix (Publish shared upgrade"
+        in _src_text
+    ), (
+        "Round-107 P1 fix 2 source invariant missing: "
+        "the 'Publish shared upgrade evidence atomically' "
+        "comment was not found."
+    )
+    # The atomic-publish pattern must use os.replace
+    # (atomic on POSIX within a single filesystem).
+    # Locate the upgrade-state-path write block.
+    assert "_upgrade_state_path.write_text" not in _src_text, (
+        "Round-107 P1 fix 2: _upgrade_state_path."
+        "write_text() is still present in the controller "
+        "source. The atomic-publish fix must replace it "
+        "with the tmp+fsync+rename pattern."
+    )
+    assert "os.replace(str(_tmp)" in _src_text, (
+        "Round-107 P1 fix 2: expected os.replace() in "
+        "the atomic-publish pattern for the upgrade "
+        "state file, but it was not found."
+    )
+
+
+def test_round_107_journal_serialization_before_cleanup(tmp_path):
+    """Round-107 P1 finding 3: in _record_mutation_result,
+    the upgrade-state cleanup scan (which decides
+    whether to unlink UPGRADE_TARGET_LEASE_STATE.json)
+    must run BEFORE _mutation_auth.record_result() so
+    the journal sentinel is still held during the scan.
+    Pre-fix, the scan ran AFTER record_result (which
+    released the sentinel), allowing a concurrent
+    authorize-mutation to interleave between the
+    sentinel release and the cleanup scan, leading the
+    scan to see no other outstanding upgrade and
+    unlink the state file prematurely.
+
+    This test exercises the source-level invariant: the
+    journal scan must appear in the function body
+    BEFORE the call to _mutation_auth.record_result().
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-107 P1 fix (Keep journal serialization"
+        in _src_text
+    ), (
+        "Round-107 P1 fix 3 source invariant missing: "
+        "the 'Keep journal serialization through "
+        "evidence cleanup' comment was not found."
+    )
+    # Locate _record_mutation_result function and
+    # verify the scan comes BEFORE record_result.
+    # _mutation_auth.record_result appears in multiple
+    # contexts (rollback handler at line ~5513, the
+    # function we're testing at line ~5649, and the
+    # doc comment). Find the first occurrence INSIDE
+    # _record_mutation_result.
+    _fn_start = _src_text.index("def _record_mutation_result")
+    # Find the next top-level def after this one.
+    _next_def_search = _fn_start + 1
+    while True:
+        _next_def_search = _src_text.find("\ndef ", _next_def_search)
+        if _next_def_search < 0:
+            _fn_end = len(_src_text)
+            break
+        # Verify this is a top-level function (not a
+        # nested def). Top-level defs are at column 0.
+        if _src_text[_next_def_search + 1 : _next_def_search + 4] != "def":
+            _next_def_search += 1
+            continue
+        # Top-level def names are aligned to column 0
+        # after the newline. Check by looking at the
+        # character at position _next_def_search + 5
+        # (after "def ").
+        if (
+            _src_text[_next_def_search + 5 : _next_def_search + 6].isalpha()
+            or _src_text[_next_def_search + 5 : _next_def_search + 6] == "_"
+        ):
+            _fn_end = _next_def_search
+            break
+        _next_def_search += 1
+    _fn_body = _src_text[_fn_start:_fn_end]
+    # Find the scan (first MUTATIONS_FILENAME reference in
+    # the function body) and the actual record_result
+    # call (must be _mutation_auth.record_result(
+    # followed by an open paren — not a docstring).
+    scan_pos = _fn_body.index("_mutation_auth.MUTATIONS_FILENAME")
+    # The actual call is the occurrence with a `(` after
+    # `record_result`. The first occurrence is in the
+    # docstring comment.
+    record_call_pos = -1
+    for _p in range(len(_fn_body)):
+        if (
+            _fn_body[_p : _p + 30] == "_mutation_auth.record_result(\n"
+            or _fn_body[_p : _p + 30] == "_mutation_auth.record_result("
+        ):
+            record_call_pos = _p
+            break
+    if record_call_pos < 0:
+        raise AssertionError(
+            "could not locate _mutation_auth.record_result "
+            "call inside _record_mutation_result"
+        )
+    assert (
+        scan_pos < record_call_pos
+    ), (
+        "Round-107 P1 fix 3: the cleanup scan (which "
+        "reads MUTATIONS_FILENAME) MUST run BEFORE the "
+        "call to _mutation_auth.record_result() so the "
+        "journal sentinel is held during the scan. "
+        f"Scan at byte {scan_pos} must come before "
+        f"record_result call at byte {record_call_pos}."
+    )
+
+
+def test_round_107_output_state_recovery_collision(tmp_path):
+    """Round-107 P1 finding 1 (compare-and-delete the
+    output-state sentinel): the round-106 output-state
+    sentinel recovery path didn't have the
+    recovery-collision check that was added for the
+    workspace sentinel (round-106 P1 finding 2).
+    Without it, two initializers concurrently
+    recovering the same stale output-state sentinel
+    could each unlink-then-reacquire, with the second
+    contender deleting the first contender's fresh
+    marker. Post-fix, the recovery path re-reads the
+    re-acquired file and fails closed if held_by is
+    not ours.
+    """
+    from pathlib import Path as _P
+    _controller_path = (
+        _P(__file__).parent.parent
+        / "scripts"
+        / "local"
+        / "autocoder_run_controller.py"
+    )
+    with open(_controller_path) as _src:
+        _src_text = _src.read()
+    assert (
+        "Round-107 P1 fix (Compare-and-delete"
+        in _src_text
+    ), (
+        "Round-107 P1 fix 1 source invariant missing: "
+        "the 'Compare-and-delete the output-state "
+        "sentinel' comment was not found."
+    )
+    # The fix must verify held_by after re-acquire in
+    # the output-state recovery path.
+    _rec_start = _src_text.index(
+        "Round-107 P1 fix (Compare-and-delete"
+    )
+    _rec_end = _src_text.find(
+        "Round-107", _rec_start + 100
+    )
+    _rec_block = _src_text[_rec_start : (
+        _rec_end if _rec_end > 0 else _rec_start + 3000
+    )]
+    assert "_out_verify" in _rec_block, (
+        "Round-107 P1 fix 1: output-state recovery "
+        "collision check must re-read the re-acquired "
+        "file and verify held_by (variable _out_verify)."
+    )
+
+
 def test_round_106_desired_after_sha_in_journal(tmp_path):
     """Round-106 P1 finding 1: the authorize-mutation
     request must thread args.desired_after_sha into the
