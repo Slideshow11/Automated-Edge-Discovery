@@ -3813,14 +3813,40 @@ def _finalize_run(args: argparse.Namespace) -> None:
             # blocks the next run for up to seven days.
             # _save_state(state, args.state)  # REMOVED: round-91
         finally:
-            # Round-76 P1 fix: the sentinel is released
-            # here at the END of the function (after the
-            # lease release and the terminal state save
-            # in the post-finally block below). The
-            # post-finally block (lines after this function)
-            # performs the lease release; we want the
-            # sentinel to be held through that release.
-            pass
+            # Round-110 P1 fix (Release the journal lock
+            # when finalization is refused): the previous
+            # `finally: pass` was a no-op, so any
+            # sys.exit(8) inside the try block (workspace
+            # not a directory, sentinel acquire failed,
+            # outstanding mutations present) leaked the
+            # sentinel fd. When the public main([...]) is
+            # called repeatedly in one Python process,
+            # main catches SystemExit and the leaked
+            # flock causes the subsequent
+            # record-mutation-result call to fail with
+            # "mutation journal lock busy". The fix
+            # releases the sentinel fd in the finally
+            # block (the early-exit path) AS WELL AS at
+            # the end of the function (the normal path,
+            # preserved for the round-76 invariant that
+            # the sentinel is held through the lease
+            # release).
+            if sentinel_fd is not None and sentinel_path is not None:
+                from scripts.local.aed_supervisor_lock import (
+                    _release_sentinel_fd,
+                )
+                _release_sentinel_fd(sentinel_fd, sentinel_path)
+                sentinel_fd = None
+            # NOTE: the previous round-76 end-of-function
+            # release (around line 4018) is PRESERVED for
+            # the success path. The sentinel is acquired
+            # here, released in this finally on early
+            # exit, and released at the end of the
+            # function on the success path. The round-76
+            # test_e_journal_sentinel_released_at_end_of_finalize
+            # invariant still holds because the normal
+            # release at the end of the function is
+            # unchanged.
     else:
         # workspace is NOT a directory; the earlier
         # guard already printed the error and exited.

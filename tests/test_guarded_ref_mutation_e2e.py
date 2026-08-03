@@ -1941,6 +1941,69 @@ def test_round_105_reconcile_resumed_url_backed_create_local(tmp_path):
     )
 
 
+def test_round_110_release_journal_lock_on_finalize_refused(tmp_path):
+    """Round-110 P2 fix: when finalize-run is refused
+    (sys.exit(8) on outstanding mutations, sentinel
+    acquire failure, or missing workspace), the journal
+    sentinel fd must be released in the finally block.
+    Pre-fix, the finally block was `pass` (a no-op),
+    so any sys.exit(8) inside the try block leaked the
+    sentinel fd. In the public main([...]) entry point,
+    main catches SystemExit, so the leaked flock
+    caused the subsequent record-mutation-result call
+    to fail with "mutation journal lock busy".
+
+    This test exercises the source-level invariant: the
+    _finalize_run function's finally block must release
+    the sentinel fd (not be a no-op). The round-76
+    end-of-function release is preserved for the
+    success path.
+    """
+    import inspect
+    from scripts.local import autocoder_run_controller as ctrl_mod
+    src = inspect.getsource(ctrl_mod._finalize_run)
+    assert (
+        "Round-110 P1 fix (Release the journal lock"
+        in src
+    ), (
+        "Round-110 P1 fix source invariant missing: "
+        "the 'Release the journal lock when finalization "
+        "is refused' comment was not found."
+    )
+    _is_dir_finally_start = src.find(
+        "finally:\n            # Round-110 P1 fix"
+    )
+    assert _is_dir_finally_start > 0, (
+        "Round-110 P1 fix: could not locate the "
+        "finally block in _finalize_run's "
+        "workspace.is_dir() branch."
+    )
+    # The body ends just before the next `else:` (which
+    # is the else branch of the workspace.is_dir() if).
+    _is_dir_finally_end = src.find("\n    else:", _is_dir_finally_start)
+    if _is_dir_finally_end < 0:
+        _is_dir_finally_end = len(src)
+    _is_dir_finally_body = src[
+        _is_dir_finally_start : _is_dir_finally_end
+    ]
+    assert (
+        "_release_sentinel_fd(sentinel_fd, sentinel_path)"
+        in _is_dir_finally_body
+    ), (
+        "Round-110 P1 fix: the finally block in the "
+        "workspace.is_dir() branch must release the "
+        "sentinel fd (not be a no-op pass)."
+    )
+    assert (
+        "_release_journal_sentinel(sentinel_fd, sentinel_path)"
+        in src
+    ), (
+        "Round-110 P1 fix: the end-of-function "
+        "_release_journal_sentinel() call must be "
+        "preserved for the round-76 invariant."
+    )
+
+
 def test_round_109_preserve_shared_evidence_on_cleanup(tmp_path):
     """Round-109 P1 fix: when authorize-mutation's
     post-acquisition checks fail (or the durable plan
