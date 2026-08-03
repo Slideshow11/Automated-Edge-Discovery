@@ -4637,6 +4637,28 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 else:
                     # Another run holds the target scope.
                     # Refuse the upgrade (fail closed).
+                    # Round-100 P1 fix: release any leases
+                    # already acquired in this loop
+                    # iteration before exiting. The previous
+                    # code left the first-iteration lease
+                    # (e.g. target-only) orphaned when the
+                    # second iteration (PR+target) was held
+                    # by another controller.
+                    for _tlo in _upgrade_target_lease_outcomes:
+                        _ts, _lo = _tlo
+                        try:
+                            _supervisor_lock.release(
+                                scope=_ts,
+                                owner_run_id=_lo.owner.get("owner_run_id"),
+                                base_dir=_lock_base_for_upgrade,
+                            )
+                        except (OSError, KeyError):
+                            pass
+                    if _upgrade_state_path is not None:
+                        try:
+                            _upgrade_state_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     holder_owner = (
                         existing_target_outcome.owner.get("owner_run_id")
                         if isinstance(existing_target_outcome.owner, dict)
