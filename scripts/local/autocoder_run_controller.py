@@ -5552,6 +5552,48 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, plan_path)
+            # Round-111 P2 fix (Fsync the plan directory
+            # before reporting authorization): the
+            # previous code fsynced the file but not the
+            # directory. If the host loses power after the
+            # os.replace() but before the directory entry
+            # is durable, the journal record is durable
+            # (the file's contents are fsynced) but the
+            # directory entry for the new plan file is
+            # not — so on reboot the plan file is missing
+            # from the directory listing. mutate-ref then
+            # exits 20 ("no durable plan") and the run is
+            # stuck until an operator manually records
+            # the failure. Fsync the directory so the new
+            # entry is durable before authorize-mutation
+            # returns to the caller.
+            try:
+                _dfd = os.open(
+                    str(plan_dir),
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except (OSError, NotImplementedError, AttributeError):
+                # fsync on directory may fail on some
+                # filesystems; the worst-case is a
+                # power-loss leaving the journal durable
+                # but the directory entry missing, which
+                # is exactly the pre-fix bug. Log so the
+                # operator can detect a persistent
+                # host-level configuration issue.
+                import sys as _sys
+                print(
+                    f"WARNING: Round-111 P2 fix: could not "
+                    f"fsync plan directory {plan_dir}; the "
+                    f"plan file may be missing after a "
+                    f"power-loss event",
+                    file=_sys.stderr,
+                )
         except (ValueError, KeyError, OSError) as plan_err:
             # Repair 6: if plan publication failed AFTER the
             # journal append succeeded, the authorization record
@@ -5821,7 +5863,16 @@ def _record_mutation_result_locked(args: argparse.Namespace, sentinel_fd: int) -
     # cleanup point (the executor has completed, the
     # mutation has a terminal result). Best-effort: log
     # but do not fail if the lease is already gone.
-    _release_upgrade_target_lease_for_record(updated)
+    #
+    # Round-111 P1 fix (Check upgrade lease releases
+    # before deleting evidence): the helper now returns
+    # a bool indicating whether ALL leases were released.
+    # When ANY release() returned False (sentinel busy),
+    # the evidence file MUST be preserved so the lease
+    # is still findable by the next controller or by
+    # explicit stale-recovery. Otherwise the lease
+    # would be orphaned without liveness evidence.
+    _all_leases_released = _release_upgrade_target_lease_for_record(updated)
     # Round-98 P1 fix (V31aE continuation): only remove
     # the dedicated upgrade state file
     # (UPGRADE_TARGET_LEASE_STATE.json) after confirming
@@ -5839,15 +5890,37 @@ def _record_mutation_result_locked(args: argparse.Namespace, sentinel_fd: int) -
     # happens BEFORE record_result() so the journal
     # sentinel is held during the scan. Now unlink the
     # state file only if the scan confirmed no other
-    # upgrade record exists.
-    if not _still_using_upgrade:
+    # upgrade record exists AND the lease releases
+    # succeeded. If ANY lease release failed, the
+    # evidence must be preserved so subsequent
+    # controllers can find the orphaned lease.
+    if not _still_using_upgrade and _all_leases_released:
         try:
             _upgrade_state_cleanup.unlink(missing_ok=True)
         except OSError:
             pass
+    elif not _all_leases_released:
+        # Round-111 P1 fix: at least one release()
+        # returned False. Preserve the evidence so the
+        # lease is still findable by stale-recovery.
+        # Log a clear error so the operator can
+        # intervene (the next controller may try to
+        # acquire the same target and fail until the
+        # lock is manually cleaned up).
+        print(
+            f"WARNING: Round-111 P1: at least one upgrade "
+            f"lease release returned False (sentinel busy "
+            f"or owner_run_id mismatch); preserving "
+            f"{_upgrade_state_cleanup!r} so the lease "
+            f"remains discoverable. Operator should "
+            f"verify the lease state on disk and consider "
+            f"explicit stale-recovery if the upgrade path "
+            f"is permanently stuck.",
+            file=sys.stderr,
+        )
 
 
-def _release_upgrade_target_lease_for_record(record: dict) -> None:
+def _release_upgrade_target_lease_for_record(record: dict) -> bool:
     """Find and release the upgrade target lease (if any)
     persisted in the journal record.
 
@@ -5864,13 +5937,24 @@ def _release_upgrade_target_lease_for_record(record: dict) -> None:
     with the second, leaving the target-only lease
     permanently locked).
 
-    Best-effort: if a lease is already gone (e.g. a
-    concurrent worker released it), the helper logs but
-    does not fail the controller.
+    Round-111 P1 fix (Check upgrade lease releases before
+    deleting evidence): the previous implementation
+    silently treated release() returning False as a
+    success (it only checked for OSError / KeyError
+    exceptions). When release() returns False the sentinel
+    is busy (another worker is holding it) and the lease
+    is NOT actually released. _record_mutation_result_locked
+    then proceeded to delete UPGRADE_TARGET_LEASE_STATE.json
+    based on the false assumption that the upgrade lease was
+    no longer installed — leaving the target locks
+    installed without readable liveness evidence. The fix
+    returns False when ANY release() call returns False so
+    the caller can preserve the state file and surface the
+    cleanup failure.
     """
     upgrade = record.get("upgrade_target_lease")
     if not upgrade:
-        return
+        return True
     leases = upgrade.get("leases") if isinstance(upgrade, dict) else None
     if not leases:
         # Legacy single-outcome format (Round-94): treat
@@ -5878,14 +5962,15 @@ def _release_upgrade_target_lease_for_record(record: dict) -> None:
         if isinstance(upgrade, dict) and "scope" in upgrade:
             leases = [upgrade]
         else:
-            return
+            return True
+    all_released = True
     for lease in leases:
         scope = lease.get("scope")
         owner_run_id = lease.get("owner_run_id")
         if not scope or not owner_run_id:
             continue
         try:
-            _supervisor_lock.release(
+            released = _supervisor_lock.release(
                 scope=scope,
                 owner_run_id=owner_run_id,
                 base_dir=None,  # host-wide default; release finds lock by key
@@ -5893,7 +5978,16 @@ def _release_upgrade_target_lease_for_record(record: dict) -> None:
         except (OSError, KeyError):
             # Best-effort: another worker may have already
             # released the lease. Continue without failing.
-            pass
+            released = True
+        if not released:
+            # Round-111 P1 fix: the release did NOT happen
+            # (sentinel busy or owner_run_id mismatch).
+            # Do NOT treat this as a success; preserve the
+            # evidence so subsequent controllers can find
+            # the lease.
+            all_released = False
+            break
+    return all_released
 
 
 def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
@@ -6365,6 +6459,11 @@ def _mutate_ref(args: argparse.Namespace) -> None:
             desired_after_sha=plan.desired_after_sha,
             active_workspace=str(workspace.resolve()),
             workspace=workspace,
+            # Round-111 P1 fix: pass the plan's operation so
+            # the binding check rejects mutations whose
+            # operation does not match the authorized
+            # mutation_type (e.g. PUSH_REMOTE -> UPDATE_LOCAL).
+            plan_operation=plan.operation,
         )
     except AuthorizationBindingError as e:
         print(

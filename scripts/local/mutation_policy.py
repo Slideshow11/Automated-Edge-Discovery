@@ -368,6 +368,7 @@ def find_outstanding_authorization(
     desired_after_sha: Optional[str] = None,
     active_workspace: Optional[str] = None,
     workspace: Optional["Path"] = None,
+    plan_operation: Optional[str] = None,
 ) -> OutstandingAuthorization:
     """Find the outstanding authorization for the given
     mutation_id and verify the loaded plan matches it.
@@ -404,6 +405,41 @@ def find_outstanding_authorization(
             raise AuthorizationBindingError(
                 f"authorization repository={rec.get('repository')!r} "
                 f"does not match plan repository={repository!r}"
+            )
+        # Round-111 P1 fix (Bind plan operations to authorization
+        # types): both `force_push`/`push` (PUSH_REMOTE) and
+        # `branch_create_force` (CREATE_LOCAL) accept the same
+        # SHA shape. A durable plan modified post-authorization
+        # from one to the other (e.g. PUSH_REMOTE → UPDATE_LOCAL)
+        # would still pass the existing target_ref and SHA checks
+        # but execute a different operation than was authorized.
+        # The fix derives the allowed operation set from the
+        # journal's mutation_type and rejects any plan whose
+        # operation does not match.
+        # Map: mutation_type -> allowed plan.operation
+        _expected_ops = {
+            "force_push": {"PUSH_REMOTE"},
+            "push": {"UPDATE_LOCAL"},
+            "squash_merge": {"SQUASH_MERGE"},
+            "branch_create_force": {"CREATE_LOCAL"},
+        }
+        rec_mt = rec.get("mutation_type") or ""
+        _expected = _expected_ops.get(rec_mt)
+        # Only enforce the mapping when the caller supplied
+        # plan_operation. Backward-compatibility: tests and
+        # legacy code that don't supply plan_operation must
+        # continue to pass.
+        if (
+            _expected is not None
+            and plan_operation is not None
+            and plan_operation not in _expected
+        ):
+            raise AuthorizationBindingError(
+                f"authorization mutation_type={rec_mt!r} "
+                f"requires plan.operation in {sorted(_expected)}, "
+                f"but loaded plan.operation={plan_operation!r}; "
+                f"the durable plan was modified after authorization "
+                f"or the plan is bound to the wrong authorization"
             )
         # The authorization stores mutation_target as the
         # branch name; the plan stores the full refname. The
