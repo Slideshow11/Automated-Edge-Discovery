@@ -6204,6 +6204,21 @@ def _mutate_ref(args: argparse.Namespace) -> None:
     if (
         op is GrdOp.DELETE_LOCAL
         and remote_path is None
+    ) or (
+        # Round-105 P1 fix (Reconcile resumed remote branch
+        # creation against the remote): a CREATE_LOCAL plan
+        # that was pushed to a URL-backed remote (Round-69
+        # path) also needs the URL fallback when resumed
+        # from EXECUTING / RECONCILING / INDETERMINATE /
+        # NOT_APPLIED. Otherwise reconciliation reads the
+        # local clone's pre-push state and can persist
+        # NOT_APPLIED even though the remote branch exists,
+        # prompting a later retry of an already-applied
+        # mutation. Local-bare configurations still use
+        # the local_repo fallback because the runner uses
+        # local create for them.
+        op is GrdOp.CREATE_LOCAL
+        and remote_path is None
     ):
         # Check if the configured remote is URL-backed.
         try:
@@ -6332,14 +6347,29 @@ def _mutate_ref(args: argparse.Namespace) -> None:
                                 file=sys.stderr,
                             )
                             sys.exit(11)
-        except (OSError, json.JSONDecodeError, ValueError):
-            # If we cannot read the journal, the upgrade
-            # target lease cannot be revalidated. Continue
-            # without revalidation (the executor may
-            # proceed against a recovered lease); the
-            # main PR-scope lease revalidation above
-            # still applies.
-            pass
+        except (OSError, json.JSONDecodeError, ValueError) as _journal_err:
+            # Round-105 P1 fix (Fail closed when upgrade
+            # leases cannot be revalidated): if the journal
+            # cannot be read, the upgrade target leases
+            # cannot be revalidated. The previous code
+            # deliberately continued to orch.execute()
+            # without revalidation, allowing a superseded
+            # PR-scoped runner to mutate the branch
+            # concurrently with a replacement target-scoped
+            # controller. Journal read failure during this
+            # pre-execution check must abort (fail closed)
+            # rather than bypass target-lease validation.
+            print(
+                f"ERROR: cannot execute mutation: the mutation "
+                f"journal at {workspace / _mutation_auth.MUTATIONS_FILENAME} "
+                f"is unreadable ({type(_journal_err).__name__}: "
+                f"{_journal_err}); upgrade target leases cannot be "
+                f"revalidated. Aborting before any protected Git or "
+                f"GitHub mutation to prevent racing a replacement "
+                f"target-scoped controller.",
+                file=sys.stderr,
+            )
+            sys.exit(11)
         final = orch.execute(
             local_repo=local_repo,
             remote_ref_path=remote_path,
@@ -6422,8 +6452,26 @@ def _mutate_ref(args: argparse.Namespace) -> None:
                         ):
                             _retry_matching_journal = _retry_rec
                             break
-            except OSError:
-                pass
+            except (OSError, json.JSONDecodeError, ValueError) as _retry_journal_err:
+                # Round-105 P1 fix (Fail closed when upgrade
+                # leases cannot be revalidated, NOT_APPLIED
+                # retry variant): the NOT_APPLIED retry path
+                # has the same journal-read step as the
+                # PREPARED branch and must fail closed when
+                # the journal is unreadable; otherwise a
+                # superseded PR-scoped runner can race a
+                # replacement target-scoped controller.
+                print(
+                    f"ERROR: cannot execute mutation (NOT_APPLIED "
+                    f"retry): the mutation journal at "
+                    f"{workspace / _mutation_auth.MUTATIONS_FILENAME} "
+                    f"is unreadable ({type(_retry_journal_err).__name__}: "
+                    f"{_retry_journal_err}); upgrade target leases "
+                    f"cannot be revalidated. Aborting before any "
+                    f"protected Git or GitHub mutation.",
+                    file=sys.stderr,
+                )
+                sys.exit(11)
             if _retry_matching_journal is not None:
                 _retry_upgrade = _retry_matching_journal.get(
                     "upgrade_target_lease"
