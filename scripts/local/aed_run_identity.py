@@ -201,6 +201,55 @@ def capture_run_identity(
     """
     now = _utcnow()
     proc_evidence = capture_process_start_evidence()
+    # Round-89 P2 fix (V1BqI continuation): strip
+    # credentials from the repository value before
+    # persistence. The previous code accepted any string
+    # for repository, including credential-bearing
+    # HTTPS forms (e.g. `https://alice:token@github.com/
+    # owner/repo.git`). The canonical_repository_identity
+    # function strips credentials as a side effect of
+    # canonicalization, but it can also return None for
+    # non-canonical inputs (e.g. SSH shorthand or local
+    # bare paths). To handle all cases consistently,
+    # explicitly check for userinfo (`@` in the URL
+    # portion) and reject or canonicalize.
+    if repository and isinstance(repository, str):
+        # If the repository is a URL with userinfo,
+        # canonicalize to the bare owner/name form via
+        # canonical_repository_identity.
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(repository)
+            if parsed.username or parsed.password:
+                # Strip userinfo and re-parse.
+                cleaned = (
+                    f"{parsed.scheme}://{parsed.hostname}"
+                    + (f":{parsed.port}" if parsed.port else "")
+                    + parsed.path
+                )
+                canonical = canonical_repository_identity(cleaned)
+                if canonical is not None:
+                    repository = canonical.shorthand
+                else:
+                    # Strip credentials entirely.
+                    from scripts.local.aed_run_identity import (
+                        canonical_repository_identity as _cri,
+                    )
+                    canonical = _cri(cleaned)
+                    if canonical is not None:
+                        repository = canonical.shorthand
+                    else:
+                        # Last resort: reject userinfo
+                        # strings entirely.
+                        raise ValueError(
+                            f"repository URL contains userinfo "
+                            f"credentials; strip them before "
+                            f"persistence: {repository!r}"
+                        )
+        except (ValueError, TypeError):
+            # If urlparse fails (e.g. plain owner/repo),
+            # the value is fine.
+            pass
 
     return {
         "run_id": run_id,

@@ -388,7 +388,18 @@ class GuardedMutationOrchestrator:
                 )
             except (subprocess.CalledProcessError, FileNotFoundError):
                 is_url_backed = False
-        if remote_ref_path is not None:
+        if remote_ref_path is not None and not is_url_backed:
+            # Round-90 P1 fix (V1BqG continuation): only use
+            # remote_ref_path for reconciliation when the
+            # remote is NOT URL-backed. For URL-backed
+            # remotes, the configured URL is the actual
+            # push endpoint; reconciling against a
+            # different remote_ref_path can falsely report
+            # SUCCEEDED (e.g. if the supplied path
+            # coincidentally has the desired_after_sha).
+            # For URL-backed remotes, always use ls-remote
+            # over the configured URL — that is the
+            # authoritative source of truth.
             read_result = _read_remote_ref_via_query(
                 remote_ref_path, self.plan.target_ref
             )
