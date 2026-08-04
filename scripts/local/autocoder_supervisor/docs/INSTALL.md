@@ -46,9 +46,13 @@ sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor/
 # 3. Copy the packaging manifest to the install root.
 sudo cp scripts/local/pyproject.toml /opt/aed-supervisor/pyproject.toml
 
-# 4. Install (no PYTHONPATH needed; the package is now
-#    importable as a regular distribution).
-sudo python3 -m pip install --no-deps /opt/aed-supervisor
+# 4. Install. The supervisor package has a single conditional
+#    runtime dependency (``tomli`` on Python <3.11; the
+#    ``tomllib`` stdlib module is used on Python 3.11+).
+#    On Python <3.11, do NOT pass ``--no-deps``; the conditional
+#    ``tomli`` dependency is required for the supervisor's
+#    config loader to import.
+sudo python3 -m pip install /opt/aed-supervisor
 ```
 
 …or into a virtualenv:
@@ -63,8 +67,11 @@ sudo cp scripts/local/pyproject.toml /opt/aed-supervisor-install/pyproject.toml
 sudo install -d /opt/aed-supervisor/venv
 sudo python3 -m venv /opt/aed-supervisor/venv
 
-# 3. Install from the staged root.
-sudo /opt/aed-supervisor/venv/bin/pip install --no-deps \
+# 3. Install from the staged root. The supervisor has a
+#    conditional ``tomli`` dependency on Python <3.11 (the
+#    ``tomllib`` stdlib is used on 3.11+), so do NOT pass
+#    ``--no-deps`` on Python <3.11.
+sudo /opt/aed-supervisor/venv/bin/pip install \
     /opt/aed-supervisor-install
 
 # 4. Clean up the staging root.
@@ -72,13 +79,25 @@ sudo rm -rf /opt/aed-supervisor-install
 ```
 
 After install, verify the package is importable from outside
-the repository checkout:
+the repository checkout. Use the same Python that the
+supervisor will use at runtime:
 
 ```bash
+# For a system-wide install:
 python3 -c "import autocoder_supervisor; print(autocoder_supervisor.__file__)"
 python3 -m autocoder_supervisor.validate --help
 python3 -m autocoder_supervisor.supervisor --help
+
+# For a virtualenv install — use the venv's python:
+/opt/aed-supervisor/venv/bin/python -c "import autocoder_supervisor; print(autocoder_supervisor.__file__)"
+/opt/aed-supervisor/venv/bin/python -m autocoder_supervisor.validate --help
+/opt/aed-supervisor/venv/bin/python -m autocoder_supervisor.supervisor --help
 ```
+
+**Important:** if you used the virtualenv install, do NOT
+use the host `python3` for verification — the host interpreter
+does not have the package installed. Always use the venv
+interpreter.
 
 ## 2. Prepare state + log directories
 

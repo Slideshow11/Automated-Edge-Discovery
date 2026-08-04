@@ -23,6 +23,12 @@ name = "aed-supervisor"
 version = "1.0.0"
 description = "AED Autocoder Supervisor (source-controlled)"
 requires-python = ">=3.10"
+# Python <3.11 does not have the tomllib stdlib module.
+# The supervisor's config.py falls back to ``tomli`` on those
+# versions, so we declare the dependency conditionally.
+dependencies = [
+    'tomli>=1.1; python_version<"3.11"',
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

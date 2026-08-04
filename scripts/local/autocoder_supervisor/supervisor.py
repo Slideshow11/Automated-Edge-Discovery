@@ -1538,13 +1538,13 @@ def write_json(path: Path, data: dict) -> None:
     world-readable, even briefly. The parent directory is
     created with mode 0o700 if it does not yet exist.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Set restrictive mode on a freshly-created parent
-    # directory. mkdir's mode argument is masked by the
-    # process umask, so we explicitly chmod after.
-    if not path.parent.exists() or (
-        path.parent.stat().st_mode & 0o077
-    ):
+    # Track whether the parent directory pre-existed. mkdir's
+    # mode argument is masked by the process umask; we rely on
+    # the explicit os.chmod call below to enforce 0o700 on
+    # newly-created parents only.
+    parent_existed = path.parent.exists()
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not parent_existed:
         try:
             os.chmod(path.parent, 0o700)
         except OSError:

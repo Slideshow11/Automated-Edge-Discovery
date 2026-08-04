@@ -9,6 +9,10 @@ versions.
 
 ```bash
 sudo systemctl stop aed-supervisor@<instance>.service
+# Remove any pre-existing staging dir from a previous
+# interrupted upgrade. Without this, `cp -r` would preserve
+# obsolete files inside the new staging tree.
+sudo rm -rf /opt/aed-supervisor.new
 sudo install -d /opt/aed-supervisor.new
 sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor.new/
 sudo cp scripts/local/pyproject.toml /opt/aed-supervisor.new/pyproject.toml

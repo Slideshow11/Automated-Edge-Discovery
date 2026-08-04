@@ -82,18 +82,32 @@ def _pip_install(venv_dir: Path, install_root: Path) -> None:
     )
 
 
-def _wheel_path_from_pip_log(venv_dir: Path) -> Path:
-    """Find the wheel that pip just built and cached."""
-    cache = Path.home() / ".cache" / "pip" / "wheels"
-    if not cache.exists():
-        pytest.skip("pip wheel cache not found; cannot inspect wheel")
-    wheels = sorted(
-        cache.rglob("aed_supervisor-*.whl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+def _pip_build_wheel(venv_dir: Path, install_root: Path,
+                      wheel_dir: Path) -> Path:
+    """Build a wheel into ``wheel_dir`` using ``pip wheel``.
+
+    Returns the path to the built wheel. The test uses a
+    test-owned wheel directory (not ``~/.cache/pip/wheels``)
+    so the test never depends on shared state and the
+    wheel path is deterministic.
+    """
+    pip = venv_dir / "bin" / "pip"
+    wheel_dir.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [str(pip), "wheel", "--no-deps", "--wheel-dir",
+         str(wheel_dir), str(install_root)],
+        capture_output=True,
+        text=True,
     )
-    if not wheels:
-        pytest.skip("no aed_supervisor wheel found in pip cache")
+    assert proc.returncode == 0, (
+        f"pip wheel failed (exit {proc.returncode}):\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+    wheels = sorted(wheel_dir.glob("aed_supervisor-*.whl"))
+    assert len(wheels) == 1, (
+        f"expected exactly one wheel in {wheel_dir}, "
+        f"found {len(wheels)}: {[w.name for w in wheels]}"
+    )
     return wheels[0]
 
 
@@ -114,14 +128,30 @@ def installed_venv(tmp_path: Path) -> Path:
     return venv_dir
 
 
-def test_install_produces_non_empty_wheel(installed_venv: Path):
-    """The wheel produced by ``pip install`` must contain the
+@pytest.fixture
+def wheel_path(tmp_path: Path) -> Path:
+    """Build the wheel into a test-owned wheel directory.
+
+    Returns the path to the built wheel. This fixture is
+    independent of the ``installed_venv`` fixture so tests
+    that only want to inspect the wheel don't need to
+    install the package.
+    """
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    install_root = _stage_install_root(staging)
+    venv_dir = _create_venv(staging)
+    wheel_dir = tmp_path / "wheels"
+    return _pip_build_wheel(venv_dir, install_root, wheel_dir)
+
+
+def test_install_produces_non_empty_wheel(wheel_path: Path):
+    """The wheel produced by ``pip wheel`` must contain the
     package source files. An empty wheel (the previous
     failure mode) means the package was not discoverable by
     setuptools at install time.
     """
-    wheel = _wheel_path_from_pip_log(installed_venv)
-    with zipfile.ZipFile(wheel) as zf:
+    with zipfile.ZipFile(wheel_path) as zf:
         names = zf.namelist()
     # Top-level package directory must contain the package
     # files. We assert on the existence of the canonical
@@ -130,8 +160,8 @@ def test_install_produces_non_empty_wheel(installed_venv: Path):
         n for n in names if n.startswith("autocoder_supervisor/")
     ]
     assert len(package_files) >= 5, (
-        f"wheel {wheel} contains {len(package_files)} package files; "
-        f"expected at least 5 (the canonical modules). "
+        f"wheel {wheel_path} contains {len(package_files)} package "
+        f"files; expected at least 5 (the canonical modules). "
         f"Package files: {package_files}"
     )
     assert "autocoder_supervisor/__init__.py" in names
@@ -139,13 +169,14 @@ def test_install_produces_non_empty_wheel(installed_venv: Path):
     assert "autocoder_supervisor/validate.py" in names
 
 
-def test_installed_package_top_level_name(installed_venv: Path):
+def test_installed_package_top_level_name(wheel_path: Path):
     """The wheel's ``top_level.txt`` must list ``autocoder_supervisor``
     (and only that top-level package).
     """
-    wheel = _wheel_path_from_pip_log(installed_venv)
-    with zipfile.ZipFile(wheel) as zf:
-        with zf.open("aed_supervisor-1.0.0.dist-info/top_level.txt") as f:
+    with zipfile.ZipFile(wheel_path) as zf:
+        with zf.open(
+            "aed_supervisor-1.0.0.dist-info/top_level.txt"
+        ) as f:
             top_level = f.read().decode("utf-8").strip().splitlines()
     assert "autocoder_supervisor" in top_level, (
         f"top_level.txt does not list autocoder_supervisor: "
