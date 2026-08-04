@@ -1330,6 +1330,43 @@ _CODEX_BOT_LOGIN_TASK_SUMMARY = "chatgpt-codex-connector"
 _CODEX_BOT_LOGIN_TASK_SUMMARY_BOT = "chatgpt-codex-connector[bot]"
 
 
+def _is_review_bot_summary_post(user: str, source_kind: str, body: str) -> bool:
+    """Return True iff ``body`` is a CodeRabbit walkthrough /
+    summary post (NOT a finding). The CodeRabbit bot posts an
+    issue-comment on every review run with a body that starts
+    with ``<!-- This is an auto-generated comment: summarize by
+    coderabbit.ai -->`` or ``<!-- review_stack_entry_start -->``
+    plus a walkthrough / pre-merge-checks section. The body
+    may incidentally mention ``suggestion`` / ``high`` /
+    ``medium`` (utm_medium) / ``CodeRabbit`` (provider name) /
+    any other content that triggers the CODEX_NEEDLES substring
+    classifier. The gate must NOT classify these summary posts
+    as blockers, even when they have no actionable findings.
+
+    The structural discriminator is the leading byte sequence:
+
+    * ``<!-- This is an auto-generated comment: summarize by
+      coderabbit.ai -->`` is the canonical CodeRabbit summary
+      prefix used for both the walkthrough and the in-progress
+      notice.
+    * ``<!-- review_stack_entry_start -->`` precedes the walkthrough
+      section and is a reliable secondary marker.
+
+    Only applies to issue-comment source_kind (these are
+    walkthrough posts, not inline review-thread comments).
+    """
+    if source_kind != "issue_comment":
+        return False
+    if user != "coderabbitai[bot]":
+        return False
+    body_lc = body.lower()
+    return (
+        "<!-- this is an auto-generated comment: summarize by coderabbit.ai -->"
+        in body_lc
+        or "<!-- review_stack_entry_start -->" in body_lc
+    )
+
+
 def _is_codex_task_summary_issue_comment(
     user: str,
     source_kind: str,
@@ -1508,6 +1545,20 @@ def classify_item(
     # that mentions a prior ``P1`` / ``P2`` finding it fixed
     # is still classified as informational.
     if is_task_summary:
+        severity = "UNSPECIFIED_INFO"
+    # Round-112 P2 fix: CodeRabbit walkthrough / summary posts
+    # are NOT findings — they are coordination / progress posts
+    # that describe the review run. Their bodies contain
+    # CODEX_NEEDLES substrings (e.g. "suggestion" in the
+    # finishing_touch_suggestion section, "high" in the
+    # "high-level summary" enabled hint, "medium" in the
+    # utm_medium query parameter, and CodeRabbit's own provider
+    # name in the review profile). The gate must NOT classify
+    # these as blockers even when the body shape happens to
+    # match a CODEX_NEEDLES substring.
+    elif _is_review_bot_summary_post(
+        user=user, source_kind=source_kind, body=body
+    ):
         severity = "UNSPECIFIED_INFO"
     # Fail-closed default: unresolved Codex threads without
     # extractable severity default to P2 (blocking).
