@@ -277,6 +277,42 @@ class GuardedMutationOrchestrator:
             self.workspace, plan.mutation_id
         )
 
+    @classmethod
+    def from_workspace(
+        cls,
+        *,
+        workspace: Path,
+        mutation_id: str,
+    ) -> "GuardedMutationOrchestrator":
+        """Construct an orchestrator by loading the durable
+        plan from disk.
+
+        Round-112 P2 fix (CodeRabbit finding WJXAI): the
+        previous ``__init__`` accepted only an in-memory plan,
+        so a caller passing a stale plan object would silently
+        overwrite the terminal persisted record. The new
+        ``from_workspace`` factory deserializes the plan from
+        ``<workspace>/GUARDED_REF_MUTATIONS/<mutation_id>.json``
+        and constructs the orchestrator around the loaded
+        plan. Use this in restart / recovery paths where the
+        durable record is the source of truth. The direct
+        ``__init__`` path is preserved for tests and for the
+        controller's first-call (where no on-disk plan exists
+        yet).
+        """
+        plan_path = grm.guarded_ref_mutation_plan_path(
+            Path(workspace), mutation_id
+        )
+        if not plan_path.is_file():
+            raise FileNotFoundError(
+                f"no durable plan for mutation_id={mutation_id!r} "
+                f"at {plan_path}"
+            )
+        plan = grm.GuardedMutationPlan.from_json(
+            plan_path.read_text()
+        )
+        return cls(workspace=Path(workspace), plan=plan)
+
     # ------------------------------------------------------------------
     # Prepare (write the PREPARED plan)
     # ------------------------------------------------------------------

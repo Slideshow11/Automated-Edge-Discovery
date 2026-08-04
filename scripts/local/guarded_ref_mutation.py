@@ -367,6 +367,7 @@ def reconcile(
     expected_before_sha: Optional[str],
     desired_after_sha: Optional[str],
     actual_ref_sha: Optional[str],
+    actual_ref_indeterminate: bool = False,
 ) -> LifecycleState:
     """Classify the actual remote ref state into the outcome
     LifecycleState.
@@ -374,28 +375,54 @@ def reconcile(
     Pure function. No I/O. The caller is responsible for
     reading the actual ref via git rev-parse and passing it
     here. If the caller cannot read the ref, pass
-    actual_ref_sha=None and the function returns INDETERMINATE.
+    actual_ref_sha=None and actual_ref_indeterminate=True. The
+    function returns INDETERMINATE in that case for ALL
+    operation types (DELETE/CREATE/UPDATE/PUSH), since the
+    caller cannot distinguish a missing ref from a read failure.
 
-    The domain uses None to mean "the ref does not exist".
-    Empty-string values from git rev-parse are translated to
-    None by the Git adapter before reaching this function.
+    The domain uses None to mean "the ref does not exist"
+    (only when actual_ref_indeterminate=False). Empty-string
+    values from git rev-parse are translated to None by the
+    Git adapter before reaching this function.
     """
-    # Cannot read the actual ref -> INDETERMINATE.
-    if actual_ref_sha is None:
-        # For UPDATE/PUSH, cannot read means INDETERMINATE.
-        # For CREATE, the target not existing is the desired
-        # state; if CREATE itself reports missing, the create
-        # did not happen and the outcome is NOT_APPLIED.
-        # For DELETE, desired_after is None; if actual_ref_sha
-        # is None, the delete succeeded.
+    # Cannot read the actual ref -> INDETERMINATE for ALL ops.
+    # Round-112 P2 fix (CodeRabbit finding WJXAB): the previous
+    # implementation returned SUCCEEDED for DELETE and
+    # NOT_APPLIED for CREATE when actual_ref_sha was None, even
+    # when the caller passed None BECAUSE the read failed.
+    # That conflated a missing ref with a read failure — for
+    # DELETE, "missing ref" is the desired terminal state; for
+    # CREATE, "missing ref" means the create did not happen.
+    # In both cases, if the caller flagged the read as
+    # indeterminate, the correct classification is INDETERMINATE
+    # (a known-unknown) rather than a definitive terminal
+    # state. The new actual_ref_indeterminate parameter
+    # disambiguates these cases.
+    if actual_ref_indeterminate or actual_ref_sha is None:
+        # Round-112 P2 fix (CodeRabbit finding WJXAB): the
+        # legacy behavior treated DELETE-with-missing-ref as
+        # SUCCEEDED and CREATE-with-missing-ref as
+        # NOT_APPLIED without an explicit indeterminate flag.
+        # That semantic is preserved ONLY when the read was
+        # definitely successful (actual_ref_indeterminate=False)
+        # AND the operation's domain semantics specifically say
+        # "missing ref == done".
+        if actual_ref_indeterminate:
+            # The caller couldn't read the ref at all. We
+            # cannot tell missing from present.
+            return LifecycleState.INDETERMINATE
+        # The read succeeded and the ref is genuinely absent.
         if desired_after_sha is None:
-            # DELETE.
+            # DELETE: ref absent == target successfully deleted.
             return LifecycleState.SUCCEEDED
         if expected_before_sha is None:
             # CREATE: target was supposed to not exist and
             # still does not. The create did not happen.
             return LifecycleState.NOT_APPLIED
-        # UPDATE/PUSH.
+        # UPDATE/PUSH: ref absent cannot be classified
+        # definitively (could be a clean checkout, a deleted
+        # upstream, or a read failure that the caller didn't
+        # flag). INDETERMINATE.
         return LifecycleState.INDETERMINATE
 
     # CREATE: actual must equal desired_after for success.

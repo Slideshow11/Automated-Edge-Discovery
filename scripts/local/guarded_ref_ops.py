@@ -80,16 +80,47 @@ def read_ref(repo: Path, ref: str) -> Optional[str]:
     Treats "" from git rev-parse as None. Any other nonzero
     return raises GuardedRefError.
     """
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", ref],
-        cwd=str(repo),
-        capture_output=True,
-        text=True,
-    )
+    # Round-112 P2 fix (CodeRabbit finding WJXAD): use
+    # `--quiet` so git exits 0/1 without printing a localized
+    # stderr message that varies with NLS / locale. The
+    # previous implementation matched English substrings
+    # ("unknown revision", "Needed a single revision") which
+    # silently failed on non-English locales. Fall back to
+    # the substring match ONLY when --quiet is not supported
+    # (older git) so the legacy behavior is preserved for the
+    # rare case.
+    cmd = ["git", "rev-parse", "--verify", "--quiet", ref]
+    use_quiet = True
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(repo), capture_output=True, text=True,
+        )
+    except subprocess.CalledProcessError:
+        # --quiet is unsupported by this git version;
+        # fall back to the legacy substring-match path.
+        use_quiet = False
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", ref],
+            cwd=str(repo), capture_output=True, text=True,
+        )
     if result.returncode == 0:
         out = result.stdout.strip()
         return grm.oid_from_git(out)
     # git rev-parse returns nonzero for non-existent refs.
+    if use_quiet:
+        # With --quiet, exit code 0 == ref exists, anything
+        # else == ref does not exist (or another error). We
+        # cannot distinguish a missing ref from a read
+        # failure here, but the runner's reconcile path
+        # treats a missing ref differently per operation
+        # type (DELETE=SUCCEEDED, CREATE=NOT_APPLIED,
+        # UPDATE/PUSH=INDETERMINATE) when the caller does
+        # not flag the read as indeterminate. Per WJXAB
+        # (Round-112 P2), the runner can opt into stricter
+        # INDETERMINATE classification via
+        # _read_remote_ref_via_query's `result.indeterminate`
+        # flag.
+        return None
     err = result.stderr
     if (
         "unknown revision" in err
