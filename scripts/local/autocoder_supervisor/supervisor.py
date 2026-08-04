@@ -215,12 +215,69 @@ def _default_providers(cfg: SupervisorConfig) -> dict[str, dict[str, Any]]:
 
 
 # Bootstrap: populate globals from the env-derived config.
-_BOOTSTRAPPED_FROM = default_config_from_env()
-_APPLIED = _apply_config(_BOOTSTRAPPED_FROM)
-POLICY: dict[str, Any] = _default_policy(_BOOTSTRAPPED_FROM)
-PROVIDERS: dict[str, dict[str, Any]] = _default_providers(
-    _BOOTSTRAPPED_FROM
-)
+#
+# This bootstrap is ONLY used when no explicit SupervisorConfig
+# is supplied (i.e. when ``main()`` runs without --config and
+# without --isolated-state). Production startup always passes
+# ``--config``, so the bootstrap is replaced by an explicit
+# ``load_config`` call in ``main()``. The in-process default
+# is therefore safe to be lenient about absolute user paths
+# (which is necessary for ``default_config_from_env`` to
+# populate ``working_checkout`` from $PWD for the
+# package's own unit tests).
+try:
+    _BOOTSTRAPPED_FROM = default_config_from_env()
+    _APPLIED = _apply_config(_BOOTSTRAPPED_FROM)
+except Exception as _exc:
+    # If the env-derived config cannot be built (e.g. the
+    # host has no $PWD), defer to a minimal stub. Production
+    # callers always pass --config and override this stub
+    # before any module function is invoked.
+    import sys as _sys
+    if "autocoder_supervisor.config" in str(_exc):
+        _BOOTSTRAPPED_FROM = None  # type: ignore[assignment]
+        _APPLIED = {}  # type: ignore[assignment]
+    else:
+        raise
+if _BOOTSTRAPPED_FROM is not None:
+    POLICY: dict[str, Any] = _default_policy(_BOOTSTRAPPED_FROM)
+    PROVIDERS: dict[str, dict[str, Any]] = _default_providers(
+        _BOOTSTRAPPED_FROM
+    )
+else:  # pragma: no cover — fallback only triggers on unusual
+      # platforms
+    POLICY = {  # type: ignore[assignment]
+        "human_boundary": "merge_only",
+        "required_review_providers_for_pr_416": ["coderabbit"],
+        "optional_review_providers_for_pr_416": ["codex"],
+        "provider_states_are_independent": True,
+        "codex_quota_reset_at": None,
+        "post_codex_recovery_request": False,
+        "quiet_window_seconds": 180,
+        "heartbeat_seconds": 120,
+    }
+    PROVIDERS = {  # type: ignore[assignment]
+        "coderabbit": {
+            "bot_logins": ["coderabbitai[bot]"],
+            "trigger_handle": "@coderabbitai review",
+            "quota_patterns": [],
+            "use_reviews_api": False,
+            "required_for_current_repair_round": True,
+            "required_for_final_merge": True,
+            "required_for_pr_416": True,
+            "quota_reset_at": None,
+        },
+        "codex": {
+            "bot_logins": ["chatgpt-codex-connector[bot]"],
+            "trigger_handle": "@codex review",
+            "quota_patterns": [],
+            "use_reviews_api": True,
+            "required_for_current_repair_round": False,
+            "required_for_final_merge": False,
+            "required_for_pr_416": False,
+            "quota_reset_at": None,
+        },
+    }
 TERMINAL_CLASSIFICATIONS = {"ACTIVE_REPAIR_CODERABBIT_FINDINGS"}
 
 # State machine (non-terminal while PR is open).
@@ -1466,20 +1523,47 @@ def write_json(path: Path, data: dict) -> None:
     """Atomically write JSON to ``path`` with restrictive permissions.
 
     The atomic write is performed by writing to a sibling
-    temporary file and renaming it into place. After the
-    rename the file mode is forced to 0o600 so the
-    process-umask does not leak the file to group or other.
+    temporary file and renaming it into place. The temp
+    file is opened with mode 0o600 so it is never
+    world-readable, even briefly. The parent directory is
+    created with mode 0o700 if it does not yet exist.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Set restrictive mode on a freshly-created parent
+    # directory. mkdir's mode argument is masked by the
+    # process umask, so we explicitly chmod after.
+    if not path.parent.exists() or (
+        path.parent.stat().st_mode & 0o077
+    ):
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            pass
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    # Set restrictive mode on the temp file before the
-    # rename so the file's mode is never world-readable
-    # even briefly.
+    # Open the temp file with mode 0o600 before writing so
+    # the file is never created with the umask-permissive
+    # 0644 mode that Path.write_text would otherwise use.
+    fd = os.open(
+        str(tmp),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2, sort_keys=True))
+    except Exception:
+        # On any failure, close and remove the temp file
+        # so we never leave a partially-written 0600 file
+        # in the state directory.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
     os.replace(tmp, path)
     # Belt-and-braces: enforce 0600 on the renamed path
     # too. Some filesystems ignore chmod on the source of a

@@ -6,13 +6,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# All paths below MUST be configured by the operator before
-# installation. Do NOT hardcode operator-specific paths.
-WorkingDirectory=%i/working_checkout
-Environment=HOME=%i
+# All paths below are absolute. The systemd template unit
+# is copied to /etc/systemd/system/aed-supervisor@.service
+# and instantiated as aed-supervisor@<instance>.service.
+# The instance-specific state directory and configuration
+# live under /var/lib/aed-supervisor/<instance>/ and
+# /etc/aed-supervisor/<instance>/ respectively, with
+# ``<instance>`` substituted by systemd at unit-load time.
+WorkingDirectory=/var/lib/aed-supervisor/%i
+Environment=HOME=/var/lib/aed-supervisor/%i
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=AED_SUPERVISOR_CONFIG=%i/aed-supervisor.toml
-ExecStart=/usr/bin/env python3 -m autocoder_supervisor.supervisor --config %i/aed-supervisor.toml
+Environment=PYTHONPATH=/opt/aed-supervisor
+Environment=AED_SUPERVISOR_CONFIG=/etc/aed-supervisor/%i/aed-supervisor.toml
+Environment=AED_PR_NUMBER=__SET_ME__
+Environment=AED_REPO_OWNER=__SET_ME__
+Environment=AED_REPO_NAME=__SET_ME__
+Environment=AED_AUTHORITATIVE_HEAD=__SET_ME__
+ExecStart=/usr/bin/env python3 -m autocoder_supervisor.supervisor --config /etc/aed-supervisor/%i/aed-supervisor.toml
 Restart=always
 RestartSec=10
 # KillMode=control-group: when the service is stopped, the

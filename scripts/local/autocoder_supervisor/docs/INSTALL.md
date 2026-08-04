@@ -10,8 +10,13 @@ system user and a systemd user service.
 Either system-wide:
 
 ```bash
+# Install root is /opt/aed-supervisor. The package lives at
+# <install-root>/autocoder_supervisor/ and the packaging
+# manifest at <install-root>/pyproject.toml. Both must
+# coexist at the install root for `pip install` to find
+# the package.
 sudo install -d /opt/aed-supervisor
-sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor/
+sudo cp -r scripts/local/autocoder_supervisor/. /opt/aed-supervisor/
 sudo python3 -m pip install --no-deps /opt/aed-supervisor
 ```
 
@@ -20,8 +25,15 @@ sudo python3 -m pip install --no-deps /opt/aed-supervisor
 ```bash
 sudo install -d /opt/aed-supervisor/venv
 sudo python3 -m venv /opt/aed-supervisor/venv
+# Copy the package contents to a temp install root and
+# install from there, because the venv's pip needs the
+# package and manifest to live side-by-side at the
+# install root.
+sudo install -d /opt/aed-supervisor-install
+sudo cp -r scripts/local/autocoder_supervisor/. /opt/aed-supervisor-install/
 sudo /opt/aed-supervisor/venv/bin/pip install --no-deps \
-    /path/to/aed-supervisor
+    /opt/aed-supervisor-install
+sudo rm -rf /opt/aed-supervisor-install
 ```
 
 ## 2. Prepare state + log directories
