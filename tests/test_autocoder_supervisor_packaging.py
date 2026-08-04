@@ -174,9 +174,17 @@ def test_installed_package_top_level_name(wheel_path: Path):
     (and only that top-level package).
     """
     with zipfile.ZipFile(wheel_path) as zf:
-        with zf.open(
-            "aed_supervisor-1.0.0.dist-info/top_level.txt"
-        ) as f:
+        # Locate the .dist-info directory by scanning the
+        # archive; do not hard-code a version number.
+        top_level_paths = [
+            name for name in zf.namelist()
+            if name.endswith(".dist-info/top_level.txt")
+        ]
+        assert len(top_level_paths) == 1, (
+            f"expected exactly one top_level.txt, "
+            f"found {top_level_paths!r}"
+        )
+        with zf.open(top_level_paths[0]) as f:
             top_level = f.read().decode("utf-8").strip().splitlines()
     assert "autocoder_supervisor" in top_level, (
         f"top_level.txt does not list autocoder_supervisor: "
