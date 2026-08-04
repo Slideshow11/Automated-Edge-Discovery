@@ -181,7 +181,37 @@ def is_url_backed_remote(local_repo: Path, remote_name: str) -> bool:
         or url.startswith("git@")
         or url.startswith("ssh://")
         or url.startswith("file://")
+        # Round-112 P2 fix (CodeRabbit finding WJW_v): the previous
+        # allowlist accepted http/https/git@/ssh/file but REJECTED
+        # git:// (a real protocol, not a typo) and every scp-style
+        # URL of the form user@host:path. scp-style URLs are the
+        # most common form for self-hosted git servers and SHOULD
+        # be classified as remote. git:// URLs are also remote.
+        # Both are validated separately by the executor / ls-remote.
+        or url.startswith("git://")
+        or _is_scp_style_remote(url)
     )
+
+
+def _is_scp_style_remote(url: str) -> bool:
+    """Return True iff ``url`` is an scp-style remote URL.
+
+    Scp-style remotes use the form ``user@host:path`` (optionally
+    prefixed by ``[`` for IPv6 hosts, e.g. ``git@[::1]:repo.git``).
+    Git accepts them via ssh transport. The earlier allowlist only
+    matched ``git@host:`` which excluded plain ``user@host:`` and
+    IPv6 forms.
+    """
+    if not url or "://" in url:
+        return False
+    if "@" not in url:
+        return False
+    # must have at least one path separator after the host part
+    head = url[1:] if url.startswith("[") else url
+    if ":" not in head:
+        return False
+    # exclude IPv6 literals like `[fe80::1]` (no colon between host and path)
+    return True
 
 
 def read_remote_ref_unified(
