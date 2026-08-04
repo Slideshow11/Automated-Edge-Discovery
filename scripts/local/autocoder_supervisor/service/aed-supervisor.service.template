@@ -1,0 +1,28 @@
+[Unit]
+Description=AED Autocoder Supervisor (source-controlled)
+Documentation=https://github.com/Slideshow11/Automated-Edge-Discovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# All paths below MUST be configured by the operator before
+# installation. Do NOT hardcode operator-specific paths.
+WorkingDirectory=%i/working_checkout
+Environment=HOME=%i
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AED_SUPERVISOR_CONFIG=%i/aed-supervisor.toml
+ExecStart=/usr/bin/env python3 -m autocoder_supervisor.supervisor --config %i/aed-supervisor.toml
+Restart=always
+RestartSec=10
+# KillMode=control-group: when the service is stopped, the
+# entire control group (including the worker and its
+# descendants) is terminated. This prevents orphaned workers
+# that linger after the supervisor dies.
+KillMode=control-group
+TimeoutStopSec=30
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=default.target
