@@ -359,13 +359,25 @@ class GuardedMutationOrchestrator:
             )
         except (ops.GuardedRefError, FileNotFoundError,
                 PermissionError, OSError,
-                subprocess.CalledProcessError) as e:
+                subprocess.CalledProcessError,
+                NotImplementedError) as e:
             # Treat any executor exception as INDETERMINATE.
             # We never saw a successful CAS; the durable
             # evidence is the EXECUTING state plus the
             # exception. The reconcile phase below reads the
             # remote ref (which may now also be unreadable)
             # and reports INDETERMINATE.
+            #
+            # Round-112 P2 fix (CodeRabbit finding WJW_y):
+            # NotImplementedError is now caught here. The
+            # executor raises NotImplementedError for
+            # GRAPHQL_UPDATE_REFS (a Layer-5+ operation that
+            # Layer 4 does not implement); without this catch
+            # the exception propagated up uncaught, leaving
+            # the plan in EXECUTING state with no terminal
+            # evidence and no path to INDETERMINATE recovery.
+            # The durable plan is preserved at EXECUTING so a
+            # recovery run can resume once Layer 5 is wired in.
             self.plan.terminal_evidence = (
                 f"executor_exception={type(e).__name__}:{e}"
             )
@@ -455,8 +467,29 @@ class GuardedMutationOrchestrator:
                 clone_remote_url = cfg.stdout.strip() or None
             except (subprocess.CalledProcessError, FileNotFoundError):
                 clone_remote_url = None
+            if clone_remote_url is None:
+                # Round-112 P2 fix (CodeRabbit finding WJW_5): the
+                # previous implementation passed `remote` (the
+                # REMOTE NAME, e.g. "origin") to ls-remote as a
+                # fallback when `git config --get remote.X.url`
+                # failed. ls-remote interprets the name as a path,
+                # not a URL, so a missing remote URL would
+                # reconcile against a foreign (or local)
+                # repository named after the configured remote.
+                # For URL-backed remotes with no resolvable URL,
+                # we cannot determine the actual remote state —
+                # fail closed with INDETERMINATE rather than
+                # passing the name to ls-remote.
+                self.plan.terminal_evidence = (
+                    f"clone_remote_url_unresolvable:"
+                    f"remote.{remote}.url config missing or empty; "
+                    f"cannot safely reconcile URL-backed "
+                    f"operation={self.plan.operation} without "
+                    f"authoritative URL"
+                )
+                return self.plan
             read_result = _read_remote_ref_via_ls_remote(
-                clone_remote_url or remote,
+                clone_remote_url,
                 self.plan.target_ref,
             )
         else:
