@@ -91,6 +91,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+import inspect
 from unittest.mock import patch
 
 import pytest
@@ -377,7 +378,9 @@ def test_c_optional_provider_in_progress_does_not_block_readiness():
     assert res["ready"] is True
 
 
-def test_c_codex_pause_does_not_pause_run(monkeypatch):
+def test_c_codex_pause_does_not_pause_run(
+    monkeypatch, isolated_state,
+):
     supervisor.write_quota_state({"providers": {"codex": {
         "classification": "PAUSED_PROVIDER_QUOTA_CODEX",
         "provider": "codex",
@@ -404,15 +407,13 @@ def test_c_codex_pause_does_not_pause_run(monkeypatch):
         },
     })
     snap = _clean_snap()
+    # Use the supervisor's own helper to compute the
+    # globally_paused rule rather than recomputing it in the
+    # test. This keeps production and test semantics in lock
+    # step.
     paused_providers = ["codex"]
-    providers_required_for_current_round = [
-        p for p, cfg in supervisor.PROVIDERS.items()
-        if cfg.get("required_for_current_repair_round", False)
-        and p not in set(paused_providers)
-    ]
-    globally_paused = (
-        bool(paused_providers)
-        and len(providers_required_for_current_round) == 0
+    globally_paused = supervisor.compute_globally_paused(
+        supervisor.PROVIDERS, paused_providers,
     )
     assert globally_paused is False
     res = supervisor.evaluate_readiness(snap, AUTH)
@@ -707,7 +708,6 @@ def test_m_only_top_level_commands_from_authorized_operator_account():
     configuration. There is no path by which a comment body
     becomes a command.
     """
-    cfg = supervisor_config.default_config_from_env()
     assert "@coderabbitai review" in supervisor.PROVIDERS[
         "coderabbit"
     ]["trigger_handle"]
@@ -715,7 +715,6 @@ def test_m_only_top_level_commands_from_authorized_operator_account():
     # The supervisor has no function that posts a comment whose
     # body comes from anywhere except its own constant string.
     post = supervisor.post_review_request
-    import inspect
     src = inspect.getsource(post)
     assert "trigger_handle" in src
     assert "reviewer_body" not in src
@@ -867,28 +866,29 @@ def test_p_crash_after_launch_does_not_double_launch(isolated_state):
 
 def test_q_runtime_files_use_restrictive_permissions(isolated_state):
     """State files must be created with restrictive modes
-    (0600) wherever the OS supports it. The package uses
-    ``os.O_CREAT | os.O_WRONLY`` semantics indirectly through
-    ``write_json`` (which uses ``Path.write_text``). We assert
-    that the parent directories are created with 0700 where
-    supported and the runtime files are not world-readable.
+    (0600) wherever the OS supports it. The package's
+    ``write_json`` helper performs an atomic write and then
+    forces the file mode to 0600 so the process umask
+    cannot leak the file to group or other.
+
+    The state directory is created with mode 0700 by the
+    ``isolated_state`` fixture.
     """
-    # Trigger state writes.
+    # Trigger state writes through the canonical write_json
+    # path.
     supervisor.write_readiness_state({
         "state": supervisor.STATE_ACTIVE_REPAIR,
     })
     supervisor.write_quota_state({"providers": {}})
     # The state directory exists.
     assert supervisor.STATE_DIR.exists()
-    # The files have at most group-readable permissions.
+    # The files are exactly mode 0600 (owner read+write).
     for p in (supervisor.READINESS_STATE_PATH,
               supervisor.QUOTA_PATH):
         st = os.stat(p)
         mode = stat.S_IMODE(st.st_mode)
-        # Owner read+write at minimum; no world-write.
-        assert mode & 0o777, f"{p} has unexpected mode {oct(mode)}"
-        assert not (mode & stat.S_IWOTH), (
-            f"{p} is world-writable: {oct(mode)}"
+        assert mode == 0o600, (
+            f"{p} has mode {oct(mode)}; expected 0o600"
         )
 
 

@@ -80,8 +80,9 @@ quota_retry_backoff_seconds = 21600
 quota_backoff_after_retry_count = 2
 
 # Optional: per-provider known quota reset times (ISO 8601 UTC).
-# Leave empty if you don't have a known reset time. The
-# supervisor will never post a Codex recovery review request
-# before its reset time even if this value is missing.
+# Leave empty if you don't have a known reset time. When a
+# reset time is absent, the supervisor relies on
+# post_codex_recovery_request = false above to suppress Codex
+# recovery review requests.
 [provider_quota_reset]
 # codex = "2026-08-08T14:09:00Z"

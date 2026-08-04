@@ -16,9 +16,9 @@ invariant requires a new ledger version. Changing the meaning
 of an existing invariant requires a deprecation cycle and a
 new ledger version.
 
-This ledger is the source of truth for **invariant #9**
+This ledger is the source of truth for **invariant I-08**
 ("review evidence is bound to the exact current head") and
-**invariant #15** ("runtime state and secrets are never
+**invariant I-15** ("runtime state and secrets are never
 committed"). Every invariant listed here is implemented in the
 source-controlled supervisor and asserted by an automated
 test.
@@ -38,7 +38,7 @@ so the supervisor can terminate the entire process group via
 
 - Enforcing implementation: `acquire_lock`,
   `launch_worker`, `lease_alive`, `read_lease`, `write_lease`,
-  `remove_lease`.
+  `remove_lease`, `list_unconsumed_events`.
 - Asserting tests:
   `test_n_two_simultaneous_launches_produce_one_writer`,
   `test_o_crash_after_marking_event_actionable_recovered`,
@@ -53,9 +53,12 @@ authorisation is the transition from
 transitions are driven by observable review/CI evidence and
 do not require human input.
 
-- Enforcing implementation: `POLICY["human_boundary"]` and
-  the dedicated `MERGED` literal in the state machine
-  (`supervisor.STATE_*` constants).
+- Enforcing implementation: `POLICY["human_boundary"]`,
+  the dedicated `MERGED` literal in the state machine (the
+  terminal `MERGED` state is written by the
+  merge-authorization command which lives outside this
+  stabilization PR — it is not a `supervisor.STATE_*`
+  constant).
 - Asserting tests:
   `test_s_merge_authorization_for_one_head_cannot_be_reused`,
   `test_f_state_persists_across_simulated_restart`.
@@ -236,7 +239,7 @@ On restart, the supervisor:
    appeared.
 
 - Enforcing implementation: `main()`'s pre-loop setup,
-  `lease_alive`, `read_readiness_state`, `read_unconsumed_events`.
+  `lease_alive`, `read_readiness_state`, `list_unconsumed_events`.
 - Asserting tests:
   `test_f_state_persists_across_simulated_restart`,
   `test_f_no_duplicate_worker_launch_on_resume`,

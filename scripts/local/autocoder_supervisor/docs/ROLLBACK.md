@@ -7,12 +7,17 @@ is:
 ## 1. Stop the service
 
 ```bash
-sudo systemctl stop aed-supervisor@aed-supervisor.service
+sudo systemctl stop aed-supervisor@<instance>.service
 ```
 
 ## 2. Restore the previous source tree
 
 ```bash
+# Confirm a rollback target exists before touching the live tree.
+test -d /opt/aed-supervisor.old || {
+    echo "no /opt/aed-supervisor.old to roll back to" >&2
+    exit 1
+}
 sudo mv /opt/aed-supervisor /opt/aed-supervisor.broken
 sudo mv /opt/aed-supervisor.old /opt/aed-supervisor
 ```
@@ -22,14 +27,14 @@ sudo mv /opt/aed-supervisor.old /opt/aed-supervisor
 ## 3. Restart the service
 
 ```bash
-sudo systemctl start aed-supervisor@aed-supervisor.service
+sudo systemctl start aed-supervisor@<instance>.service
 ```
 
 ## 4. Verify
 
 ```bash
-systemctl --user status aed-supervisor@aed-supervisor.service
-journalctl --user -u aed-supervisor@aed-supervisor.service -n 50
+sudo systemctl status aed-supervisor@<instance>.service
+sudo journalctl -u aed-supervisor@<instance>.service -n 50
 ```
 
 The persistent state files (lease, snapshots, readiness
@@ -45,7 +50,7 @@ with the corrupted state. Instead:
 
 1. Stop the service.
 2. Inspect the state directory: `ls -la /var/lib/aed-supervisor/state/`.
-3. Move any state file with `journalctl --user -u aed-supervisor` error
+3. Move any state file with `sudo journalctl -u aed-supervisor` error
    references to `/var/lib/aed-supervisor/state/quarantine/`.
 4. Restart the service — it will start in `ACTIVE_REPAIR` and
    rebuild the missing state from the live PR.
@@ -61,9 +66,12 @@ simply stop the source-controlled service and start the
 legacy service:
 
 ```bash
-sudo systemctl stop aed-supervisor@aed-supervisor.service
+sudo systemctl stop aed-supervisor@<instance>.service
 systemctl --user start aed-supervisor-legacy.service
 ```
 
 (Where `aed-supervisor-legacy.service` is the systemd unit
-that launches `~/.hermes/aed-supervisor/supervisor.py`.)
+that launches `~/.hermes/aed-supervisor/supervisor.py`. Note
+that the legacy unit is intentionally user-scoped because it
+runs under a per-user systemd manager; the source-controlled
+unit is system-scoped because it has its own system user.)

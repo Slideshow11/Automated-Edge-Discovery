@@ -55,19 +55,19 @@ identity.
 
 ## Layout
 
-```
+```text
 scripts/local/autocoder_supervisor/
 ├── __init__.py
-├── contracts.py          # TypedDicts for every supervisor concept
-├── config.py             # SupervisorConfig loader + validator
-├── supervisor.py         # ported v5 implementation
-├── validate.py           # dry-run validation command
-├── INVARIANTS.md         # versioned invariant ledger
-├── README.md             # this file
+├── contracts.py
+├── config.py
+├── supervisor.py
+├── validate.py
+├── INVARIANTS.md
+├── README.md
 ├── examples/
 │   └── aed-supervisor.example.toml
 ├── service/
-│   └── aed-supervisor.service.template
+│   └── aed-supervisor@.service.template
 └── docs/
     ├── INSTALL.md
     ├── UPGRADE.md
@@ -88,7 +88,8 @@ cp scripts/local/autocoder_supervisor/examples/aed-supervisor.example.toml \
 $EDITOR /etc/aed-supervisor-canary.toml
 
 # 3. Run the dry-run validation.
-python3 -m autocoder_supervisor.validate --config /etc/aed-supervisor-canary.toml
+PYTHONPATH=scripts/local \
+    python3 -m autocoder_supervisor.validate --config /etc/aed-supervisor-canary.toml
 
 # 4. Run a single iteration (--once exits after one heartbeat).
 PYTHONPATH=scripts/local \

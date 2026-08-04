@@ -42,8 +42,18 @@ behavioural contracts and invariant ledger are the canonical
 description of the system. The ``ReviewProvider`` abstraction
 described in the long-term README is intentionally deferred to
 the standalone Autocoder extraction and is **not** implemented
-inside this stabilization PR.
+inside this stabilization PR. The supervisor source is
+importable and runnable.
 """
 from __future__ import annotations
 
-__all__ = ["contracts", "config", "supervisor", "validate"]
+# Submodules are not eagerly imported here because importing
+# ``supervisor`` triggers the configuration bootstrap (which
+# loads environment variables and constructs the PROVIDERS
+# dict from ``SupervisorConfig.default_config_from_env()``).
+# Import the submodules you need explicitly:
+#
+#     from autocoder_supervisor import supervisor
+#     from autocoder_supervisor import validate
+#     from autocoder_supervisor import config
+#     from autocoder_supervisor import contracts

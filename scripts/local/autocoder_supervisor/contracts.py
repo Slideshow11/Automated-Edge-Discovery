@@ -113,12 +113,14 @@ class SupervisorConfig:
     ) -> "SupervisorConfig":
         """Validate and construct a ``SupervisorConfig``.
 
-        ``reject_user_paths`` defaults to True so an
-        accidentally-committed configuration cannot leak the
-        operator's home directory. ``default_config_from_env``
-        and tests may pass ``False`` so that an in-process
-        default — which is never persisted — can point at the
-        current working checkout.
+        ``reject_user_paths`` defaults to True. The strict
+        guard is the canonical contract: any *persisted*
+        configuration (e.g. one loaded from a TOML file via
+        ``load_config``) is rejected if it points at an
+        absolute user-specific path. ``default_config_from_env``
+        and tests pass ``reject_user_paths=False`` because
+        their in-process configurations are never persisted
+        to the source tree.
 
         Raises ``ValueError`` on any invalid input. The
         validator explicitly rejects tokens, cookies, and

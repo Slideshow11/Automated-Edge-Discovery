@@ -25,7 +25,8 @@ that creates a fresh state directory under
 `tempfile.mkdtemp(prefix="aed-supervisor-")`:
 
 ```bash
-python3 -m autocoder_supervisor.supervisor --isolated-state --once
+PYTHONPATH=scripts/local \
+    python3 -m autocoder_supervisor.supervisor --isolated-state --once
 ```
 
 This is useful for smoke-testing the daemon loop against a

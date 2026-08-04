@@ -48,7 +48,24 @@ from .config import (
 from .contracts import SupervisorConfigDict, SupervisorConfig
 
 
-def _check_state_dir(state_dir: Path, errors: list[str]) -> None:
+def _check_state_dir(
+    state_dir: Path, errors: list[str], warnings: list[str]
+) -> None:
+    """Verify the state directory is set up correctly.
+
+    The dry-run validator does NOT create or chmod the
+    state directory — those mutations belong to the
+    supervisor's startup path, not the validator. The
+    validator only reports what is wrong.
+    """
+    parent = state_dir.parent
+    if parent.exists() and not os.access(parent, os.W_OK):
+        errors.append(
+            f"state_dir parent {parent} is not writable; "
+            "the supervisor cannot create the state directory "
+            "at startup"
+        )
+        return
     if state_dir.exists():
         if not state_dir.is_dir():
             errors.append(
@@ -62,17 +79,12 @@ def _check_state_dir(state_dir: Path, errors: list[str]) -> None:
                 f"({oct(mode)}); expected 0700"
             )
     else:
-        try:
-            state_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            errors.append(
-                f"state_dir {state_dir} cannot be created: {e}"
-            )
-            return
-        try:
-            os.chmod(state_dir, 0o700)
-        except Exception:
-            pass
+        # The directory does not exist. The supervisor will
+        # create it on startup; record an advisory.
+        warnings.append(
+            f"state_dir {state_dir} does not exist; "
+            "the supervisor will create it on startup"
+        )
 
 
 def _check_repo_accessible(
@@ -83,19 +95,33 @@ def _check_repo_accessible(
             f"working_checkout {working_checkout} does not exist"
         )
         return
-    if not (working_checkout / ".git").exists():
+    # A linked Git worktree has a `.git` file (not a
+    # directory), so we cannot pre-check with a `.git` directory
+    # test. Use `git -C ... status` to validate.
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(working_checkout), "status",
+             "--porcelain"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except FileNotFoundError:
         errors.append(
-            f"working_checkout {working_checkout} is not a git working tree"
+            f"`git` executable not on PATH; cannot validate "
+            f"working_checkout {working_checkout}"
         )
         return
-    # Best-effort: `git status --porcelain` returns 0 if git
-    # can read the tree.
-    res = subprocess.run(
-        ["git", "-C", str(working_checkout), "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
+    except subprocess.TimeoutExpired:
+        errors.append(
+            f"git status timed out for working_checkout "
+            f"{working_checkout}; cannot validate"
+        )
+        return
+    except OSError as e:
+        errors.append(
+            f"working_checkout {working_checkout} cannot be "
+            f"inspected by git: {e}"
+        )
+        return
     if res.returncode != 0:
         errors.append(
             f"working_checkout {working_checkout} is not accessible to "
@@ -136,8 +162,16 @@ def _check_lease_conflict(
             f"worker_lease.json at {lease} could not be parsed: {e}"
         )
         return
+    # Accept only positive integer PIDs. Reject strings,
+    # floats, negatives, and booleans outright — they are
+    # either malformed or a sign of corruption.
     pid = data.get("pid")
-    if not pid:
+    if not isinstance(pid, int) or pid <= 0:
+        warnings.append(
+            f"worker_lease.json at {lease} has malformed pid={pid!r}; "
+            "the supervisor will revoke and rewrite the lease on "
+            "startup"
+        )
         return
     try:
         os.kill(pid, 0)
@@ -146,11 +180,23 @@ def _check_lease_conflict(
             "if it is the same instance, but if you are starting a new "
             "instance you must first revoke the old lease"
         )
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         warnings.append(
             f"stale worker_lease.json at {lease} points at pid={pid} "
             "which is not alive; the supervisor will detect this on "
             "startup and revoke it"
+        )
+    except PermissionError:
+        # PermissionError means the process exists but the
+        # current user cannot signal it. This is an
+        # unresolved live-lease conflict — the supervisor
+        # cannot safely launch a new worker while this lease
+        # is held by an inaccessible process.
+        errors.append(
+            f"worker_lease.json at {lease} is held by pid={pid} "
+            "which the current user cannot signal; "
+            "an operator must manually revoke this lease "
+            "before starting a new instance"
         )
     except OSError as e:
         if e.errno == 1:
@@ -158,6 +204,69 @@ def _check_lease_conflict(
                 f"worker_lease.json at {lease} is owned by a process "
                 f"the current user cannot signal (pid={pid})"
             )
+        else:
+            warnings.append(
+                f"worker_lease.json at {lease} could not be inspected: "
+                f"{e}"
+            )
+
+
+def _check_runtime_file_mode(
+    path: Path, errors: list[str], mode_required: int = 0o600
+) -> None:
+    """Verify that a runtime file has restrictive permissions."""
+    if not path.exists():
+        return
+    mode = path.stat().st_mode & 0o777
+    if mode & 0o077:
+        errors.append(
+            f"{path} is accessible to group/other ({oct(mode)}); "
+            f"expected {oct(mode_required)}"
+        )
+
+
+def _check_pr_head_match(
+    cfg: SupervisorConfig, errors: list[str]
+) -> None:
+    """Verify that the configured PR head matches the live PR head.
+
+    This catches a stale checkout — the operator could have
+    a configuration pointing at one head while the live PR
+    has moved on. Validation must not silently report success
+    in that case.
+    """
+    import json as _json
+
+    head = os.environ.get("AED_AUTHORITATIVE_HEAD", "").strip()
+    if not head:
+        # No head pinned in the environment — the operator
+        # has not yet pinned an authoritative head. Skip the
+        # check rather than fail spuriously.
+        return
+    if not cfg.working_checkout:
+        return
+    repo = Path(cfg.working_checkout)
+    if not (repo / ".git").exists() and not (
+        repo.exists() and (repo / ".git").is_file()
+    ):
+        # Already reported by _check_repo_accessible; skip.
+        return
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return
+    if out.returncode != 0:
+        return
+    local_head = out.stdout.strip()
+    if local_head != head:
+        errors.append(
+            f"working_checkout HEAD {local_head!r} does not match "
+            f"the configured authoritative head {head!r}; "
+            "the supervisor will refuse readiness until they match"
+        )
 
 
 def validate_environment(
@@ -171,10 +280,18 @@ def validate_environment(
     errors: list[str] = []
     warnings: list[str] = []
     state_dir = Path(cfg.state_dir)
-    _check_state_dir(state_dir, errors)
+    _check_state_dir(state_dir, errors, warnings)
     _check_repo_accessible(Path(cfg.working_checkout), errors)
     _check_provider_policy(cfg, errors)
     _check_lease_conflict(state_dir, errors, warnings)
+    _check_pr_head_match(cfg, errors)
+    # Verify runtime files use restrictive modes.
+    for runtime_path in (
+        Path(cfg.log_path),
+        Path(cfg.heartbeat_path),
+        Path(cfg.lock_path),
+    ):
+        _check_runtime_file_mode(runtime_path, errors)
     return errors, warnings
 
 

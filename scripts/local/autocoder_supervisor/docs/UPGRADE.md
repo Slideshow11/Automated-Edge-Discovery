@@ -8,13 +8,13 @@ versions.
 ## In-place upgrade (same `v1` schema)
 
 ```bash
-sudo systemctl stop aed-supervisor@aed-supervisor.service
+sudo systemctl stop aed-supervisor@<instance>.service
 sudo install -d /opt/aed-supervisor.new
 sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor.new/
 # Replace the old install atomically:
 sudo mv /opt/aed-supervisor /opt/aed-supervisor.old
 sudo mv /opt/aed-supervisor.new /opt/aed-supervisor
-sudo systemctl start aed-supervisor@aed-supervisor.service
+sudo systemctl start aed-supervisor@<instance>.service
 ```
 
 The supervisor's persistent state (lease, snapshots, readiness
@@ -36,8 +36,8 @@ When the `schema_version` field changes (e.g. v1 → v2):
 After upgrading, check that the service started cleanly:
 
 ```bash
-systemctl --user status aed-supervisor@aed-supervisor.service
-journalctl --user -u aed-supervisor@aed-supervisor.service -n 50
+sudo systemctl status aed-supervisor@<instance>.service
+sudo journalctl -u aed-supervisor@<instance>.service -n 50
 ```
 
 Look for:

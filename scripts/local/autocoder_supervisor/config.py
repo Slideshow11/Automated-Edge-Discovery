@@ -237,6 +237,14 @@ def validate_config_dict(
             raise ValueError(
                 f"supervisor config: {k} must be a non-negative integer"
             )
+    # Cadence keys must be strictly positive; ``0`` would turn
+    # the supervisor loop into an unthrottled GitHub API
+    # poller and trigger rate limiting.
+    for k in ("heartbeat_seconds", "quiet_window_seconds"):
+        if int(data[k]) < 1:
+            raise ValueError(
+                f"supervisor config: {k} must be at least 1 second"
+            )
 
     # Worker command must be a non-empty list of strings.
     wc = data.get("worker_command")
@@ -252,11 +260,17 @@ def validate_config_dict(
 
 
 def load_config(path: str | os.PathLike[str]) -> SupervisorConfig:
-    """Load and validate a supervisor configuration from TOML."""
+    """Load and validate a supervisor configuration from TOML.
+
+    Persisted TOML files are validated against the strict
+    user-path guard because they are exactly the artifact that
+    could leak the operator's home directory into the source
+    tree if the guard were disabled.
+    """
     p = Path(path)
     text = p.read_text()
     data = tomllib.loads(text)
-    return SupervisorConfig.from_dict(data, reject_user_paths=False)  # type: ignore[arg-type]
+    return SupervisorConfig.from_dict(data)  # type: ignore[arg-type]
 
 
 def default_config_from_env() -> SupervisorConfig:
@@ -266,6 +280,14 @@ def default_config_from_env() -> SupervisorConfig:
     without an explicit configuration. The paths default to
     safe non-user locations so the package can be unit-tested
     in CI without any host-specific state.
+
+    The fallback is intentionally an *in-process* default —
+    it is never persisted. The ``reject_user_paths`` guard is
+    therefore disabled (``from_dict(reject_user_paths=False)``)
+    so the operator's local ``$PWD``-derived
+    ``working_checkout`` is accepted. The strict guard is
+    reserved for ``load_config``, which reads a *persisted*
+    TOML file.
     """
     state_dir = os.environ.get(
         "AED_SUPERVISOR_STATE_DIR", "/tmp/aed-supervisor/state"
@@ -279,9 +301,14 @@ def default_config_from_env() -> SupervisorConfig:
     lock_path = os.environ.get(
         "AED_SUPERVISOR_LOCK_PATH", "/tmp/aed-supervisor/lock"
     )
+    # The working_checkout falls back to $PWD for the
+    # in-process default. This is acceptable because the
+    # result is never persisted; load_config (which reads
+    # TOML files) is what guards against committed user
+    # paths.
     working_checkout = os.environ.get(
         "AED_SUPERVISOR_WORKING_CHECKOUT",
-        os.environ.get("PWD", "/tmp"),
+        os.environ.get("PWD", "/tmp/aed-supervisor/working_checkout"),
     )
 
     data: SupervisorConfigDict = {

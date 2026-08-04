@@ -50,23 +50,29 @@ the configuration.
 
 ## 4. Install the systemd service
 
+The committed file is a systemd *template unit*. The systemd
+convention requires template units to be named with the
+literal `@` in the filename (so `foo@.service` becomes
+`foo@<instance>.service` when instantiated). Copy the file to
+`/etc/systemd/system/aed-supervisor@.service`:
+
 ```bash
-sudo cp scripts/local/autocoder_supervisor/service/aed-supervisor.service.template \
-    /etc/systemd/system/aed-supervisor@aed-supervisor.service
+sudo cp scripts/local/autocoder_supervisor/service/aed-supervisor@.service.template \
+    /etc/systemd/system/aed-supervisor@.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now aed-supervisor@aed-supervisor.service
+sudo systemctl enable --now aed-supervisor@<instance>.service
 ```
 
-(The `%i` placeholder is replaced by the systemd instance
-name — e.g. `aed-supervisor` above — which lets multiple
-supervisor instances coexist under different names with
-different state directories and configurations.)
+The `<instance>` placeholder names the supervisor instance —
+e.g. `aed-supervisor@canary.service`. `%i` inside the unit
+expands to `<instance>`, so different instances can coexist
+with different state directories and configurations.
 
 ## 5. Verify
 
 ```bash
-systemctl --user status aed-supervisor@aed-supervisor.service
-journalctl --user -u aed-supervisor@aed-supervisor.service -f
+sudo systemctl status aed-supervisor@<instance>.service
+sudo journalctl -u aed-supervisor@<instance>.service -f
 ```
 
 You should see the supervisor log "supervisor started

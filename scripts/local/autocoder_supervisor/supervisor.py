@@ -481,11 +481,7 @@ def list_review_requests() -> list:
 def write_review_request(
     provider: str, head_sha: str, record: dict
 ) -> None:
-    REVIEW_REQUESTS_DIR.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
-    p = review_request_path(provider, head_sha)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(record, indent=2))
-    os.replace(tmp, p)
+    write_json(review_request_path(provider, head_sha), record)
 
 
 def read_review_request(
@@ -516,10 +512,7 @@ def read_quota_state() -> dict:
 
 
 def write_quota_state(state: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
-    tmp = QUOTA_PATH.with_suffix(".tmp")  # type: ignore[name-defined]
-    tmp.write_text(json.dumps(state, indent=2))
-    os.replace(tmp, QUOTA_PATH)  # type: ignore[name-defined]
+    write_json(QUOTA_PATH, state)  # type: ignore[name-defined]
 
 
 def is_provider_quota_message(
@@ -691,10 +684,7 @@ def read_lease() -> Optional[dict]:
 
 
 def write_lease(lease: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
-    tmp = LEASE_PATH.with_suffix(".tmp")  # type: ignore[name-defined]
-    tmp.write_text(json.dumps(lease, indent=2))
-    os.replace(tmp, LEASE_PATH)  # type: ignore[name-defined]
+    write_json(LEASE_PATH, lease)  # type: ignore[name-defined]
 
 
 def remove_lease() -> None:
@@ -757,26 +747,49 @@ def lease_alive(lease: dict) -> Optional[dict]:
         cwd = os.readlink(f"/proc/{pid}/cwd")
     except Exception:
         return None
-    if not cwd.endswith("Automated-Edge-Discovery"):
+    # The worker must have been launched from the configured
+    # working_checkout. Comparing against REPO_DIR (which is
+    # the configured path) lets operators use any checkout
+    # directory name, not only "Automated-Edge-Discovery".
+    repo_dir = str(REPO_DIR).rstrip("/")  # type: ignore[name-defined]
+    if not (cwd == repo_dir or cwd.endswith("/" + repo_dir.split("/")[-1])):
         return None
     lease["heartbeat_at"] = now_iso()
     return lease
 
 
 def write_cooldown() -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
-    tmp = LAST_RESUME_PATH.with_suffix(".tmp")  # type: ignore[name-defined]
-    tmp.write_text(now_iso())
-    os.replace(tmp, LAST_RESUME_PATH)  # type: ignore[name-defined]
+    """Persist the cooldown timestamp atomically.
+
+    The file is plain text (an ISO timestamp) so we reuse
+    ``write_json`` for the atomic rename + 0600 chmod path.
+    """
+    write_json(LAST_RESUME_PATH, {"ts": now_iso()})  # type: ignore[name-defined]
 
 
 def read_cooldown() -> Optional[str]:
+    """Read the persisted cooldown timestamp.
+
+    The file is JSON with an envelope ``{"ts": <ISO>}``;
+    legacy plain-text cooldown files are still accepted.
+    """
     try:
-        return LAST_RESUME_PATH.read_text().strip()  # type: ignore[name-defined]
+        text = LAST_RESUME_PATH.read_text().strip()  # type: ignore[name-defined]
     except FileNotFoundError:
         return None
     except Exception:
         return None
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "ts" in data:
+            return str(data["ts"])
+    except Exception:
+        pass
+    # Legacy plain-text format: the file content was a bare
+    # ISO timestamp.
+    return text
 
 
 def cooldown_active() -> bool:
@@ -804,24 +817,79 @@ def build_resume_prompt(rs: dict, live: dict) -> str:
     )
 
 
+def _resolve_hermes_bin() -> Optional[str]:
+    """Locate the hermes CLI binary via PATH.
+
+    Returns the absolute path or ``None`` if the binary is
+    not on PATH. Any exception (e.g. ``which`` not installed)
+    is treated as "not found".
+    """
+    try:
+        return subprocess.check_output(
+            ["which", "hermes"], text=True, timeout=10
+        ).strip() or None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def launch_worker(rs: dict, live: dict) -> Optional[dict]:
     prompt = build_resume_prompt(rs, live)
+    # Resolve the hermes binary: prefer AED_HERMES_BIN, then
+    # the configured worker_command (whose first element is
+    # the binary path), then `which hermes`.
+    configured_cmd = list(WORKER_COMMAND_TEMPLATE)  # type: ignore[name-defined]
     hermes_bin = (
         os.environ.get("AED_HERMES_BIN")
-        or subprocess.check_output(["which", "hermes"], text=True).strip()
+        or (configured_cmd[0] if configured_cmd else None)
+        or _resolve_hermes_bin()
     )
-    cmd = [
-        hermes_bin,
-        "chat",
-        "-q",
-        prompt,
-        "--resume",
-        SESSION_ID,  # type: ignore[name-defined]
-        "--no-restore-cwd",
-        "--accept-hooks",
-        "--yolo",
-        "-Q",
-    ]
+    if not hermes_bin:
+        log(
+            "error",
+            "could not resolve hermes binary; "
+            "set AED_HERMES_BIN or configure worker_command[0]",
+        )
+        return None
+    # Build the launch command by substituting {prompt} and
+    # {session_id} into the configured template (if any) and
+    # appending the standard flags. The configured template
+    # is honoured so the operator can override individual
+    # flags; the post-substitution flags are appended if they
+    # are not already present.
+    if configured_cmd:
+        cmd = [
+            part.format(
+                prompt=prompt,
+                session_id=SESSION_ID,  # type: ignore[name-defined]
+            )
+            for part in configured_cmd
+        ]
+        # The configured template provides the launch
+        # arguments; do not append the standard flags if they
+        # are already there.
+        standard_tail = (
+            "--no-restore-cwd", "--accept-hooks", "--yolo", "-Q",
+        )
+        if not any(t in cmd for t in standard_tail):
+            cmd.extend(standard_tail)
+        # If the configured command did not include the
+        # hermes binary path (e.g. it was just `["hermes",
+        # "chat", ...]`), substitute the resolved path.
+        if cmd[0] in ("hermes", "hermes-chat"):
+            cmd[0] = hermes_bin
+    else:
+        cmd = [
+            hermes_bin,
+            "chat",
+            "-q",
+            prompt,
+            "--resume",
+            SESSION_ID,  # type: ignore[name-defined]
+            "--no-restore-cwd",
+            "--accept-hooks",
+            "--yolo",
+            "-Q",
+        ]
     log(
         "info",
         "launching worker in own process group",
@@ -1213,6 +1281,32 @@ def correlate_provider_review(
     return result
 
 
+def compute_globally_paused(
+    providers: dict[str, dict[str, Any]],
+    paused_providers: list[str],
+) -> bool:
+    """Decide whether the run is globally paused.
+
+    A run is globally paused only when every provider eligible
+    for the current repair round is paused. A single paused
+    optional provider must NEVER globally pause the run when
+    at least one required provider is still available.
+
+    This helper is the canonical implementation; tests should
+    call it rather than re-implementing the rule.
+    """
+    paused_set = set(paused_providers)
+    providers_required_for_current_round = [
+        p for p, cfg in providers.items()
+        if cfg.get("required_for_current_repair_round", False)
+        and p not in paused_set
+    ]
+    return (
+        bool(paused_providers)
+        and len(providers_required_for_current_round) == 0
+    )
+
+
 def resume_if_eligible(rs: dict, live: dict) -> str:
     cls = (
         rs.get("round103_resume", {}).get("resume_classification") or ""
@@ -1221,15 +1315,9 @@ def resume_if_eligible(rs: dict, live: dict) -> str:
         return "stop"
     statuses = process_provider_quotas(live)
     any_paused, paused = handle_paused_providers(live, statuses)
-    paused_set = set(paused)
-    providers_required_for_current_round = [
-        p for p, cfg in PROVIDERS.items()
-        if cfg.get("required_for_current_repair_round", False)
-        and p not in paused_set
-    ]
     globally_paused = (
         any_paused
-        and len(providers_required_for_current_round) == 0
+        and compute_globally_paused(PROVIDERS, paused)
     )
     if globally_paused:
         run = read_run_state()
@@ -1237,7 +1325,7 @@ def resume_if_eligible(rs: dict, live: dict) -> str:
         run["round103_resume"]["resume_classification"] = (
             "PAUSED_ALL_REVIEW_PROVIDERS"
         )
-        RUN_STATE.write_text(json.dumps(run, indent=2))  # type: ignore[name-defined]
+        write_json(RUN_STATE, run)  # type: ignore[name-defined]
         return "quota_paused"
     lease = read_lease()
     if lease:
@@ -1294,6 +1382,7 @@ def resume_if_eligible(rs: dict, live: dict) -> str:
     request_records = list_review_requests()
     surfaces_by_provider = {}
     active_provider = None
+    paused_set = set(paused)
     for provider in PROVIDERS:
         if provider in paused_set:
             continue
@@ -1357,10 +1446,31 @@ def read_json(path: Path) -> dict:
 
 
 def write_json(path: Path, data: dict) -> None:
+    """Atomically write JSON to ``path`` with restrictive permissions.
+
+    The atomic write is performed by writing to a sibling
+    temporary file and renaming it into place. After the
+    rename the file mode is forced to 0o600 so the
+    process-umask does not leak the file to group or other.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    # Set restrictive mode on the temp file before the
+    # rename so the file's mode is never world-readable
+    # even briefly.
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
     os.replace(tmp, path)
+    # Belt-and-braces: enforce 0600 on the renamed path
+    # too. Some filesystems ignore chmod on the source of a
+    # rename and only honour it on the destination.
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1494,20 +1604,30 @@ def capture_live_snapshot(rs: dict, token: str) -> dict:
     all_threads: list[tuple[str, bool, bool]] = []
     cursor = None
     for _ in range(6):
-        vars_data = {}
+        vars_data = {
+            "owner": REPO_OWNER,  # type: ignore[name-defined]
+            "name": REPO_NAME,  # type: ignore[name-defined]
+            "number": int(PR_NUMBER),  # type: ignore[name-defined]
+        }
         if cursor:
             vars_data["cursor"] = cursor
+        # Use GraphQL variables rather than concatenating
+        # owner / name / number into the query document. This
+        # is the GitHub-recommended pattern and prevents
+        # accidental injection of operator-controlled values
+        # into the GraphQL parser.
         query = (
-            'query($cursor: String) { repository(owner: "'
-            + REPO_OWNER + '", name: "' + REPO_NAME + '") {'  # type: ignore[name-defined]
-            ' pullRequest(number: ' + str(PR_NUMBER) + ') {'  # type: ignore[name-defined]
-            '   reviewThreads(first: 100, after: $cursor) {'
-            '     pageInfo { hasNextPage endCursor }'
-            '     nodes { id isResolved isOutdated } } } } }'
+            "query($owner: String!, $name: String!, "
+            "$number: Int!, $cursor: String) "
+            "{ repository(owner: $owner, name: $name) "
+            "{ pullRequest(number: $number) "
+            "{ reviewThreads(first: 100, after: $cursor) "
+            "{ pageInfo { hasNextPage endCursor } "
+            "nodes { id isResolved isOutdated } } } } }"
         )
         payload = json.dumps({
             "query": query,
-            "variables": vars_data or None,
+            "variables": vars_data,
         }).encode()
         req = urllib.request.Request(
             "https://api.github.com/graphql",
@@ -1668,7 +1788,9 @@ def any_required_provider_in_progress(snap: dict) -> bool:
     return False
 
 
-def evaluate_readiness(snap: dict, head: str = None) -> dict:
+def evaluate_readiness(
+    snap: dict, head: Optional[str] = None,
+) -> dict:
     h = head or AUTHORITATIVE_HEAD  # type: ignore[name-defined]
     if not snap or snap.get("head_sha") != h:
         return {"ready": False, "reason": "head_mismatch"}
@@ -1898,13 +2020,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 globals()[k] = globals()["STATE_DIR"] / "snapshot_b.json"
             elif k == "READINESS_STATE_PATH":
                 globals()[k] = globals()["STATE_DIR"] / "readiness_state.json"
-        RUN_STATE.write_text(  # type: ignore[name-defined]
-            json.dumps({
+        write_json(  # type: ignore[name-defined]
+            RUN_STATE,
+            {
                 "current_head": AUTHORITATIVE_HEAD,  # type: ignore[name-defined]
                 "round103_resume": {
                     "resume_classification": "PR416_ROUND111_IN_PROGRESS",
                 },
-            })
+            },
         )
 
     if not acquire_lock():
