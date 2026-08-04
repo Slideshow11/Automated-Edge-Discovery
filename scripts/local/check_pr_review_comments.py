@@ -1343,6 +1343,12 @@ def _is_review_bot_summary_post(user: str, source_kind: str, body: str) -> bool:
     classifier. The gate must NOT classify these summary posts
     as blockers, even when they have no actionable findings.
 
+    The same body shape is also used as the CodeRabbit REVIEW
+    body (the body of the PR review record itself, not an
+    issue comment). When ``source_kind == "review"`` the body is
+    the review's persisted body, which also begins with the
+    walkthrough prefix.
+
     The structural discriminator is the leading byte sequence:
 
     * ``<!-- This is an auto-generated comment: summarize by
@@ -1352,11 +1358,8 @@ def _is_review_bot_summary_post(user: str, source_kind: str, body: str) -> bool:
     * ``<!-- review_stack_entry_start -->`` precedes the walkthrough
       section and is a reliable secondary marker.
 
-    Only applies to issue-comment source_kind (these are
-    walkthrough posts, not inline review-thread comments).
+    Applies to issue-comment AND review source_kinds.
     """
-    if source_kind != "issue_comment":
-        return False
     if user != "coderabbitai[bot]":
         return False
     body_lc = body.lower()
@@ -2260,6 +2263,17 @@ def main() -> int:
         if sev not in ("P0", "P1", "UNSPECIFIED_BLOCKING", "P2"):
             continue
         thread_resolved = f.get("thread_resolved", False)
+        # Round-112 P2 fix: walkthrough / summary posts from
+        # CodeRabbit are NOT findings even when stale. The
+        # CodeRabbit walkthrough has been superseded by the
+        # latest incremental review and must not block the
+        # gate on the new head.
+        if _is_review_bot_summary_post(
+            user=f.get("user", ""),
+            source_kind=f.get("_source_kind", "issue_comment"),
+            body=f.get("body", ""),
+        ):
+            continue
         if thread_resolved:
             # Resolved stale findings: reported as history, NOT blocking.
             resolved_stale_blockers.append(f)

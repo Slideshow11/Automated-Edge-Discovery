@@ -482,6 +482,32 @@ def assess_liveness(lock: dict) -> LivenessEvidence:
                 ctime_match=ctime_match,
             )
 
+    # Round-112 P2 fix (CodeRabbit finding WJW_X): the previous
+    # implementation returned is_alive=False / is_indeterminate=False
+    # (definitively stale) when the PID exists but the recorded
+    # evidence is insufficient to make a positive or negative
+    # match (e.g. recorded_evidence has no stat_start_time and
+    # ctime_match is False). That classification is wrong: a live
+    # PID with no recorded evidence cannot be confirmed as the
+    # recorded owner, but it also cannot be definitively declared
+    # stale. Fail closed as INDETERMINATE so the caller treats it
+    # as a known-unknown and runs stale-lock recovery instead of
+    # risking a false positive that lets a hostile contender
+    # acquire the lease.
+    if isinstance(pid, int) and pid > 0 and _pid_exists(pid):
+        return LivenessEvidence(
+            is_alive=False,
+            is_indeterminate=True,
+            reason=(
+                "pid_live_no_recorded_start_evidence:"
+                f"{state_reason}:cannot_confirm_owner_without_recorded_"
+                "start_time;fail_closed_to_stale_recovery"
+            ),
+            pid_exists=True,
+            stat_start_time_match=False,
+            ctime_match=False,
+        )
+
     # Stale.
     return LivenessEvidence(
         is_alive=False,
