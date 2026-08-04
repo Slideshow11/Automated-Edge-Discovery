@@ -1330,6 +1330,55 @@ _CODEX_BOT_LOGIN_TASK_SUMMARY = "chatgpt-codex-connector"
 _CODEX_BOT_LOGIN_TASK_SUMMARY_BOT = "chatgpt-codex-connector[bot]"
 
 
+def _is_review_bot_summary_post(user: str, source_kind: str, body: str) -> bool:
+    """Return True iff ``body`` is a CodeRabbit walkthrough /
+    summary post (NOT a finding). The CodeRabbit bot posts an
+    issue-comment on every review run with a body that starts
+    with ``<!-- This is an auto-generated comment: summarize by
+    coderabbit.ai -->`` or ``<!-- review_stack_entry_start -->``
+    plus a walkthrough / pre-merge-checks section. The body
+    may incidentally mention ``suggestion`` / ``high`` /
+    ``medium`` (utm_medium) / ``CodeRabbit`` (provider name) /
+    any other content that triggers the CODEX_NEEDLES substring
+    classifier. The gate must NOT classify these summary posts
+    as blockers, even when they have no actionable findings.
+
+    The same body shape is also used as the CodeRabbit REVIEW
+    body (the body of the PR review record itself, not an
+    issue comment). When ``source_kind == "review"`` the body is
+    the review's persisted body, which also begins with the
+    walkthrough prefix.
+
+    The structural discriminator is the leading byte sequence:
+
+    * ``<!-- This is an auto-generated comment: summarize by
+      coderabbit.ai -->`` is the canonical CodeRabbit summary
+      prefix used for both the walkthrough and the in-progress
+      notice.
+    * ``<!-- review_stack_entry_start -->`` precedes the walkthrough
+      section and is a reliable secondary marker.
+
+    Applies to issue-comment AND review source_kinds.
+    """
+    if user != "coderabbitai[bot]":
+        return False
+    # Round-112 P3 fix (CodeRabbit finding WKNBc): the contract
+    # requires the marker at the START of the body. The previous
+    # implementation used `in` (substring match), which
+    # incorrectly classified a CodeRabbit issue-comment that
+    # quoted or embedded the marker later in its body as a
+    # summary. Use `startswith` for both markers. CodeRabbit's
+    # actual summary/walkthrough posts always begin with one of
+    # these markers, so a leading-byte test is sufficient.
+    body_lc = body.lower()
+    return (
+        body_lc.startswith(
+            "<!-- this is an auto-generated comment: summarize by coderabbit.ai -->"
+        )
+        or body_lc.startswith("<!-- review_stack_entry_start -->")
+    )
+
+
 def _is_codex_task_summary_issue_comment(
     user: str,
     source_kind: str,
@@ -1508,6 +1557,20 @@ def classify_item(
     # that mentions a prior ``P1`` / ``P2`` finding it fixed
     # is still classified as informational.
     if is_task_summary:
+        severity = "UNSPECIFIED_INFO"
+    # Round-112 P2 fix: CodeRabbit walkthrough / summary posts
+    # are NOT findings — they are coordination / progress posts
+    # that describe the review run. Their bodies contain
+    # CODEX_NEEDLES substrings (e.g. "suggestion" in the
+    # finishing_touch_suggestion section, "high" in the
+    # "high-level summary" enabled hint, "medium" in the
+    # utm_medium query parameter, and CodeRabbit's own provider
+    # name in the review profile). The gate must NOT classify
+    # these as blockers even when the body shape happens to
+    # match a CODEX_NEEDLES substring.
+    elif _is_review_bot_summary_post(
+        user=user, source_kind=source_kind, body=body
+    ):
         severity = "UNSPECIFIED_INFO"
     # Fail-closed default: unresolved Codex threads without
     # extractable severity default to P2 (blocking).
@@ -2209,6 +2272,17 @@ def main() -> int:
         if sev not in ("P0", "P1", "UNSPECIFIED_BLOCKING", "P2"):
             continue
         thread_resolved = f.get("thread_resolved", False)
+        # Round-112 P2 fix: walkthrough / summary posts from
+        # CodeRabbit are NOT findings even when stale. The
+        # CodeRabbit walkthrough has been superseded by the
+        # latest incremental review and must not block the
+        # gate on the new head.
+        if _is_review_bot_summary_post(
+            user=f.get("user", ""),
+            source_kind=f.get("_source_kind", "issue_comment"),
+            body=f.get("body", ""),
+        ):
+            continue
         if thread_resolved:
             # Resolved stale findings: reported as history, NOT blocking.
             resolved_stale_blockers.append(f)

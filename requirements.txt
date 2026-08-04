@@ -40,6 +40,7 @@ boto3                         # S3 upload (lazy import in auditor.py, optional a
 pandas                        # both: test fixtures + engine modules (features, schema, etc.)
 statsmodels                   # both: calibrate_costs + diagnostics/inference
 matplotlib                    # calibrate_costs plotting
+hypothesis>=6.0               # property-based tests for guarded-ref mutation (test-only)
 numpy                         # both: test fixtures + throughout engine
 
 # === [optional] — Integration tools (planned / unconfirmed source imports) ===
