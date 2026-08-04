@@ -1362,11 +1362,20 @@ def _is_review_bot_summary_post(user: str, source_kind: str, body: str) -> bool:
     """
     if user != "coderabbitai[bot]":
         return False
+    # Round-112 P3 fix (CodeRabbit finding WKNBc): the contract
+    # requires the marker at the START of the body. The previous
+    # implementation used `in` (substring match), which
+    # incorrectly classified a CodeRabbit issue-comment that
+    # quoted or embedded the marker later in its body as a
+    # summary. Use `startswith` for both markers. CodeRabbit's
+    # actual summary/walkthrough posts always begin with one of
+    # these markers, so a leading-byte test is sufficient.
     body_lc = body.lower()
     return (
-        "<!-- this is an auto-generated comment: summarize by coderabbit.ai -->"
-        in body_lc
-        or "<!-- review_stack_entry_start -->" in body_lc
+        body_lc.startswith(
+            "<!-- this is an auto-generated comment: summarize by coderabbit.ai -->"
+        )
+        or body_lc.startswith("<!-- review_stack_entry_start -->")
     )
 
 

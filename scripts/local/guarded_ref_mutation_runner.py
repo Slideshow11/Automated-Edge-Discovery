@@ -516,6 +516,17 @@ class GuardedMutationOrchestrator:
                 # we cannot determine the actual remote state —
                 # fail closed with INDETERMINATE rather than
                 # passing the name to ls-remote.
+                #
+                # Round-112 P3 fix (CodeRabbit finding WKoC1):
+                # the previous version set `terminal_evidence`
+                # and returned while the plan status was still
+                # RECONCILING, and did not persist the change.
+                # The durable plan was therefore left in
+                # RECONCILING forever, blocking reconciliation
+                # retries. Now we set status=INDETERMINATE,
+                # set last_reconciled_at, and persist BEFORE
+                # returning so a recovery run sees the documented
+                # fail-closed INDETERMINATE outcome.
                 self.plan.terminal_evidence = (
                     f"clone_remote_url_unresolvable:"
                     f"remote.{remote}.url config missing or empty; "
@@ -523,6 +534,9 @@ class GuardedMutationOrchestrator:
                     f"operation={self.plan.operation} without "
                     f"authoritative URL"
                 )
+                self.plan.status = grm.LifecycleState.INDETERMINATE.value
+                self.plan.last_reconciled_at = _utcnow_iso()
+                _persist_plan(self.plan, self.workspace)
                 return self.plan
             read_result = _read_remote_ref_via_ls_remote(
                 clone_remote_url,

@@ -426,13 +426,41 @@ def authorize(workspace: Path, req: AuthorizationRequest, sentinel_fd: Optional[
                 rec.get("expected_main_sha") == req.expected_main_sha
                 and rec.get("expected_target_sha") == req.expected_target_sha
             )
-            if heads_match and rec.get("result") is None:
+            # Round-112 P3 fix (CodeRabbit finding WJW_E,
+            # originally incorrectly resolved): the duplicate
+            # scan previously compared only the expected heads
+            # and ignored `desired_after_sha`. Two records that
+            # share the same scope and the same expected heads
+            # but request DIFFERENT `desired_after_sha` values
+            # are NOT duplicates — they are two distinct
+            # intended mutations on the same ref at different
+            # SHAs (e.g. one PUSH to sha-A, then a second PUSH to
+            # sha-B). Without this check, the second
+            # authorization would be rejected as a duplicate
+            # even though it is a fresh, intended mutation. The
+            # mutation_id-based lookup that the prior
+            # disposition relied on belongs to
+            # record_result(), not to the duplicate-authorization
+            # scan in authorize().
+            desired_match = (
+                rec.get("desired_after_sha") == req.desired_after_sha
+            )
+            if heads_match and desired_match and rec.get("result") is None:
                 return AuthorizationOutcome(
                     ok=False,
                     mutation_id=None,
                     record=rec,
                     reason="duplicate_authorization",
                 )
+            # Round-112 P3 fix (WJW_E): same scope + same
+            # expected heads but DIFFERENT desired_after_sha
+            # is a distinct intended mutation. Skip BOTH the
+            # prior-result branch AND the heads-mismatch
+            # drift branch below for this case — neither is
+            # appropriate when the two records differ only in
+            # desired_after_sha.
+            if heads_match and not desired_match:
+                continue
             if heads_match and rec.get("result") is not None:
                 # Round-25 P1 fix (Allow a fresh authorization
                 # after a terminal result): if the previous

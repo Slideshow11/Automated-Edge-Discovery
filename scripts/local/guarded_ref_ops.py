@@ -79,16 +79,28 @@ def read_ref(repo: Path, ref: str) -> Optional[str]:
 
     Treats "" from git rev-parse as None. Any other nonzero
     return raises GuardedRefError.
+
+    Round-112 P3 fix (CodeRabbit finding WKoC_): the previous
+    implementation conflated "missing ref" (exit 1) with
+    repository-level failures (exit 128 from `fatal: not a git
+    repository`, or other non-1 non-zero codes). Both returned
+    None, so a malformed `local_repo` would silently report the
+    ref as missing. Now:
+      - exit 0  -> ref exists, return SHA
+      - exit 1  -> ref does not exist, return None
+      - any other nonzero -> raise GuardedRefError so the caller
+        treats the read as a failure (not as a missing ref)
+
+    For `--quiet` invocations, git returns:
+      - 0: ref exists
+      - 1: ref does not exist (no other output)
+      - 128: not a git repository (or similar repo-level failure)
+      - 2..127: reserved / undefined for our purposes
+
+    For legacy (non-quiet) invocations on older git without
+    `--quiet` support, we still fall back to the localized
+    substring match, but exit code != 0 and != 1 still raises.
     """
-    # Round-112 P2 fix (CodeRabbit finding WJXAD): use
-    # `--quiet` so git exits 0/1 without printing a localized
-    # stderr message that varies with NLS / locale. The
-    # previous implementation matched English substrings
-    # ("unknown revision", "Needed a single revision") which
-    # silently failed on non-English locales. Fall back to
-    # the substring match ONLY when --quiet is not supported
-    # (older git) so the legacy behavior is preserved for the
-    # rare case.
     cmd = ["git", "rev-parse", "--verify", "--quiet", ref]
     use_quiet = True
     try:
@@ -106,29 +118,35 @@ def read_ref(repo: Path, ref: str) -> Optional[str]:
     if result.returncode == 0:
         out = result.stdout.strip()
         return grm.oid_from_git(out)
-    # git rev-parse returns nonzero for non-existent refs.
-    if use_quiet:
-        # With --quiet, exit code 0 == ref exists, anything
-        # else == ref does not exist (or another error). We
-        # cannot distinguish a missing ref from a read
-        # failure here, but the runner's reconcile path
-        # treats a missing ref differently per operation
-        # type (DELETE=SUCCEEDED, CREATE=NOT_APPLIED,
-        # UPDATE/PUSH=INDETERMINATE) when the caller does
-        # not flag the read as indeterminate. Per WJXAB
-        # (Round-112 P2), the runner can opt into stricter
-        # INDETERMINATE classification via
-        # _read_remote_ref_via_query's `result.indeterminate`
-        # flag.
-        return None
-    err = result.stderr
-    if (
-        "unknown revision" in err
-        or "Needed a single revision" in err
-    ):
-        return None
+    # git rev-parse returns:
+    #   exit 1   -> ref does not exist (definitive)
+    #   exit 128 -> not a git repository, or repository failure
+    #               (must NOT be treated as "missing ref")
+    #   other nonzero -> other git-level failure
+    if result.returncode == 1:
+        # Definitive: ref does not exist.
+        if use_quiet:
+            return None
+        # Legacy non-quiet path: still verify via substring to
+        # filter out other exit-1 codes (e.g. sandbox errors).
+        err = result.stderr
+        if (
+            "unknown revision" in err
+            or "Needed a single revision" in err
+        ):
+            return None
+        raise GuardedRefError(
+            f"git rev-parse {ref} exit=1 but stderr did not "
+            f"indicate missing ref: {err.strip()}"
+        )
+    # Any other nonzero exit code: repository failure or other
+    # unexpected error. Surface as GuardedRefError so the caller
+    # treats the read as a failure (not as a missing ref) and
+    # avoids persisting a "missing" outcome for a malformed repo.
+    err = result.stderr or ""
     raise GuardedRefError(
-        f"git rev-parse {ref} failed: {err.strip()}"
+        f"git rev-parse {ref} failed with exit={result.returncode}: "
+        f"{err.strip()}"
     )
 
 
