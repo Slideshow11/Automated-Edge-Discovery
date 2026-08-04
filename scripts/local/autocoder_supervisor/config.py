@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -278,8 +279,8 @@ def default_config_from_env() -> SupervisorConfig:
 
     This is the fallback used when the package is imported
     without an explicit configuration. The paths default to
-    safe non-user locations so the package can be unit-tested
-    in CI without any host-specific state.
+    a per-process private runtime directory so that no local
+    user can pre-create or race the supervisor's state.
 
     The fallback is intentionally an *in-process* default —
     it is never persisted. The ``reject_user_paths`` guard is
@@ -289,17 +290,41 @@ def default_config_from_env() -> SupervisorConfig:
     reserved for ``load_config``, which reads a *persisted*
     TOML file.
     """
+    # Build a per-process private runtime directory.
+    # Prefer $XDG_RUNTIME_DIR (mode 0700 by convention) and
+    # fall back to a tempfile.mkdtemp() if it is not set.
+    # mkdtemp creates the directory with mode 0700.
+    import tempfile
+
+    runtime_root = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_root:
+        runtime_root = os.path.join(
+            runtime_root, f"aed-supervisor-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        )
+        os.makedirs(runtime_root, mode=0o700, exist_ok=True)
+    else:
+        runtime_root = tempfile.mkdtemp(
+            prefix=f"aed-supervisor-{os.getpid()}-",
+        )
+        # tempfile.mkdtemp creates with mode 0700 already;
+        # chmod is defensive in case the umask interfered.
+        try:
+            os.chmod(runtime_root, 0o700)
+        except OSError:
+            pass
+
     state_dir = os.environ.get(
-        "AED_SUPERVISOR_STATE_DIR", "/tmp/aed-supervisor/state"
+        "AED_SUPERVISOR_STATE_DIR", os.path.join(runtime_root, "state")
     )
     log_path = os.environ.get(
-        "AED_SUPERVISOR_LOG_PATH", "/tmp/aed-supervisor/supervisor.log"
+        "AED_SUPERVISOR_LOG_PATH", os.path.join(runtime_root, "supervisor.log")
     )
     heartbeat_path = os.environ.get(
-        "AED_SUPERVISOR_HEARTBEAT_PATH", "/tmp/aed-supervisor/heartbeat"
+        "AED_SUPERVISOR_HEARTBEAT_PATH",
+        os.path.join(runtime_root, "heartbeat"),
     )
     lock_path = os.environ.get(
-        "AED_SUPERVISOR_LOCK_PATH", "/tmp/aed-supervisor/lock"
+        "AED_SUPERVISOR_LOCK_PATH", os.path.join(runtime_root, "lock")
     )
     # The working_checkout falls back to $PWD for the
     # in-process default. This is acceptable because the
@@ -308,7 +333,7 @@ def default_config_from_env() -> SupervisorConfig:
     # paths.
     working_checkout = os.environ.get(
         "AED_SUPERVISOR_WORKING_CHECKOUT",
-        os.environ.get("PWD", "/tmp/aed-supervisor/working_checkout"),
+        os.environ.get("PWD", "/tmp/aed-supervisor-default/working_checkout"),
     )
 
     data: SupervisorConfigDict = {
