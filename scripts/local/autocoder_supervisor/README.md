@@ -79,21 +79,32 @@ scripts/local/autocoder_supervisor/
 ## Quick start (isolated canary)
 
 ```bash
-# 1. Pick a non-user-specific state directory.
-mkdir -p /var/lib/aed-supervisor-canary/state
+# 1. Pick a non-user-specific install root.
+sudo install -d /opt/aed-supervisor-canary
+sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor-canary/
+sudo cp scripts/local/pyproject.toml /opt/aed-supervisor-canary/pyproject.toml
 
-# 2. Copy the example config and edit it.
-cp scripts/local/autocoder_supervisor/examples/aed-supervisor.example.toml \
+# 2. Install into a venv (no PYTHONPATH needed once installed).
+sudo python3 -m venv /opt/aed-supervisor-canary/venv
+sudo /opt/aed-supervisor-canary/venv/bin/pip install --no-deps \
+    /opt/aed-supervisor-canary
+
+# 3. Copy the example config and edit it.
+sudo cp /opt/aed-supervisor-canary/autocoder_supervisor/examples/aed-supervisor.example.toml \
     /etc/aed-supervisor-canary.toml
-$EDITOR /etc/aed-supervisor-canary.toml
+sudo $EDITOR /etc/aed-supervisor-canary.toml
 
-# 3. Run the dry-run validation.
-PYTHONPATH=scripts/local \
-    python3 -m autocoder_supervisor.validate --config /etc/aed-supervisor-canary.toml
+# 4. Run the dry-run validation (installed package, no repo PYTHONPATH).
+PYTHONPATH= \
+    /opt/aed-supervisor-canary/venv/bin/python \
+    -m autocoder_supervisor.validate --config /etc/aed-supervisor-canary.toml
 
-# 4. Run a single iteration (--once exits after one heartbeat).
-PYTHONPATH=scripts/local \
-    python3 -m autocoder_supervisor.supervisor \
+# 5. Run a single iteration (--once exits after one heartbeat).
+PYTHONPATH= \
+    AED_PR_NUMBER=<N> AED_REPO_OWNER=<owner> AED_REPO_NAME=<repo> \
+    AED_AUTHORITATIVE_HEAD=<head_sha> \
+    /opt/aed-supervisor-canary/venv/bin/python \
+    -m autocoder_supervisor.supervisor \
     --config /etc/aed-supervisor-canary.toml --once
 ```
 

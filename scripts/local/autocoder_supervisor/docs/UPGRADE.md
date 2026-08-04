@@ -11,6 +11,7 @@ versions.
 sudo systemctl stop aed-supervisor@<instance>.service
 sudo install -d /opt/aed-supervisor.new
 sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor.new/
+sudo cp scripts/local/pyproject.toml /opt/aed-supervisor.new/pyproject.toml
 # Replace the old install atomically:
 sudo mv /opt/aed-supervisor /opt/aed-supervisor.old
 sudo mv /opt/aed-supervisor.new /opt/aed-supervisor

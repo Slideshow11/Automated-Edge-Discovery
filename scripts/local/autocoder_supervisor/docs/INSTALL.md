@@ -2,38 +2,82 @@
 
 The source-controlled supervisor is a Python package. It can
 be installed system-wide or into a virtualenv. The
-recommended production deployment uses a dedicated, dedicated
-system user and a systemd user service.
+recommended production deployment uses a dedicated system
+user and a systemd user service.
+
+## Source-tree layout
+
+The package is laid out so that the install root contains
+both `pyproject.toml` and the `autocoder_supervisor/`
+package directory side-by-side:
+
+```
+scripts/local/
+├── pyproject.toml                      # packaging manifest
+└── autocoder_supervisor/               # Python package
+    ├── __init__.py
+    ├── contracts.py
+    ├── config.py
+    ├── supervisor.py
+    ├── validate.py
+    ├── INVARIANTS.md
+    ├── README.md
+    ├── pyproject.toml                   # REMOVED — would confuse setuptools
+    ├── docs/
+    ├── examples/
+    └── service/
+```
+
+The committed `pyproject.toml` is at `scripts/local/pyproject.toml`
+(NOT inside `autocoder_supervisor/`). It is moved to the
+install root alongside the package directory.
 
 ## 1. Install the Python package
 
 Either system-wide:
 
 ```bash
-# Install root is /opt/aed-supervisor. The package lives at
-# <install-root>/autocoder_supervisor/ and the packaging
-# manifest at <install-root>/pyproject.toml. Both must
-# coexist at the install root for `pip install` to find
-# the package.
+# 1. Create the install root.
 sudo install -d /opt/aed-supervisor
-sudo cp -r scripts/local/autocoder_supervisor/. /opt/aed-supervisor/
+
+# 2. Copy the package directory into the install root.
+sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor/
+
+# 3. Copy the packaging manifest to the install root.
+sudo cp scripts/local/pyproject.toml /opt/aed-supervisor/pyproject.toml
+
+# 4. Install (no PYTHONPATH needed; the package is now
+#    importable as a regular distribution).
 sudo python3 -m pip install --no-deps /opt/aed-supervisor
 ```
 
 …or into a virtualenv:
 
 ```bash
+# 1. Stage the install root in a temp location.
+sudo install -d /opt/aed-supervisor-install
+sudo cp -r scripts/local/autocoder_supervisor /opt/aed-supervisor-install/
+sudo cp scripts/local/pyproject.toml /opt/aed-supervisor-install/pyproject.toml
+
+# 2. Create the venv.
 sudo install -d /opt/aed-supervisor/venv
 sudo python3 -m venv /opt/aed-supervisor/venv
-# Copy the package contents to a temp install root and
-# install from there, because the venv's pip needs the
-# package and manifest to live side-by-side at the
-# install root.
-sudo install -d /opt/aed-supervisor-install
-sudo cp -r scripts/local/autocoder_supervisor/. /opt/aed-supervisor-install/
+
+# 3. Install from the staged root.
 sudo /opt/aed-supervisor/venv/bin/pip install --no-deps \
     /opt/aed-supervisor-install
+
+# 4. Clean up the staging root.
 sudo rm -rf /opt/aed-supervisor-install
+```
+
+After install, verify the package is importable from outside
+the repository checkout:
+
+```bash
+python3 -c "import autocoder_supervisor; print(autocoder_supervisor.__file__)"
+python3 -m autocoder_supervisor.validate --help
+python3 -m autocoder_supervisor.supervisor --help
 ```
 
 ## 2. Prepare state + log directories

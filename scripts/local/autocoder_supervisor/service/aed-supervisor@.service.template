@@ -9,14 +9,25 @@ Type=simple
 # All paths below are absolute. The systemd template unit
 # is copied to /etc/systemd/system/aed-supervisor@.service
 # and instantiated as aed-supervisor@<instance>.service.
-# The instance-specific state directory and configuration
-# live under /var/lib/aed-supervisor/<instance>/ and
-# /etc/aed-supervisor/<instance>/ respectively, with
-# ``<instance>`` substituted by systemd at unit-load time.
+#
+# The supervisor package is installed at /opt/aed-supervisor
+# (via the documented procedure in docs/INSTALL.md). The
+# install root contains:
+#
+#     /opt/aed-supervisor/
+#     ├── pyproject.toml
+#     └── autocoder_supervisor/   <- the Python package
+#
+# ``pip install /opt/aed-supervisor`` registers the package
+# in the active Python environment's site-packages, so no
+# PYTHONPATH override is needed. The ExecStart uses the
+# venv Python explicitly when the operator installed the
+# package into a venv; substitute the appropriate path if
+# the install is system-wide.
 WorkingDirectory=/var/lib/aed-supervisor/%i
 Environment=HOME=/var/lib/aed-supervisor/%i
+Environment=PYTHONPATH=
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=PYTHONPATH=/opt/aed-supervisor
 Environment=AED_SUPERVISOR_CONFIG=/etc/aed-supervisor/%i/aed-supervisor.toml
 Environment=AED_PR_NUMBER=__SET_ME__
 Environment=AED_REPO_OWNER=__SET_ME__
