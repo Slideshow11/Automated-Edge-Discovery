@@ -302,13 +302,21 @@ def heartbeat_touch() -> None:
 def acquire_lock() -> bool:
     global _LOCK_FD
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
+    # Create the lock file with restrictive permissions
+    # (0600). The lock file contains the supervisor
+    # instance id and the holder PID, both of which are
+    # operator-sensitive.
     if not LOCK_PATH.exists():  # type: ignore[name-defined]
         LOCK_PATH.write_text(  # type: ignore[name-defined]
             f"supervisor_instance={INSTANCE_ID} pid={os.getpid()} "  # type: ignore[name-defined]
             f"started={now_iso()}\n"
         )
+        try:
+            os.chmod(LOCK_PATH, 0o600)  # type: ignore[name-defined]
+        except OSError:
+            pass
     _LOCK_FD = os.open(
-        str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644  # type: ignore[name-defined]
+        str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600  # type: ignore[name-defined]
     )
     try:
         fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -748,11 +756,12 @@ def lease_alive(lease: dict) -> Optional[dict]:
     except Exception:
         return None
     # The worker must have been launched from the configured
-    # working_checkout. Comparing against REPO_DIR (which is
-    # the configured path) lets operators use any checkout
-    # directory name, not only "Automated-Edge-Discovery".
+    # working_checkout exactly. We compare against the resolved
+    # REPO_DIR (no basename fallback) so that operators using
+    # multiple checkouts under different names cannot
+    # accidentally inherit each other's leases.
     repo_dir = str(REPO_DIR).rstrip("/")  # type: ignore[name-defined]
-    if not (cwd == repo_dir or cwd.endswith("/" + repo_dir.split("/")[-1])):
+    if cwd.rstrip("/") != repo_dir:
         return None
     lease["heartbeat_at"] = now_iso()
     return lease
@@ -1199,6 +1208,7 @@ def correlate_provider_review(
     head_sha: str,
     surfaces: dict,
     request_record: dict,
+    token: str = "",
 ) -> dict:
     result = {
         "provider": provider,
@@ -1261,8 +1271,14 @@ def correlate_provider_review(
                 result["latest_response_timestamp"] = r.get(
                     "submitted_at"
                 )
+    # Pass the actual token; the previous empty-string token
+    # silently defeated the stale-head guard for any request
+    # made before the supervisor had read its token. Without a
+    # valid token, github_get returns None and we conservatively
+    # treat the response as not stale.
     live_head = github_get(
-        f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{PR_NUMBER}", ""  # type: ignore[name-defined]
+        f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{PR_NUMBER}",  # type: ignore[name-defined]
+        token,
     )
     if (
         live_head
@@ -1401,7 +1417,8 @@ def resume_if_eligible(rs: dict, live: dict) -> str:
         )
         surfaces_by_provider[provider] = surfaces
         corr = correlate_provider_review(
-            provider, AUTHORITATIVE_HEAD, surfaces, req  # type: ignore[name-defined]
+            provider, AUTHORITATIVE_HEAD, surfaces, req,  # type: ignore[name-defined]
+            token=token or "",
         )
         if (
             corr["covers_requested_head"]
@@ -1568,6 +1585,7 @@ def capture_live_snapshot(rs: dict, token: str) -> dict:
         "issue_comments": [],
         "required_checks": {},
         "providers": {},
+        "_provider_issue_comments": {},
         "unconsumed_event_ids": [
             e.get("id") for e in list_unconsumed_events()
         ],
@@ -1676,10 +1694,21 @@ def capture_live_snapshot(rs: dict, token: str) -> dict:
                 "id": c.get("id"),
                 "created_at": c.get("created_at"),
                 "login": c.get("user", {}).get("login") or "",
+                "body": (c.get("body") or "")[:500],
             })
         page += 1
         if len(ic) < 100:
             break
+    # Build the per-provider issue-comment index so the
+    # ``in_progress`` computation can scan only the comments
+    # authored by each provider's bot accounts.
+    snap.setdefault("_provider_issue_comments", {})  # type: ignore[arg-type]
+    for provider, cfg in PROVIDERS.items():
+        bot_logins = set(cfg.get("bot_logins", []))
+        snap["_provider_issue_comments"][provider] = [
+            c for c in snap["issue_comments"]
+            if c.get("login") in bot_logins
+        ]
     cr = safe_github_get(
         f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{snap['head_sha'] or ''}/check-runs",  # type: ignore[name-defined]
         token,
@@ -1715,7 +1744,9 @@ def capture_live_snapshot(rs: dict, token: str) -> dict:
                 c.get("body", "").lower()
                 if isinstance(c, dict) else ""
             )
-            for c in []
+            for c in (
+                snap.get("_provider_issue_comments", {}).get(p, [])
+            )
         )
         snap["providers"][p] = {
             "paused": bool(quota.get(p)),
@@ -1763,6 +1794,15 @@ def threads_block_readiness(snap: dict) -> list:
 
 
 def required_checks_green(snap: dict) -> bool:
+    """All required GitHub checks for the PR must have a SUCCESS
+    or SKIPPED conclusion.
+
+    A check that has not been registered yet (the entry is
+    absent from the snapshot) is treated as NOT green. A
+    check whose status is queued/in_progress is also NOT
+    green. The only green states are ``success``, ``skipped``,
+    ``neutral``.
+    """
     required = {
         "test (3.11)",
         "validator",
@@ -1772,10 +1812,20 @@ def required_checks_green(snap: dict) -> bool:
     }
     for name in required:
         info = snap.get("required_checks", {}).get(name)
+        # An absent entry means the check has not yet been
+        # registered; fail closed rather than skipping.
         if info is None:
-            continue
+            return False
+        status = info.get("status")
+        # Pending checks (queued, in_progress, waiting,
+        # pending, requested) are not yet green. ``completed``
+        # is the canonical "conclusion is final" status
+        # emitted by GitHub once a check has reached its
+        # terminal state.
+        if status not in ("completed", "success", "skipped", "neutral"):
+            return False
         c = info.get("conclusion")
-        if c not in ("success", "skipped", "neutral", None):
+        if c not in ("success", "skipped", "neutral"):
             return False
     return True
 
@@ -2103,8 +2153,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                             reason="new_actionable_event",
                             head_sha=iteration.get("head_sha"),
                         )
-                        for eid in fresh_ids:
-                            mark_event_launched(eid)
                         log(
                             "info",
                             "revoking readiness (new actionable "
@@ -2117,8 +2165,28 @@ def main(argv: Optional[list[str]] = None) -> int:
                         live = (
                             inspect_live_state(token) if token else {}
                         )
-                        if launch_worker(rs, live):
-                            pass
+                        # Mark each event as launched only
+                        # AFTER the worker has actually been
+                        # launched successfully. A failed
+                        # launch must not permanently suppress
+                        # the event; the next heartbeat's
+                        # fresh_ids filter would otherwise
+                        # exclude it forever.
+                        new_lease = launch_worker(rs, live)
+                        if new_lease:
+                            for eid in fresh_ids:
+                                mark_event_launched(eid)
+                        else:
+                            log(
+                                "warning",
+                                "worker launch failed; "
+                                "events remain actionable so "
+                                "the next heartbeat will retry",
+                                events=[
+                                    e.get("kind") for e in new_events
+                                    if e.get("id") in fresh_ids
+                                ],
+                            )
 
             if cur_state == STATE_ACTIVE_REPAIR:
                 if not list_unconsumed_events():
