@@ -359,21 +359,16 @@ def heartbeat_touch() -> None:
 def acquire_lock() -> bool:
     global _LOCK_FD
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)  # type: ignore[name-defined]
-    # Create the lock file with restrictive permissions
-    # (0600). The lock file contains the supervisor
-    # instance id and the holder PID, both of which are
-    # operator-sensitive.
-    if not LOCK_PATH.exists():  # type: ignore[name-defined]
-        LOCK_PATH.write_text(  # type: ignore[name-defined]
-            f"supervisor_instance={INSTANCE_ID} pid={os.getpid()} "  # type: ignore[name-defined]
-            f"started={now_iso()}\n"
-        )
-        try:
-            os.chmod(LOCK_PATH, 0o600)  # type: ignore[name-defined]
-        except OSError:
-            pass
+    # Open (or create) the lock file with mode 0600 first,
+    # before any write_text happens. This is the only way to
+    # guarantee the lock file is never world-readable, even
+    # briefly. The later chmod(0o600) is a belt-and-braces
+    # measure for filesystems that do not honour the open
+    # mode.
     _LOCK_FD = os.open(
-        str(LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o600  # type: ignore[name-defined]
+        str(LOCK_PATH),  # type: ignore[name-defined]
+        os.O_RDWR | os.O_CREAT,
+        0o600,
     )
     try:
         fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -381,6 +376,13 @@ def acquire_lock() -> bool:
         os.close(_LOCK_FD)
         _LOCK_FD = None
         return False
+    # Always re-assert the file's mode in case the file
+    # pre-existed with looser permissions from a previous
+    # version of this code.
+    try:
+        os.fchmod(_LOCK_FD, 0o600)
+    except OSError:
+        pass
     os.ftruncate(_LOCK_FD, 0)
     os.write(
         _LOCK_FD,
@@ -1337,9 +1339,17 @@ def correlate_provider_review(
         f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{PR_NUMBER}",  # type: ignore[name-defined]
         token,
     )
-    if (
-        live_head
-        and live_head.get("head", {}).get("sha") != head_sha
+    # A missing or malformed live-head response is treated
+    # as STALE so the supervisor refuses to authorize a
+    # review whose head it cannot confirm. The covers_
+    # requested_head gate stays closed in that case. This is
+    # the fail-closed behaviour that prevents a transient
+    # GitHub API outage from being silently treated as
+    # "no review yet".
+    if live_head is None or not isinstance(live_head, dict):
+        result["stale"] = True
+    elif (
+        live_head.get("head", {}).get("sha") != head_sha
     ):
         result["stale"] = True
     result["covers_requested_head"] = (
@@ -1823,15 +1833,66 @@ def capture_live_snapshot(rs: dict, token: str) -> dict:
             ],
             default=None,
         )
+        # Terminal review evidence (a formal review record
+        # or an issue comment with a completed-walkthrough
+        # marker) overrides any stale "in progress" comment
+        # that may be hanging around from an earlier round.
+        recent_review_ts_str = recent_review_ts or ""
+        latest_comment_id_int = latest_comment_id or 0
+        # Find the latest issue comment authored by this
+        # provider. If it predates the most recent formal
+        # review, the provider is in a terminal state and
+        # any "in progress" comment is stale.
+        latest_comment_ts = max(
+            (
+                c.get("created_at") or ""
+                for c in (
+                    snap.get("_provider_issue_comments", {}).get(p, [])
+                )
+            ),
+            default="",
+        )
+        # Only consider "in progress" comments newer than
+        # the most recent formal review (terminal evidence
+        # overrides).
+        def _ts(s: str) -> str:
+            return s or ""
         in_progress = any(
             "in progress" in (
                 c.get("body", "").lower()
                 if isinstance(c, dict) else ""
             )
+            and (
+                recent_review_ts_str is None
+                or _ts(c.get("created_at") or "")
+                > recent_review_ts_str
+            )
             for c in (
                 snap.get("_provider_issue_comments", {}).get(p, [])
             )
         )
+        # An explicit "completed" or "review complete"
+        # comment after the latest review record forces
+        # in_progress = False (terminal evidence overrides
+        # any leftover "in progress" wording).
+        if in_progress and any(
+            (
+                "review completed" in (
+                    c.get("body", "").lower()
+                    if isinstance(c, dict) else ""
+                )
+                or "<!-- this is an auto-generated comment: review"
+                in (
+                    c.get("body", "").lower()
+                    if isinstance(c, dict) else ""
+                )
+            )
+            and _ts(c.get("created_at") or "") >= recent_review_ts_str
+            for c in (
+                snap.get("_provider_issue_comments", {}).get(p, [])
+            )
+        ):
+            in_progress = False
         snap["providers"][p] = {
             "paused": bool(quota.get(p)),
             "in_progress": in_progress,
