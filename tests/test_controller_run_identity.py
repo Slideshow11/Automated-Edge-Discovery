@@ -4002,17 +4002,24 @@ class TestRound24WindowsSentinelCompat:
         from scripts.local import aed_supervisor_lock as supervisor_lock
         import unittest.mock as _mock
 
+        # Round-112 P1 fix (CodeRabbit finding #6): Windows
+        # without msvcrt must FAIL CLOSED, not silently
+        # degrade to a no-op. The previous no-op fallback
+        # silently disabled mutual exclusion; the supervisor
+        # would believe it held a sentinel it did not.
         with _mock.patch.object(supervisor_lock.os, "name", "nt"):
-            flock_fn, LOCK_EX, LOCK_NB, LOCK_UN = (
-                supervisor_lock._sentinel_lock_module()
-            )
-            # The flock_fn should be a callable (msvcrt-based or
-            # the no-op fallback). It must support both lock
-            # and unlock operations.
-            assert callable(flock_fn)
-            # Both op paths must execute without raising.
-            flock_fn(0, LOCK_EX | LOCK_NB)
-            flock_fn(0, LOCK_UN)
+            with _mock.patch.dict(
+                supervisor_lock.sys.modules,
+                {"msvcrt": None},
+            ):
+                try:
+                    supervisor_lock._sentinel_lock_module()
+                    assert False, (
+                        "Windows without msvcrt must fail closed "
+                        "with RuntimeError (was silently no-op)"
+                    )
+                except RuntimeError as e:
+                    assert "msvcrt" in str(e).lower()
 
     def test_unsupported_platform_raises(self):
         from scripts.local import aed_supervisor_lock as supervisor_lock

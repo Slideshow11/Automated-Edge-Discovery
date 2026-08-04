@@ -531,22 +531,22 @@ def _sentinel_lock_module():
         try:
             import msvcrt
         except ImportError:
-            # Round-24 P2 fix (cont'd): Windows platform without
-            # msvcrt (e.g., some restricted CI environments). On
-            # such systems, fall back to a no-op sentinel that
-            # still serializes via flock-style O_EXCL creation.
-            # This is unsafe for true concurrency but unblocks
-            # smoke tests on Windows machines that lack msvcrt.
-            LK_UNLCK = 0
-
-            def _noop_flock(fd, op):
-                if op & 0x4:  # LOCK_UN placeholder
-                    return
-                # LOCK_EX | LOCK_NB: assume exclusive because we
-                # just created the file.
-                return
-
-            return (_noop_flock, 0x2, 0x1, 0x4)
+            # Round-112 P1 fix (CodeRabbit finding #6): Windows
+            # platform without msvcrt. The previous implementation
+            # returned a no-op flock that silently disabled mutual
+            # exclusion: every contender believed it held the
+            # sentinel, so two processes could simultaneously
+            # write to the same lease file. Fail closed: raise
+            # RuntimeError so the supervisor never silently loses
+            # mutual exclusion. Operators running on Windows
+            # without msvcrt must install `msvcrt` (it ships with
+            # the standard library on CPython for Windows).
+            raise RuntimeError(
+                "Windows platform requires the `msvcrt` module "
+                "for supervisor locking. Install Python's "
+                "standard-library `msvcrt` module (ships with "
+                "CPython on Windows) and restart the supervisor."
+            )
 
         LK_NBLCK = 2
         LK_UNLCK = 0
@@ -931,8 +931,28 @@ def _check_cross_scope_conflict(
                     reason="repo_wide_lock_already_held",
                 )
                 break
-    except OSError:
-        return None
+    except OSError as e:
+        # Round-112 P1 fix (CodeRabbit finding #7): the previous
+        # implementation returned None on any OSError during
+        # the cross-scope scan (e.g. iterdir permission denied,
+        # disk error, transient FS issue). None means "no
+        # conflict" — the caller would then proceed to acquire
+        # the lock, defeating mutual exclusion. Fail closed:
+        # return an indeterminate LockOutcome so try_acquire
+        # does NOT proceed.
+        return LockOutcome(
+            ok=False,
+            path=Path(),
+            owner=None,
+            reason=(
+                f"cross_scope_scan_failed:OSError during base_dir "
+                f"iterdir or lease-file read ({type(e).__name__}); "
+                f"cannot determine whether a conflicting lease "
+                f"exists; refusing to acquire to avoid silent "
+                f"mutual-exclusion bypass"
+            ),
+            indeterminate=True,
+        )
     if narrower_locks:
         # We are acquiring the repo-wide lock; report the
         # first conflicting narrower lock.

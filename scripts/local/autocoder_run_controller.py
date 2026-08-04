@@ -5373,7 +5373,8 @@ def _authorize_mutation_locked(args: argparse.Namespace, state: dict, sentinel_f
                     _format_upgrade_target_lease(
                         _upgrade_target_lease_outcomes
                         if _upgrade_target_lease_outcomes
-                        else None
+                        else None,
+                        base_dir=_lock_base_for_upgrade,
                     )
                 ),
             )
@@ -5964,16 +5965,34 @@ def _release_upgrade_target_lease_for_record(record: dict) -> bool:
         else:
             return True
     all_released = True
+    # Round-112 P1 fix (CodeRabbit finding #10): the previous
+    # release() call passed base_dir=None which resolves to
+    # the host-wide default lock directory. _authorize_mutation_locked
+    # acquires each upgrade lease with base_dir=_lock_base_for_upgrade
+    # (typically --lock-dir or run_identity.lock_dir). If those
+    # differ, the release iterates the wrong directory and the
+    # lease is never actually freed. The fix: persist the
+    # base_dir at acquisition time and use it at release time.
+    lease_base_dir = upgrade.get("base_dir") if isinstance(upgrade, dict) else None
+    lease_base_dir_path = Path(lease_base_dir) if lease_base_dir else None
     for lease in leases:
         scope = lease.get("scope")
         owner_run_id = lease.get("owner_run_id")
         if not scope or not owner_run_id:
             continue
+        # Per-lease base_dir fallback (overrides the upgrade
+        # level). Allows multiple leases in the same upgrade
+        # to live in different lock dirs.
+        per_lease_base_dir = lease.get("base_dir") if isinstance(lease, dict) else None
+        if per_lease_base_dir:
+            base_dir_to_use = Path(per_lease_base_dir)
+        else:
+            base_dir_to_use = lease_base_dir_path
         try:
             released = _supervisor_lock.release(
                 scope=scope,
                 owner_run_id=owner_run_id,
-                base_dir=None,  # host-wide default; release finds lock by key
+                base_dir=base_dir_to_use,
             )
         except (OSError, KeyError):
             # Best-effort: another worker may have already
@@ -6008,7 +6027,9 @@ def _resolve_lock_base(args, workspace: Path) -> Optional[Path]:
     return None
 
 
-def _format_upgrade_target_lease(outcomes) -> Optional[object]:
+def _format_upgrade_target_lease(
+    outcomes, base_dir: Optional[Path] = None
+) -> Optional[object]:
     """Convert the upgrade target lease probe outcomes to a
     serializable structure for the journal record.
 
@@ -6027,20 +6048,30 @@ def _format_upgrade_target_lease(outcomes) -> Optional[object]:
 
     The lock_base is captured at acquisition so the
     release path uses the same directory.
+
+    Round-112 P1 fix (CodeRabbit finding #10): each lease
+    entry MUST also persist the base_dir it was acquired
+    in. The release function uses this to locate the lock
+    file; without it, release() iterates the wrong directory
+    and the lease is never freed.
     """
     if not outcomes:
         return None
     if not isinstance(outcomes, list):
         outcomes = [outcomes]
     leases = []
+    base_dir_str = str(base_dir) if base_dir else None
     for outcome in outcomes:
         target_scope, lock_outcome = outcome
         leases.append({
             "scope": target_scope,
             "owner_run_id": lock_outcome.owner.get("owner_run_id"),
             "path": str(lock_outcome.path) if lock_outcome.path else None,
+            # The base_dir used at acquisition so the release
+            # path can locate the lock file (Round-112 P1 fix).
+            "base_dir": base_dir_str,
         })
-    return {"leases": leases}
+    return {"leases": leases, "base_dir": base_dir_str}
 
 
 def _inspect_lock(args: argparse.Namespace) -> None:
