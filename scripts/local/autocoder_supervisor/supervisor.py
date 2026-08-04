@@ -2146,6 +2146,99 @@ def run_iteration_v5(rs: dict, token: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def active_repair_quiet_window(
+    rs: dict,
+    token: str,
+    quiet_window: int,
+    pre_unconsumed_ids: set,
+) -> None:
+    """Run the ACTIVE_REPAIR quiet-window transition.
+
+    Captures snapshot A, sleeps for the quiet window, captures
+    snapshot B, and decides what to do:
+
+    - If snapshots differ or new events were emitted during
+      the quiet window, stay in ACTIVE_REPAIR.
+    - If snapshots are stable AND no new events emerged,
+      clear the pre-existing unconsumed events (they are
+      effectively resolved by the system stabilising) and
+      advance to PROVISIONAL_READY if the readiness gate
+      passes.
+
+    The function reads ``readiness_state``, ``snapshot_a``,
+    ``snapshot_b``, and ``unconsumed_events``; the caller
+    is responsible for the surrounding ``while True:`` loop
+    and the heartbeat / lock bookkeeping.
+    """
+    snap_a = capture_and_store_snapshot("A", rs, token)
+    time.sleep(quiet_window)
+    snap_b = capture_live_snapshot(rs, token or "")
+    new_events_during_window = [
+        e
+        for e in detect_new_actionable_events(snap_a, snap_b)
+        if e.get("id") not in pre_unconsumed_ids
+    ]
+    reasons = snapshot_differs(
+        snap_a, snap_b, AUTHORITATIVE_HEAD  # type: ignore[name-defined]
+    )
+    if reasons or new_events_during_window:
+        log(
+            "info",
+            "snapshot differs; staying ACTIVE_REPAIR",
+            reasons=reasons,
+            new_events=len(new_events_during_window),
+        )
+        return
+    # Snapshot is stable AND no new events emerged during the
+    # quiet window. Clear pre-existing unconsumed events
+    # BEFORE evaluating readiness so the readiness gate can
+    # pass — the ``unconsumed_events`` check inside
+    # ``evaluate_readiness`` would otherwise reject readiness
+    # even though the system has stabilised.
+    if list_unconsumed_events():
+        log(
+            "info",
+            "snapshot stable across quiet window; "
+            "clearing pre-existing unconsumed events",
+            count=len(list_unconsumed_events()),
+        )
+        write_json(
+            UNCONSUMED_EVENTS_PATH,  # type: ignore[name-defined]
+            {"events": []},
+        )
+    result = evaluate_readiness(
+        snap_b, AUTHORITATIVE_HEAD  # type: ignore[name-defined]
+    )
+    if result.get("ready"):
+        enter_readiness(STATE_PROVISIONAL_READY)
+        log(
+            "info",
+            "entered PROVISIONAL_READY (snapshot A == B)",
+            head=AUTHORITATIVE_HEAD,  # type: ignore[name-defined]
+        )
+    else:
+        log(
+            "info",
+            "readiness denied",
+            reason=result.get("reason"),
+        )
+
+
+def capture_and_store_snapshot(
+    slot: str, rs: dict, token: str,
+) -> dict:
+    """Capture a live snapshot and persist it under ``slot``.
+
+    Module-level wrapper around the inline closure that
+    previously lived inside ``main()`` so it can be reused
+    by ``active_repair_quiet_window`` and tested in
+    isolation.
+    """
+    snap = capture_live_snapshot(rs, token or "")
+    write_snapshot(slot, snap)
+    return snap
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2245,13 +2338,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     quiet_window = POLICY["quiet_window_seconds"]
     heartbeat_seconds = POLICY["heartbeat_seconds"]
 
-    def capture_and_store_snapshot(
-        slot: str, rs: dict, token: str
-    ) -> dict:
-        snap = capture_live_snapshot(rs, token or "")
-        write_snapshot(slot, snap)
-        return snap
-
     try:
         while True:
             heartbeat_touch()
@@ -2334,44 +2420,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
 
             if cur_state == STATE_ACTIVE_REPAIR:
-                if not list_unconsumed_events():
-                    snap_a = capture_and_store_snapshot("A", rs, token)
-                    time.sleep(quiet_window)
-                    snap_b = capture_live_snapshot(rs, token or "")
-                    reasons = snapshot_differs(
-                        snap_a, snap_b, AUTHORITATIVE_HEAD  # type: ignore[name-defined]
-                    )
-                    if not reasons:
-                        result = evaluate_readiness(
-                            snap_b, AUTHORITATIVE_HEAD  # type: ignore[name-defined]
-                        )
-                        if result.get("ready"):
-                            enter_readiness(STATE_PROVISIONAL_READY)
-                            log(
-                                "info",
-                                "entered PROVISIONAL_READY "
-                                "(snapshot A == B)",
-                                head=AUTHORITATIVE_HEAD,  # type: ignore[name-defined]
-                            )
-                        else:
-                            log(
-                                "info",
-                                "readiness denied",
-                                reason=result.get("reason"),
-                            )
-                    else:
-                        log(
-                            "info",
-                            "snapshot differs; staying ACTIVE_REPAIR",
-                            reasons=reasons,
-                        )
-                else:
-                    log(
-                        "info",
-                        "unconsumed events remain; staying "
-                        "ACTIVE_REPAIR",
-                        count=len(list_unconsumed_events()),
-                    )
+                pre_unconsumed_ids = {
+                    e.get("id") for e in list_unconsumed_events()
+                }
+                active_repair_quiet_window(
+                    rs, token or "", quiet_window, pre_unconsumed_ids,
+                )
 
             elif cur_state in READINESS_STATES:
                 snap_now = capture_live_snapshot(rs, token or "")

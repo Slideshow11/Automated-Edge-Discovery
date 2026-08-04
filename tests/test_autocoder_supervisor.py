@@ -553,6 +553,51 @@ def test_f_no_active_repair_revival_without_head_change(isolated_state):
         assert state["state"] == supervisor.STATE_AWAITING_MERGE_AUTHORIZATION
 
 
+def test_f_active_repair_clears_stale_unconsumed_events_on_stable_snapshot(
+    isolated_state, monkeypatch,
+):
+    """When in ACTIVE_REPAIR with a pre-existing unconsumed
+    event but the snapshot is stable across the quiet
+    window AND no new events emerge, the supervisor clears
+    the unconsumed events (they are effectively resolved by
+    the snapshot stabilising) and advances to
+    PROVISIONAL_READY if the readiness gate passes.
+    """
+    # The supervisor's AUTHORITATIVE_HEAD is sourced from
+    # $AED_AUTHORITATIVE_HEAD; pin it to AUTH so the snapshot
+    # head matches the expected head (otherwise snapshot_differs
+    # flags head_sha_drift and the supervisor stays in
+    # ACTIVE_REPAIR).
+    monkeypatch.setattr(supervisor, "AUTHORITATIVE_HEAD", AUTH)
+    supervisor.enter_readiness(
+        supervisor.STATE_ACTIVE_REPAIR, head_sha=AUTH,
+    )
+    # Pre-existing unconsumed event that "stalled" the
+    # supervisor in earlier iterations.
+    supervisor.write_unconsumed_event({
+        "id": "check_changed:stale-check",
+        "kind": "required_check_conclusion_change",
+        "check": "stale-check",
+    })
+    snap = _clean_snap()
+    pre_unconsumed_ids = {
+        e.get("id") for e in supervisor.list_unconsumed_events()
+    }
+    with patch.object(supervisor, "capture_live_snapshot",
+                      return_value=snap), \
+         patch("time.sleep"):
+        supervisor.active_repair_quiet_window(
+            {"current_head": AUTH}, "", 60, pre_unconsumed_ids,
+        )
+    # The supervisor should have:
+    #   1. Cleared the pre-existing unconsumed event.
+    #   2. Captured the stable snapshot.
+    #   3. Advanced to PROVISIONAL_READY.
+    assert supervisor.list_unconsumed_events() == []
+    state = supervisor.read_readiness_state()
+    assert state["state"] == supervisor.STATE_PROVISIONAL_READY
+
+
 # ---------------------------------------------------------------------------
 # G. New formal review after provisional readiness
 # ---------------------------------------------------------------------------
