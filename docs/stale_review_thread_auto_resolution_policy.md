@@ -66,6 +66,7 @@ Resolution is **never permitted** when any of the following are true:
 | Multiple unrelated unresolved threads | Risk compounding: resolve one at a time |
 | No specific pattern in comment body to verify against | Cannot prove thread is stale without a concrete reference |
 | Changed files extend beyond expected scope | Policy applies only to the files the PR touches |
+| Thread or comment requires deletion to clear | Deleting review comments destroys audit history. Resolve eligible stale threads only; never call REST `DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}` or GraphQL `deletePullRequestReviewComment`. |
 
 ---
 
@@ -97,7 +98,7 @@ All 14 of the following must be true before resolving a single thread:
 When all 14 conditions are met:
 
 1. **Resolve only the stale thread.** Do not resolve any other threads in the same pass.
-2. **Do not dismiss the review.** Only resolve the comment thread; do not call `dismissReview`.
+2. **Do not dismiss the review.** Only resolve the comment thread through `resolveReviewThread`. **Do not delete review comments.** Never call REST `DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}` or GraphQL `deletePullRequestReviewComment`. Resolving a thread preserves the comment chain as part of the PR audit record; deleting a comment erases it from review history.
 3. **Do not resolve unrelated threads.** Even if multiple threads appear stale, resolve one, then re-verify all 14 conditions before resolving the next.
 4. **Rerun the waiter** with `--require-review-comments-clean` still enabled to confirm the resolved thread no longer appears as a blocker.
 5. **Merge only if `READY_TO_MERGE_CANDIDATE`.** If the waiter returns anything other than `READY_TO_MERGE_CANDIDATE`, do not merge. Investigate before proceeding.
