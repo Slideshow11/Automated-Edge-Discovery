@@ -324,9 +324,31 @@ def guarded_push(
     )
     spec = f"{src_spec}:{ref}"
     cmd = ["git", "push", lease_option, remote, spec]
-    result = subprocess.run(
-        cmd, cwd=str(repo), capture_output=True, text=True
-    )
+    # Round-112 P2 fix (CodeRabbit finding WJW_r): add a
+    # bounded timeout to the network `git push` invocation.
+    # An unresponsive remote, hung TLS handshake, or stale
+    # proxy can block the controller thread indefinitely
+    # otherwise, leaving the plan in a non-terminal state
+    # until finalize-run forcibly cleans it up. Use 60s
+    # (matches the convention used by `git ls-remote` in
+    # resolve_remote_ref_via_query).
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(repo), capture_output=True, text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return RefMutationResult(
+            ok=False,
+            actual_ref_sha=None,
+            stdout="",
+            stderr=(
+                f"git push timed out after 60s; the remote may be "
+                f"unreachable or the credentials may have failed; "
+                f"treating as an indeterminate remote-state outcome"
+            ),
+            returncode=-1,
+        )
     return RefMutationResult(
         ok=result.returncode == 0,
         actual_ref_sha=None,
